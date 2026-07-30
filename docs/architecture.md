@@ -2006,6 +2006,14 @@ mechanism, implemented in `crates/app/build.rs`:
 2. **Dev builds:** `build.rs` locates the downloaded dylib under
    `target/<profile>/build/tdlib-rs-*/out/**/libtdjson*.dylib` and copies it
    next to the binary (`target/<profile>/`), where the first rpath finds it.
+   Empirical findings from T04 that T56 must respect: the downloaded archive
+   contains both `libtdjson.dylib` and a versioned `libtdjson.<ver>.dylib`
+   (e.g. `1.8.61`), and the dylib's `LC_ID_DYLIB` is the **versioned** name —
+   so the versioned filename is what the linked binary's `LC_LOAD_DYLIB`
+   references and what must exist next to the binary (dev) or in `../lib`
+   (packaged). Also, cargo does not propagate `rustc-link-arg` from a
+   dependency's build script, so tdlib-rs's own absolute rpath never reaches
+   `tgt`; the copy step is load-bearing, not defensive.
 3. **Packaged builds:** `scripts/package.sh` lays out `dist/tgt/bin/tgt` +
    `dist/tgt/lib/libtdjson.dylib`, runs
    `install_name_tool -id @rpath/libtdjson.dylib dist/tgt/lib/libtdjson.dylib`
