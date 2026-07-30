@@ -1640,6 +1640,10 @@ use crate::theme::Theme;
 pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache);
 ```
 
+Staging note (orchestrator, M1): until T21 creates `LayoutCache`, `view` is
+`view(state, theme, f)` — T21/T23 add the `cache` parameter together with the
+type. T08's runtime loop calls whichever arity currently exists.
+
 ---
 
 ## 5. Sequence diagrams
