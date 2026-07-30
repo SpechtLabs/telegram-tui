@@ -808,6 +808,16 @@ pub struct FieldError {
     pub error: TdError,
 }
 
+/// Credentials-wizard contract (T11, binding on T12/T14): the wizard adds NO
+/// fields anywhere — it is driven entirely by `active_field`. The AppState
+/// constructor seeds `active_field = AuthField::ApiId` iff credentials are
+/// missing (else `Phone`); `handle_key` treats `active_field ∈ {ApiId,
+/// ApiHash}` as wizard-active regardless of phase; Enter on ApiHash (api_id
+/// parses as i32, api_hash non-empty) emits
+/// `Effect::SaveConfig(ConfigPatch::Credentials)` and moves to `Phone`.
+/// Nothing may route back into ApiId/ApiHash once a phase past
+/// WaitTdlibParameters has been projected.
+///
 /// A PROJECTION of TDLib's authorizationState — never a parallel state machine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthState {
