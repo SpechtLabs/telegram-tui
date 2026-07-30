@@ -1842,7 +1842,7 @@ unicode-segmentation = "=1.13.3"
 unicode-width = "=0.2.2"
 lru = "=0.18.1"
 qrcode = "=0.14.1"
-ratatui-image = "=11.0.6"
+ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "=0.25.10"
 jiff = "=0.2.35"
 serde = { workspace = true }
@@ -1855,6 +1855,13 @@ insta = { workspace = true }
 
 `crossterm 0.29` is the matching pair for `ratatui 0.30`. `jiff` formats
 message timestamps (`14:02`); `core` stores raw unix seconds only.
+
+`ratatui-image` ships with default features off: its `chafa-dyn` default probes
+for the system `chafa` C library at build time and fails without it, and
+installing one would violate constraint 10 (no Homebrew / system packages).
+Without chafa, the halfblocks fallback renders primitively — acceptable, since
+the spec only requires that a placeholder fallback always exists (§8.3).
+Kitty/iTerm2/Sixel protocols are unaffected.
 
 ### 6.4 `crates/app/Cargo.toml`
 
@@ -1878,7 +1885,7 @@ ratatui = "=0.30.2"
 clap = { version = "=4.6.4", features = ["derive"] }
 color-eyre = "=0.6.5"
 etcetera = "=0.11.0"
-keyring = { version = "=4.1.5", features = ["apple-native"] }
+keyring = "=4.1.5"
 arboard = "=3.6.1"
 rand = "=0.10.2"
 serde = { workspace = true }
@@ -1899,6 +1906,10 @@ prost = "=0.14.4"
 
 Notes:
 
+- `keyring` 4.x has no `apple-native` cargo feature (that name never existed in
+  any published version); its default `v1` feature already selects the
+  macOS Keychain store (`apple-native-keyring-store`) on this platform, so the
+  plain pin is correct and sufficient.
 - `tracing-batteries` is not on crates.io; pinned to commit
   `f059e936623c2eb0ca67f6ae3301487c9443ffd0` (repo HEAD, 2026-07-21).
   `default-features = false` is load-bearing: the crate enables `sentry` by

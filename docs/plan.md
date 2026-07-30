@@ -143,12 +143,12 @@ links and its dylib resolves.
 
 ### - [ ] T02 — core model types `group A`
 
-**Goal:** All plain data types of the domain: ids, time, key, entity, message, chat.
-**Owns:** `crates/core/src/model/{ids,time,key,entity,message,chat}.rs`.
-**Reads:** architecture §4.1, §4.2. Must not touch `model/chips.rs` (T26's).
+**Goal:** All plain data types of the domain: ids, time, key, entity, message, chat — plus `TdError`, which `SendState::Failed` embeds and which depends on nothing else in `td/`.
+**Owns:** `crates/core/src/model/{ids,time,key,entity,message,chat}.rs`, `crates/core/src/td/error.rs` (ownership transferred from T05 by the orchestrator: `model/message.rs` cannot compile without `TdError`, and T05 depends on T02 — a cycle otherwise. `TdError::telemetry_kind` returns string literals matching `schema::error_kinds`, no import of T03's module).
+**Reads:** architecture §4.1, §4.2, §4.7 (`TdError` only). Must not touch `model/chips.rs` (T26's).
 **Depends on:** T01.
-**Interfaces produced:** every type in architecture §4.1–§4.2, field-for-field.
-**Tests (inline):** `chat_order_key_sorts_desc_by_order_then_id` (BTreeSet iteration order matches TDLib expectation, including negative orders and equal orders disambiguated by id); `sender_color_seed_stable`; serde round-trip for `MessageView` and `ChatView` (`serde_json::to_string` → `from_str` → eq).
+**Interfaces produced:** every type in architecture §4.1–§4.2, field-for-field; `TdError` + `telemetry_kind()`.
+**Tests (inline):** `chat_order_key_sorts_desc_by_order_then_id` (BTreeSet iteration order matches TDLib expectation, including negative orders and equal orders disambiguated by id); `sender_color_seed_stable`; serde round-trip for `MessageView` and `ChatView` (`serde_json::to_string` → `from_str` → eq); `flood_wait_maps_to_td_flood_wait_kind` (moved from T05 with the file).
 **Acceptance:** `cargo test -p tgt-core model::`
 
 ### - [ ] T03 — telemetry schema, event, `emit!`, hashing `group A`
@@ -175,12 +175,12 @@ links and its dylib resolves.
 
 ### - [ ] T05 — TDLib boundary types and trait
 
-**Goal:** `TdRequest`, `TdResponse`, `TdlibParams`, `TdUpdate`, `AuthPhase`, `ConnectionPhase`, `TdError`, and the `TdRuntime` trait.
-**Owns:** `crates/core/src/td/{runtime,request,update,error}.rs`.
-**Reads:** architecture §4.7; T02's model types. Must not touch `td/fake.rs` (T10's).
+**Goal:** `TdRequest`, `TdResponse`, `TdlibParams`, `TdUpdate`, `AuthPhase`, `ConnectionPhase`, and the `TdRuntime` trait. (`TdError` moved to T02 — see its block.)
+**Owns:** `crates/core/src/td/{runtime,request,update}.rs`.
+**Reads:** architecture §4.7; T02's model types and `td/error.rs`. Must not touch `td/fake.rs` (T10's) or `td/error.rs` (T02's).
 **Depends on:** T02.
-**Interfaces produced:** everything in architecture §4.7 except `FakeTd`; `TdRequest::kind() -> &'static str`; `TdError::telemetry_kind() -> &'static str`.
-**Tests:** serde round-trip `TdUpdate` and `TdRequest` (fixture format depends on it); `flood_wait_maps_to_td_flood_wait_kind`; `request_kind_names_are_unique` (collect kinds of one value per variant into a set, assert no dupes).
+**Interfaces produced:** everything in architecture §4.7 except `FakeTd` and `TdError`; `TdRequest::kind() -> &'static str`.
+**Tests:** serde round-trip `TdUpdate` and `TdRequest` (fixture format depends on it); `request_kind_names_are_unique` (collect kinds of one value per variant into a set, assert no dupes).
 **Acceptance:** `cargo test -p tgt-core td::`
 
 ### - [ ] T06 — Action, Effect, App root, focus stack
