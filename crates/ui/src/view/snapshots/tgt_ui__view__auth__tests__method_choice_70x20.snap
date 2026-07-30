@@ -1,0 +1,19 @@
+---
+source: crates/ui/src/view/auth.rs
+expression: "render_to_string(70, 20, &state)"
+---
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+          ┌─────────────────── Sign in ────────────────────┐          
+          │How would you like to sign in?                  │          
+          │                                                │          
+          │  Phone number                                  │          
+          │▶ QR code                                       │          
+          │                                                │          
+          │↑↓ choose · p phone · q qr · ⏎ continue         │          
+          │                                                │          
+          │                                                │          
+          └────────────────────────────────────────────────┘
