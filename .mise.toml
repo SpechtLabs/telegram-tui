@@ -1,0 +1,4 @@
+# .mise.toml — local tooling, exact pins (repo convention)
+[tools]
+rust = "1.97.1"                # mirrors rust-toolchain.toml
+"cargo:cargo-insta" = "1.48.0" # snapshot review workflow

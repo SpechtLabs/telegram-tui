@@ -1,0 +1,36 @@
+[package]
+name = "tgt-app"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "tgt"
+path = "src/main.rs"
+
+[dependencies]
+tgt-core = { workspace = true }
+tgt-ui = { workspace = true }
+tdlib-rs = { version = "=1.4.0", default-features = false, features = ["download-tdlib"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "process"] }
+crossterm = { version = "=0.29.0", features = ["event-stream"] }
+ratatui = "=0.30.2"
+clap = { version = "=4.6.4", features = ["derive"] }
+color-eyre = "=0.6.5"
+etcetera = "=0.11.0"
+keyring = "=4.1.5"
+arboard = "=3.6.1"
+rand = "=0.10.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "=1.1.4"
+tracing = { workspace = true }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
+tracing-appender = "=0.2.5"
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["opentelemetry"] }
+
+[dev-dependencies]
+insta = { workspace = true }
+tempfile = "=3.27.0"
+axum = "=0.8.9"
+opentelemetry-proto = { version = "=0.32.0", features = ["gen-tonic-messages", "trace", "logs"] }
+prost = "=0.14.4"

@@ -1,0 +1,22 @@
+[package]
+name = "tgt-ui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+tgt-core = { workspace = true }
+ratatui = "=0.30.2"
+crossterm = "=0.29.0"
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.2"
+lru = "=0.18.1"
+qrcode = "=0.14.1"
+ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "=0.25.10"
+jiff = "=0.2.35"
+serde = { workspace = true }
+toml = "=1.1.4"
+tracing = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
