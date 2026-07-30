@@ -31,9 +31,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -71,9 +69,6 @@ const TD_LOG_FILE: &str = "tdlib.log";
 /// counts characters, ellipsis included, so a preview can never blow up a
 /// layout regardless of what was pasted into the original message.
 const EXCERPT_MAX_CHARS: usize = 80;
-
-/// The desugared return type of an `#[async_trait]` method.
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ---------------------------------------------------------------------------
 // Runtime
@@ -434,21 +429,10 @@ impl TdlibRuntime {
     }
 }
 
+#[async_trait::async_trait]
 impl TdRuntime for TdlibRuntime {
-    // Hand-written expansion of `#[async_trait] async fn request(...)`. The
-    // macro is not a dependency of `tgt-app` (dependency sets are frozen by
-    // T01 and Cargo.toml is not this task's to edit), and the trait's
-    // desugared signature is early-bound in both lifetimes, so the impl has
-    // to spell them out to match.
-    fn request<'life0, 'async_trait>(
-        &'life0 self,
-        req: TdRequest,
-    ) -> BoxFuture<'async_trait, Result<TdResponse, TdError>>
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(self.execute(req))
+    async fn request(&self, req: TdRequest) -> Result<TdResponse, TdError> {
+        self.execute(req).await
     }
 
     fn updates(&self) -> mpsc::Receiver<TdUpdate> {

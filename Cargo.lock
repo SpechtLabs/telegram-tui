@@ -4731,6 +4731,7 @@ name = "tgt-app"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "async-trait",
  "axum",
  "clap",
  "color-eyre",

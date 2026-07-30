@@ -1897,6 +1897,7 @@ path = "src/main.rs"
 [dependencies]
 tgt-core = { workspace = true }
 tgt-ui = { workspace = true }
+async-trait = { workspace = true }
 tdlib-rs = { version = "=1.4.0", default-features = false, features = ["download-tdlib"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "process"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
@@ -1975,6 +1976,32 @@ no system package, per constraint 10.
 The mapping layer in `TdlibRuntime` is also where PII-bearing raw types die:
 only `TdUpdate`/`TdResponse` (already reduced to what the app renders) cross
 into `core`.
+
+Empirical findings from T09 against TDLib ~1.8.61 / tdlib-rs 1.4.0 (binding
+on later tasks):
+
+- **`MessageCaps` is mostly unavailable on `message`.** TDLib moved
+  `can_be_edited`/`can_be_deleted_*`/`can_be_forwarded` onto
+  `messageProperties`, fetched per message via `getMessageProperties`; only
+  `can_be_saved` still rides on the message. `TdlibRuntime` maps that one and
+  defaults the rest to `false`. **T26 must add a
+  `TdRequest::GetMessageProperties { chat_id, message_id }` variant (+
+  matching `TdResult` completion) and fetch properties when a message is
+  selected** — otherwise edit/delete/forward chips never light up. This is an
+  approved pending contract change; T26's owner edits this document's §4.7
+  when implementing it.
+- **Reply excerpts are empty for same-chat replies** (TDLib only inlines
+  quote/content for cross-chat replies). The conversation/selection layer
+  (T16/T25/T26) fills `ReplyPreview.excerpt` from its own message window when
+  the mapped excerpt is empty.
+- `muted` is approximated as `!use_default_mute_for && mute_for > 0`; the
+  scope-default case reads as unmuted (a second round trip would be needed
+  for exactness — accepted for v1).
+- `TdError::Offline` is never produced from a TDLib error string; offline-ness
+  is signalled by `ConnectionPhase::WaitingForNetwork`.
+- tdlib-rs handles `@extra` correlation internally; the receive loop must be
+  running before any request (constructor guarantees it). `receive()` is a
+  global 2 s-timeout blocking call serviced by one dedicated OS thread.
 
 ---
 

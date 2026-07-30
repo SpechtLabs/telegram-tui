@@ -435,6 +435,14 @@ below 100 columns.
 
 ### - [ ] T26 — selection mode and chips `group E`
 
+**Amendment (from T09's findings, architecture §7):** TDLib serves capability
+flags via `getMessageProperties`, not on `message`. T26 additionally adds
+`TdRequest::GetMessageProperties` + a `TdResult::MessagePropertiesLoaded`
+completion (editing architecture §4.7/§4.3 first, per rule 8), requests it on
+selection, and updates the selected message's `caps` when the result arrives.
+T26 also fills empty `ReplyPreview.excerpt`s from the local window (same-chat
+replies arrive excerpt-less).
+
 **Goal:** `chips_for` derivation (architecture §4.2) and selection handlers: enter/leave selection, `↑`/`↓` message movement, `←`/`→` chip cursor with scroll, `⏎` invoke, letter shortcuts, chip actions emitting effects (Reply → composer context, Copy → `Effect::CopyToClipboard`, Delete → push `Modal(ConfirmDelete)`, Forward → chat picker via palette deferred to T41 — v1 forwards to the currently filtered chat list selection, Edit → composer edit mode, React → `ToggleReaction` with default emoji set). Adds `selection: Option<SelectionState>` field to `ConversationState`.
 **Owns:** `crates/core/src/state/selection.rs`, `crates/core/src/model/chips.rs`, `crates/core/src/state/conversation.rs` (field + selection plumbing only).
 **Depends on:** T24.
