@@ -1,0 +1,15 @@
+---
+source: crates/ui/src/view/auth.rs
+expression: rendered
+---
+Scan this QR code with Telegram on anoth
+                                        
+     Terminal too small for QR code.    
+                                        
+    Open this link on another device:   
+      tg://login?token=AAAABBBBCCCC     
+                                        
+                                        
+                                        
+                                        
+Settings → Devices → Link Desktop Device
