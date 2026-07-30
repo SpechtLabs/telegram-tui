@@ -1462,10 +1462,15 @@ impl TelemetryEvent {
 macro_rules! emit {
     ($event:expr) => {{
         let __ev: $crate::telemetry::TelemetryEvent = $event;
+        // Field order note (T03): `action` (a non-dotted field) must sit
+        // between `target:` and the first dotted field — tracing 0.1.44's
+        // macro grammar hits a local ambiguity if a dotted field like
+        // `telemetry.public` immediately follows `target:`. Same fields,
+        // same values, reordered only.
         ::tracing::info!(
             target: "tgt_telemetry",
-            telemetry.public = true,
             action = __ev.action,
+            telemetry.public = true,
             outcome = __ev.outcome.as_str(),
             error.kind = __ev.error_kind,
             duration_ms = __ev.duration_ms,
