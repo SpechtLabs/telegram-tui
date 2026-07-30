@@ -1,0 +1,22 @@
+---
+source: crates/core/src/telemetry/schema.rs
+expression: ALLOWED_KEYS
+---
+[
+  "app.version",
+  "os.version",
+  "term.program",
+  "term.graphics_protocol",
+  "term.width_bucket",
+  "install.id",
+  "session.id",
+  "action",
+  "outcome",
+  "error.kind",
+  "duration_ms",
+  "chat.kind",
+  "chat.hash",
+  "history.page_depth",
+  "download.size_bucket",
+  "telemetry.public"
+]
