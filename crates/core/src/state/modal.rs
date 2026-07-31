@@ -21,7 +21,7 @@ use crate::app::AppState;
 use crate::effect::Effect;
 use crate::model::key::Key;
 use crate::state::focus::{Focus, ModalKind};
-use crate::td::request::TdRequest;
+use crate::td::request::{OutgoingFileKind, TdRequest};
 
 /// Which of `ConfirmDelete`'s two options is selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,9 +94,31 @@ pub fn handle_key(app: &mut AppState, modal_ui: &mut ModalState, key: Key) -> Op
             }
             _ => Some(Vec::new()),
         },
-        ModalKind::ConfirmSendFile { .. } => match key {
+        // `path` here came either from a parsed `/send <path>` (core does
+        // not validate existence — no filesystem access, architecture §9.3)
+        // or from a pasted bare path the app layer already confirmed exists
+        // (`crates/app/src/media_kind.rs::existing_path`). Either way this
+        // modal has no way to tell which, so both are treated the same: no
+        // open chat is the only local no-op condition; anything else about
+        // the path's validity surfaces later as a TDLib send failure.
+        ModalKind::ConfirmSendFile { path } => match key {
             Key::Esc => None,
-            Key::Enter => Some(vec![]), // T39 wires SendMessageFile
+            Key::Enter => {
+                let Some(chat_id) = app.open_chat else {
+                    return Some(Vec::new());
+                };
+                // `kind` is always `Document` from core: core cannot sniff a
+                // file's MIME type (no filesystem access). The dispatcher
+                // (`crates/app/src/dispatch.rs`, wired in T40) upgrades
+                // `kind` via `media_kind::kind_for(&path)` before the
+                // request ever reaches TDLib.
+                Some(vec![Effect::Td(TdRequest::SendMessageFile {
+                    chat_id,
+                    path,
+                    kind: OutgoingFileKind::Document,
+                    caption: None,
+                })])
+            }
             _ => Some(Vec::new()),
         },
     }
@@ -118,6 +140,7 @@ mod tests {
     use crate::state::toasts::ToastState;
     use crate::td::update::{AuthPhase, ConnectionPhase};
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     const CHAT: ChatId = ChatId(1);
     const MSG: MessageId = MessageId(42);
@@ -256,12 +279,43 @@ mod tests {
     }
 
     #[test]
-    fn confirm_send_file_scaffold_emits_no_effects() {
+    fn confirm_send_file_emits_send_message_file() {
         let mut app = fixture_state(Focus::Modal(ModalKind::ConfirmSendFile {
             path: "/tmp/example.txt".into(),
         }));
         let mut modal_ui = ModalState::default();
+
         let effects = handle_key(&mut app, &mut modal_ui, Key::Enter);
+
+        let effects = effects.expect("confirm must claim the key");
+        assert_eq!(effects.len(), 1, "expected exactly one effect: {effects:?}");
+        match &effects[0] {
+            Effect::Td(TdRequest::SendMessageFile {
+                chat_id,
+                path,
+                kind,
+                caption,
+            }) => {
+                assert_eq!(*chat_id, CHAT);
+                assert_eq!(path, &PathBuf::from("/tmp/example.txt"));
+                // Core cannot sniff MIME; the dispatcher upgrades this later.
+                assert_eq!(*kind, OutgoingFileKind::Document);
+                assert!(caption.is_none());
+            }
+            other => panic!("expected Effect::Td(SendMessageFile), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_send_file_without_open_chat_is_a_noop() {
+        let mut app = fixture_state(Focus::Modal(ModalKind::ConfirmSendFile {
+            path: "/tmp/example.txt".into(),
+        }));
+        app.open_chat = None;
+        let mut modal_ui = ModalState::default();
+
+        let effects = handle_key(&mut app, &mut modal_ui, Key::Enter);
+
         assert_claimed_no_effects(effects);
     }
 
