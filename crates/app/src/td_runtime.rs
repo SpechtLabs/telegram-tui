@@ -89,6 +89,10 @@ pub struct TdlibRuntime {
     /// the receive thread. See [`SeededFiles`].
     seeded_files: Arc<SeededFiles>,
     receiving: Arc<AtomicBool>,
+    /// Taken by [`TdlibRuntime::shutdown`], which is the only caller that
+    /// needs to *wait* for the receive thread rather than merely ask it to
+    /// stop. `Drop` leaves it in place and unjoined — see both.
+    receive_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl TdlibRuntime {
@@ -112,7 +116,7 @@ impl TdlibRuntime {
         let seeded_files = Arc::new(SeededFiles::default());
         let receiving = Arc::new(AtomicBool::new(true));
 
-        spawn_receive_thread(
+        let receive_thread = spawn_receive_thread(
             client_id,
             updates_tx.clone(),
             Arc::clone(&names),
@@ -130,7 +134,52 @@ impl TdlibRuntime {
             names,
             seeded_files,
             receiving,
+            receive_thread: Mutex::new(Some(receive_thread)),
         }
+    }
+
+    /// Stops the receive thread **and waits for it to exit**, which is what
+    /// makes replacing this client with a fresh one safe.
+    ///
+    /// # Why a restart cannot just drop and recreate
+    ///
+    /// `tdlib_rs::receive()` (lib.rs:35) reads the one global `td_receive`
+    /// queue shared by every client in the process, and the loop below
+    /// discards anything whose `@client_id` is not its own — there is no way
+    /// to put an update back. Two receive threads therefore race for one
+    /// queue and eat each other's updates. `Drop` only *asks* the thread to
+    /// stop and returns immediately, leaving it alive for up to one 2 s
+    /// `receive()` timeout, so a naive drop-then-create has a window in
+    /// which the dying thread swallows the new client's
+    /// `authorizationStateWaitTdlibParameters` — the one update the restart
+    /// is waiting for.
+    ///
+    /// So: join first, create second. The wait is bounded by that same 2 s
+    /// timeout and only happens on a deliberate restart.
+    ///
+    /// Responses are not at risk either way: `@extra` correlation goes
+    /// through tdlib-rs's global `OBSERVER`, keyed by a counter rather than
+    /// by client, so whichever thread receives a response notifies the right
+    /// waiter.
+    pub async fn shutdown(&self) {
+        self.receiving.store(false, Ordering::Release);
+        let handle = self
+            .receive_thread
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        // On the blocking pool: the thread is inside a 2 s C call and
+        // joining it from the async worker would stall the whole runtime.
+        if tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the tdlib receive thread panicked while shutting down");
+        }
+        tracing::debug!("tdlib receive thread joined");
     }
 
     /// The TDLib client id this runtime owns. Exposed for diagnostics only —
@@ -494,8 +543,12 @@ impl TdRuntime for TdlibRuntime {
 impl Drop for TdlibRuntime {
     fn drop(&mut self) {
         // The receive thread notices within one `receive()` timeout (2 s) and
-        // exits; it is never joined, because joining would stall shutdown for
-        // that timeout with nothing useful to wait for.
+        // exits; it is never joined here, because joining would stall
+        // shutdown for that timeout with nothing useful to wait for. The
+        // process is going away and the thread goes with it.
+        //
+        // A *restart* is the case where the wait is worth it, and it calls
+        // [`TdlibRuntime::shutdown`] explicitly rather than relying on this.
         self.receiving.store(false, Ordering::Release);
     }
 }
@@ -513,7 +566,7 @@ fn spawn_receive_thread(
     names: Arc<NameCache>,
     seeded_files: Arc<SeededFiles>,
     receiving: Arc<AtomicBool>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("tdlib-receive".to_string())
         .spawn(move || {
@@ -554,7 +607,7 @@ fn spawn_receive_thread(
             }
             tracing::debug!("tdlib receive thread stopped");
         })
-        .expect("failed to spawn the tdlib receive thread");
+        .expect("failed to spawn the tdlib receive thread")
 }
 
 async fn init_tdlib_logging(client_id: i32, log_path: Option<PathBuf>) {
