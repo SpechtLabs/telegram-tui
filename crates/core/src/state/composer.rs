@@ -9,7 +9,7 @@ use crate::model::entity::FormattedText;
 use crate::model::ids::MessageId;
 use crate::model::key::Key;
 use crate::state::auth::InputField;
-use crate::state::focus::Focus;
+use crate::state::focus::{Focus, ModalKind};
 use crate::td::request::TdRequest;
 use crate::td::update::TdUpdate;
 
@@ -47,9 +47,42 @@ pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
     }
 
     match key {
-        Key::Enter => Some(submit(app, chat_id)),
+        // A pending path offer (from a bare-path paste, see [`handle_paste`])
+        // takes priority over both `/send` parsing and a normal text submit:
+        // the offer already IS a fully-formed intent to send a file, so
+        // `Enter` here means "yes, send it" rather than "submit whatever the
+        // input buffer holds" (the buffer was left untouched when the offer
+        // was made — see `handle_paste`'s doc comment).
+        Key::Enter if app.composer.pending_path_offer.is_some() => {
+            let path = app
+                .composer
+                .pending_path_offer
+                .take()
+                .expect("checked Some above");
+            app.focus
+                .push(Focus::Modal(ModalKind::ConfirmSendFile { path }));
+            Some(Vec::new())
+        }
+        Key::Enter => match try_send_command(app) {
+            Some(effects) => Some(effects),
+            None => Some(submit(app, chat_id)),
+        },
         Key::AltEnter => {
             insert_char(&mut app.composer.input, '\n');
+            Some(Vec::new())
+        }
+        // Claimed only to discard a pending path offer; an ordinary `Esc`
+        // with no offer pending is left unclaimed (falls through to `_`)
+        // so the router's generic pop/back-to-chat-list handling still
+        // applies. NOTE: `core/src/app.rs`'s `dispatch_key` currently
+        // intercepts `Esc` globally (step 3) ahead of the focused-pane
+        // dispatch (step 4), so this arm cannot fire through the live
+        // router yet — reordering that is an `app.rs` change outside this
+        // task's ownership. The logic lives here, ready for whenever that
+        // reordering (or an offer-aware special case) lands; direct callers
+        // of `handle_key` (this module's own tests) already exercise it.
+        Key::Esc if app.composer.pending_path_offer.is_some() => {
+            app.composer.pending_path_offer = None;
             Some(Vec::new())
         }
         Key::Up => {
@@ -176,6 +209,129 @@ fn submit(app: &mut AppState, chat_id: crate::model::ids::ChatId) -> Vec<Effect>
             },
         })]
     }
+}
+
+const SEND_COMMAND: &str = "/send";
+
+/// `/send <path>` (spec §10). Parsing only: the path is taken verbatim (no
+/// tilde expansion, no existence check — both are I/O core cannot perform,
+/// see [`looks_like_path`]'s doc comment for the full purity split). On a
+/// successful parse the input buffer is cleared exactly as [`submit`] clears
+/// it on an ordinary send, and `Focus::Modal(ConfirmSendFile)` is pushed;
+/// existence is validated later, either by `crates/app/src/media_kind.rs`'s
+/// `existing_path` before dispatch, or as an ordinary send failure surfaced
+/// by TDLib itself if it slips through.
+///
+/// Returns `None` when `input` is not a `/send` command at all (so the
+/// caller falls through to a normal text submit); `Some(vec![])` when it is
+/// `/send` with a missing/blank argument (claimed, no-op — the input is left
+/// alone so the user can fix it); `Some(vec![])` with the modal pushed as a
+/// side effect on a successful parse (no `Effect` carries a focus change,
+/// architecture §4.4).
+fn try_send_command(app: &mut AppState) -> Option<Vec<Effect>> {
+    let text = app.composer.input.text.as_str();
+    if text != SEND_COMMAND && !text.starts_with("/send ") {
+        return None;
+    }
+    let arg = text.strip_prefix(SEND_COMMAND).unwrap_or(text).trim();
+    if arg.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let path = PathBuf::from(arg);
+    app.composer.input.text.clear();
+    app.composer.input.cursor = 0;
+    app.focus
+        .push(Focus::Modal(ModalKind::ConfirmSendFile { path }));
+    Some(Vec::new())
+}
+
+/// Pure heuristic for "this pasted text is probably a filesystem path":
+/// starts with `/`, `~/`, or `./`, has something after that prefix, and is a
+/// single line. NOT an existence check — core has no filesystem access
+/// (architecture §9.3's purity rules), so it cannot be one. This is one half
+/// of a deliberate split documented on the plan (T39):
+///
+/// - Core ([`handle_paste`], this function): decides *whether to offer* a
+///   send from pasted text, using only the string itself.
+/// - `tgt-app`'s `crates/app/src/media_kind.rs::existing_path` (impure):
+///   does the actual tilde-expansion (needs `$HOME`) and `fs` existence
+///   check before a `/send` or offered path is ever handed to TDLib.
+///
+/// Consequently `pending_path_offer` can hold a path that turns out not to
+/// exist — confirming it in that state surfaces as an ordinary send failure
+/// once TDLib (or the app-layer pre-check) rejects it, per the plan's
+/// resolution recorded in this task's final report.
+pub fn looks_like_path(s: &str) -> bool {
+    if s.contains('\n') || s.contains('\r') {
+        return false;
+    }
+    let trimmed = s.trim();
+    let after_prefix = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("./"))
+        .or_else(|| trimmed.strip_prefix('/'));
+    matches!(after_prefix, Some(rest) if !rest.is_empty())
+}
+
+/// Bracketed paste (spec §10: "terminals paste dropped files as plain text
+/// paths, so the composer detects a bare existing path and offers to send
+/// it"). When the pasted text [`looks_like_path`], it is held as
+/// `pending_path_offer` instead of being inserted into the input buffer —
+/// `Enter` in `handle_key` turns a pending offer into a
+/// `Focus::Modal(ConfirmSendFile)` push, `Esc` discards it. Anything else
+/// pastes as ordinary text at the cursor, one char at a time (multi-byte
+/// paste content is not assumed to already sit at char boundaries).
+///
+/// Same claim rules as [`handle_key`] (`Screen::Main`, a chat open, composer
+/// focused) — checked here rather than shared, since this isn't itself a
+/// `handle_key` match arm (paste is a distinct `Action`, not a `Key`).
+///
+/// Not yet wired from `Action::Paste`: `core/src/app.rs`'s `dispatch` still
+/// drops `Paste` in its catch-all `_ => Vec::new()` arm (see the comment
+/// there). Routing `Action::Paste` into this function is an `app.rs` change,
+/// outside this task's ownership (`composer.rs`/`modal.rs`/`media_kind.rs`
+/// only) — left for whichever later task wires it.
+pub fn handle_paste(app: &mut AppState, text: String) {
+    if app.screen != Screen::Main || app.open_chat.is_none() {
+        return;
+    }
+    if *app.focus.current() != Focus::Composer {
+        return;
+    }
+
+    if looks_like_path(&text) {
+        app.composer.pending_path_offer = Some(PathBuf::from(text.trim()));
+    } else {
+        for c in text.chars() {
+            insert_char(&mut app.composer.input, c);
+        }
+    }
+}
+
+/// Cancels an in-flight upload tracked under `message_id`
+/// (`AppState::media.uploads`, architecture §4.6). TDLib has no dedicated
+/// "cancel upload" request — `CancelDownloadFile` (`state/media.rs`) is for
+/// the download side only — so v1 cancels by deleting the optimistic pending
+/// message itself: `revoke: false`, since a still-uploading message was
+/// never visible to the other side, so there is nothing to revoke there.
+///
+/// Drops the tracked [`crate::state::media::UploadProgress`] entry
+/// immediately rather than waiting for TDLib's `MessagesDeleted` push — the
+/// upload's own progress stops being meaningful the instant the user
+/// cancels, and `state/media.rs`'s `progress_upload` is already a no-op
+/// against an untracked id, so no dangling-write hazard is introduced by
+/// removing it early. A `message_id` with no tracked upload (already
+/// completed, or never started) is a no-op: no effects.
+pub fn cancel_upload(app: &mut AppState, message_id: MessageId) -> Vec<Effect> {
+    let Some(progress) = app.media.uploads.remove(&message_id) else {
+        return Vec::new();
+    };
+    vec![Effect::Td(TdRequest::DeleteMessages {
+        chat_id: progress.chat_id,
+        message_ids: vec![message_id],
+        revoke: false,
+    })]
 }
 
 /// Moves `pending_send` (if any) back into `input`, cursor at the end.
@@ -612,5 +768,175 @@ mod tests {
 
         // pending_send was already None: the new draft is left untouched.
         assert_eq!(app.composer.input.text, "new draft");
+    }
+
+    // --- T39: /send, pasted-path offers, upload cancel ---------------------
+
+    /// The core half of the plan's `send_command_parses_path_and_validates_existence`.
+    /// "Validates existence" is the app-layer half — see
+    /// `crates/app/src/media_kind.rs`'s test of the same name — because
+    /// existence checks are I/O and core is pure (module docs on
+    /// [`looks_like_path`] record the full split). This half only asserts
+    /// the parse: a well-formed `/send <path>` opens the confirm modal with
+    /// exactly that path and clears the input; a missing argument is a
+    /// claimed no-op; plain text is not treated as the command at all.
+    #[test]
+    fn send_command_parses_path_and_validates_existence() {
+        let mut app = fixture_state();
+        app.composer.input.text = "/send /tmp/photo.jpg".to_string();
+        app.composer.input.cursor = 20;
+
+        let effects = handle_key(&mut app, Key::Enter).expect("composer claims Enter");
+
+        assert!(effects.is_empty());
+        assert_eq!(app.composer.input.text, "");
+        assert_eq!(app.composer.input.cursor, 0);
+        assert_eq!(
+            *app.focus.current(),
+            Focus::Modal(ModalKind::ConfirmSendFile {
+                path: PathBuf::from("/tmp/photo.jpg"),
+            })
+        );
+    }
+
+    #[test]
+    fn send_command_with_missing_arg_is_a_claimed_noop() {
+        let mut app = fixture_state();
+        app.composer.input.text = "/send".to_string();
+        app.composer.input.cursor = 5;
+
+        let effects = handle_key(&mut app, Key::Enter).expect("composer claims Enter");
+
+        assert!(effects.is_empty());
+        assert_eq!(app.composer.input.text, "/send");
+        assert_eq!(*app.focus.current(), Focus::Composer);
+
+        app.composer.input.text = "/send   ".to_string();
+        app.composer.input.cursor = 8;
+        let effects = handle_key(&mut app, Key::Enter).expect("composer claims Enter");
+        assert!(effects.is_empty());
+        assert_eq!(*app.focus.current(), Focus::Composer);
+    }
+
+    #[test]
+    fn plain_text_starting_with_slash_send_word_is_not_the_command() {
+        let mut app = fixture_state();
+        app.composer.input.text = "/sendoff tomorrow".to_string();
+
+        let effects = handle_key(&mut app, Key::Enter).expect("composer claims Enter");
+
+        // Falls through to an ordinary text submit, not the file command.
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::Td(TdRequest::SendMessageText { .. })
+        ));
+        assert_eq!(*app.focus.current(), Focus::Composer);
+    }
+
+    #[test]
+    fn looks_like_path_accepts_absolute_home_and_relative_prefixes() {
+        assert!(looks_like_path("/tmp/dropped.png"));
+        assert!(looks_like_path("~/Downloads/dropped.png"));
+        assert!(looks_like_path("./dropped.png"));
+        assert!(looks_like_path("  /tmp/dropped.png  "));
+    }
+
+    #[test]
+    fn looks_like_path_rejects_ordinary_text() {
+        assert!(!looks_like_path("hello there"));
+        assert!(!looks_like_path("/"));
+        assert!(!looks_like_path("~/"));
+        assert!(!looks_like_path(""));
+        assert!(!looks_like_path("/tmp/one\n/tmp/two"));
+    }
+
+    #[test]
+    fn pasted_bare_path_offers_send() {
+        let mut app = fixture_state();
+
+        handle_paste(&mut app, "/tmp/dropped.png".to_string());
+
+        assert_eq!(
+            app.composer.pending_path_offer,
+            Some(PathBuf::from("/tmp/dropped.png"))
+        );
+        // The offer replaces the ordinary paste-insert: nothing landed in
+        // the input buffer for this pasted text.
+        assert_eq!(app.composer.input.text, "");
+
+        // Enter with an offer pending opens the confirm modal and clears it.
+        let effects = handle_key(&mut app, Key::Enter).expect("composer claims Enter");
+        assert!(effects.is_empty());
+        assert!(app.composer.pending_path_offer.is_none());
+        assert_eq!(
+            *app.focus.current(),
+            Focus::Modal(ModalKind::ConfirmSendFile {
+                path: PathBuf::from("/tmp/dropped.png"),
+            })
+        );
+    }
+
+    #[test]
+    fn pasted_ordinary_text_inserts_normally() {
+        let mut app = fixture_state();
+
+        handle_paste(&mut app, "just some words".to_string());
+
+        assert!(app.composer.pending_path_offer.is_none());
+        assert_eq!(app.composer.input.text, "just some words");
+    }
+
+    #[test]
+    fn esc_with_pending_offer_discards_it() {
+        let mut app = fixture_state();
+        handle_paste(&mut app, "/tmp/dropped.png".to_string());
+        assert!(app.composer.pending_path_offer.is_some());
+
+        let effects = handle_key(&mut app, Key::Esc).expect("composer claims Esc for the offer");
+
+        assert!(effects.is_empty());
+        assert!(app.composer.pending_path_offer.is_none());
+        assert_eq!(*app.focus.current(), Focus::Composer);
+    }
+
+    #[test]
+    fn esc_without_pending_offer_is_unclaimed() {
+        let mut app = fixture_state();
+        assert!(app.composer.pending_path_offer.is_none());
+        assert!(handle_key(&mut app, Key::Esc).is_none());
+    }
+
+    #[test]
+    fn upload_cancellable_before_completion() {
+        let mut app = fixture_state();
+        let msg_id = MessageId(-7);
+        crate::state::media::start_upload(&mut app, msg_id, CHAT, 2_000);
+        crate::state::media::progress_upload(&mut app, msg_id, 500);
+        assert!(app.media.uploads.contains_key(&msg_id));
+
+        let effects = cancel_upload(&mut app, msg_id);
+
+        assert!(!app.media.uploads.contains_key(&msg_id));
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Effect::Td(TdRequest::DeleteMessages {
+                chat_id,
+                message_ids,
+                revoke,
+            }) => {
+                assert_eq!(*chat_id, CHAT);
+                assert_eq!(message_ids, &vec![msg_id]);
+                assert!(!revoke);
+            }
+            other => panic!("expected Effect::Td(DeleteMessages), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_upload_without_tracked_entry_is_a_noop() {
+        let mut app = fixture_state();
+        let effects = cancel_upload(&mut app, MessageId(-99));
+        assert!(effects.is_empty());
     }
 }
