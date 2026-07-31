@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.3](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.2...v0.1.3) (2026-07-31)
+
+
+### Features
+
+* auto-download photos for inline display ([088a945](https://github.com/SpechtLabs/telegram-tui/commit/088a94540a765b47d736dc796f65a9c1f77d457a))
+* render inline images in supported terminals ([5cf85e5](https://github.com/SpechtLabs/telegram-tui/commit/5cf85e58582633eb1ab3ab80e795acfdc136b851))
+* **ui:** built-in theme catalogue with runtime switching ([64e2030](https://github.com/SpechtLabs/telegram-tui/commit/64e2030afb6af7e08ec2d5382a71b46be84a69e5))
+* **ui:** message rendering — inline receipts, single-line attachments, tertiary timestamps ([0819281](https://github.com/SpechtLabs/telegram-tui/commit/0819281b6718e80d6da42861bec0880fda6a5cd5))
+* **ui:** modern chrome — borderless panes, padding, visual hierarchy ([c4dc36d](https://github.com/SpechtLabs/telegram-tui/commit/c4dc36d701d3cfab9c7f98ec9859ede6f41fe846))
+
+
+### Bug Fixes
+
+* **app:** seed file state from message payloads so downloads survive restart ([9acc9c6](https://github.com/SpechtLabs/telegram-tui/commit/9acc9c60180c8e9043efa68b26ed54c5e6c0915f))
+* **app:** stop the draw gate from swallowing frames ([7a65b44](https://github.com/SpechtLabs/telegram-tui/commit/7a65b441a5cf08e2d676df0073d6023c9b093753))
+* **core:** fill the viewport when a chat opens cold ([e8c7eeb](https://github.com/SpechtLabs/telegram-tui/commit/e8c7eebf6d357035079f77328b05fda514bff440))
+* **ui:** erase inline images instead of only forgetting them ([2f92913](https://github.com/SpechtLabs/telegram-tui/commit/2f92913c30e2d5a8ee6c902a62bd5149b9e1dd7f))
+
 ## [0.1.2](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.1...v0.1.2) (2026-07-31)
 
 
