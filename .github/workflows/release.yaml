@@ -62,17 +62,26 @@ permissions:
 # private repos — and a superseded run proves nothing about the current head.
 # Releases are exempt: cancelling one half-way could leave a tag published
 # with no binary attached to it.
-# A manual repair gets a group of its own, keyed by the tag it is rebuilding.
-# With cancel-in-progress false GitHub keeps only ONE pending run per group, so
-# while this shared `github.ref` with ordinary pushes, every push to main
-# cancelled a queued repair before it started — which is exactly when a repair
-# is wanted, since the branch is active precisely because something is being
-# fixed. v0.1.4's repair was cancelled twice this way. Keying on the tag also
-# means two repairs of different tags no longer block each other, while a
-# second repair of the same tag still queues behind the first.
+# Every run gets a group nothing else can occupy: a repair is keyed by the tag
+# it rebuilds, a push by its own commit. Neither can evict the other, and two
+# pushes cannot evict each other.
+#
+# That is deliberate rather than lax, and it was learned twice. With
+# cancel-in-progress false GitHub still keeps only ONE *pending* run per group,
+# so a shared group means a newer run evicts a waiting one. v0.1.4's repair was
+# cancelled that way twice before it ran a single job. Then v0.1.5 was worse:
+# release-please had already created the tag when a later push evicted the
+# queued run, publishing a tag with zero assets — the exact outcome the
+# original "releases are exempt from cancellation" note was written to prevent,
+# arriving through eviction rather than cancellation.
+#
+# The cost is that two release runs can now overlap on rapid pushes. That is
+# the cheaper failure: release-please reconciles its own PR and only one push
+# ever creates a release, whereas an evicted run leaves a published tag with
+# nothing attached and needs a manual repair to finish.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   ci:
