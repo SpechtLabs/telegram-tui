@@ -18,6 +18,16 @@
 //! position, forward first, then backward, and takes the first row that
 //! survives filtering. This keeps the cursor close to where the user left
 //! it instead of snapping to the top of the list.
+//!
+//! ## Scroll viewport vs. selection
+//!
+//! `scroll_offset` is the wheel's, `selected` is the keyboard's — a wheel
+//! step (`scroll_viewport`) moves one without touching the other. Core has
+//! no idea how tall the sidebar renders, so `clamp_scroll` can only keep
+//! `scroll_offset` inside `[0, visible_rows().len() - 1]` and stop it
+//! sitting below `selected`'s row (never scrolled the selection off above
+//! the top); the rest of "keep the selection visible" — following it from
+//! below — needs the pane height and is `tgt-ui`'s job.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -53,6 +63,14 @@ pub struct ChatListState {
     pub active_list: ChatListId,
     pub selected: Option<ChatId>,
     pub filter: Option<InputField>,
+    /// Index into `visible_rows(&self)` of the first row the sidebar draws —
+    /// the mouse wheel's viewport position, independent of `selected`. See
+    /// [`scroll_viewport`] and [`clamp_scroll`] for what keeps it honest:
+    /// core has no notion of the pane's rendered height, so this is only
+    /// clamped to a valid row index and to never sit below `selected` (never
+    /// scrolled the selection off above the top). Keeping the selection
+    /// visible from *below* needs the height, which only `tgt-ui` has, so
+    /// that half of "keep the selection visible" is the view's job.
     pub scroll_offset: usize,
     pub load: ChatLoadPhase,
 }
@@ -172,19 +190,25 @@ fn apply_position(app: &mut AppState, chat_id: ChatId, position: ChatPositionEnt
     }
 }
 
-/// Keeps `selected` on a visible row. No-op while the current selection is
-/// still visible (or unset); see the module docs for the "nearest surviving
-/// row" rule.
+/// Keeps `selected` on a visible row. No-op on the selection itself while
+/// the current selection is still visible (or unset); see the module docs
+/// for the "nearest surviving row" rule. Always finishes by re-clamping
+/// `scroll_offset` (`clamp_scroll`), since a re-sort or a filter edit can
+/// shrink `visible_rows` or move `selected` out from under a scroll position
+/// the wheel left behind.
 fn reconcile_selection(app: &mut AppState) {
     let Some(sel) = app.chat_list.selected else {
+        clamp_scroll(app);
         return;
     };
     let visible = visible_rows(&app.chat_list);
     if visible.contains(&sel) {
+        clamp_scroll(app);
         return;
     }
     if visible.is_empty() {
         app.chat_list.selected = None;
+        clamp_scroll(app);
         return;
     }
 
@@ -210,6 +234,55 @@ fn reconcile_selection(app: &mut AppState) {
         .copied();
 
     app.chat_list.selected = nearest.or_else(|| visible.first().copied());
+    clamp_scroll(app);
+}
+
+/// The only clamp core can perform without knowing the sidebar's rendered
+/// height: keeps `scroll_offset` pointing at a real row (0 when the list is
+/// empty, `visible_rows().len() - 1` at most otherwise) and never lets it
+/// sit below `selected`'s row, which would mean the selection scrolled off
+/// above the top of the window. It deliberately does *not* pull
+/// `scroll_offset` up to follow `selected` from below — that side of "keep
+/// the selection visible" needs the pane height, so it belongs to the view
+/// (see `ChatListState::scroll_offset`'s docs).
+fn clamp_scroll(app: &mut AppState) {
+    let rows = visible_rows(&app.chat_list);
+    if rows.is_empty() {
+        app.chat_list.scroll_offset = 0;
+        return;
+    }
+    let max = rows.len() - 1;
+    if app.chat_list.scroll_offset > max {
+        app.chat_list.scroll_offset = max;
+    }
+    if let Some(sel) = app.chat_list.selected
+        && let Some(idx) = rows.iter().position(|&id| id == sel)
+        && idx < app.chat_list.scroll_offset
+    {
+        app.chat_list.scroll_offset = idx;
+    }
+}
+
+/// Wheel scroll over the sidebar: moves `scroll_offset` by one row and
+/// leaves `selected` untouched. The wheel points at what the user is
+/// looking at; the selection is where their intent is pointed, and a mouse
+/// wheel shouldn't move it (this task's whole fix — see its report for the
+/// spec correction). Clamped so scrolling past either end of the current
+/// `visible_rows` is a no-op rather than landing the offset past the last
+/// row.
+pub fn scroll_viewport(app: &mut AppState, up: bool) {
+    let rows = visible_rows(&app.chat_list);
+    if rows.is_empty() {
+        app.chat_list.scroll_offset = 0;
+        return;
+    }
+    let max = rows.len() - 1;
+    let offset = app.chat_list.scroll_offset.min(max);
+    app.chat_list.scroll_offset = if up {
+        offset.saturating_sub(1)
+    } else {
+        (offset + 1).min(max)
+    };
 }
 
 /// Walks the active list's order set (already sorted by TDLib order; never
@@ -331,6 +404,10 @@ pub fn cycle_folder(app: &mut AppState, forward: bool) {
 
 fn reset_selection_to_first_visible(app: &mut AppState) {
     app.chat_list.selected = visible_rows(&app.chat_list).first().copied();
+    // A folder/archive switch is a new list; a scroll position carried over
+    // from the old one is stale. `clamp_scroll` pulls it down to the new
+    // selection (row 0) rather than leaving it pointed mid-list.
+    clamp_scroll(app);
 }
 
 /// Active while focus is `ChatList` or `ChatFilter` (spec §6.2 routing:
@@ -457,6 +534,10 @@ fn move_selection(app: &mut AppState, delta: i32) {
         None => 0,
     };
     app.chat_list.selected = Some(rows[new_idx]);
+    // `↑`/`↓` can walk the selection above a scroll position the wheel left
+    // behind; pull the window back down to it. See `clamp_scroll`'s docs for
+    // why this is one-directional.
+    clamp_scroll(app);
 }
 
 /// Enter on a selected row: opens the chat and requests the newest page of
@@ -1058,5 +1139,124 @@ mod tests {
         assert_eq!(app.chat_list.active_list, ChatListId::Archive);
         cycle_folder(&mut app, true);
         assert_eq!(app.chat_list.active_list, ChatListId::Archive);
+    }
+
+    /// This task's fix: a wheel step over the sidebar moves the viewport,
+    /// never the selection. Before, the mouse handler replayed `↑`/`↓`.
+    #[test]
+    fn wheel_does_not_move_selection() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 30));
+        handle_td(&mut app, &new_chat_with_order(2, "Bob", 20));
+        handle_td(&mut app, &new_chat_with_order(3, "Carol", 10));
+        app.chat_list.selected = Some(ChatId(1));
+
+        scroll_viewport(&mut app, false);
+        scroll_viewport(&mut app, false);
+        scroll_viewport(&mut app, true);
+
+        assert_eq!(app.chat_list.selected, Some(ChatId(1)));
+        assert_eq!(app.chat_list.scroll_offset, 1);
+    }
+
+    /// `scroll_viewport` clamps at both ends: scrolling up from 0 stays at
+    /// 0, scrolling down past the last row stops at `len - 1` rather than
+    /// pointing past it.
+    #[test]
+    fn wheel_clamps_at_both_ends() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 30));
+        handle_td(&mut app, &new_chat_with_order(2, "Bob", 20));
+        handle_td(&mut app, &new_chat_with_order(3, "Carol", 10));
+
+        // Already at the top: scrolling up is a no-op, not a panic.
+        scroll_viewport(&mut app, true);
+        assert_eq!(app.chat_list.scroll_offset, 0);
+
+        // Scroll past the bottom: clamps at the last row's index (2), never
+        // beyond it.
+        for _ in 0..10 {
+            scroll_viewport(&mut app, false);
+        }
+        assert_eq!(app.chat_list.scroll_offset, 2);
+
+        // And back up, one row at a time.
+        scroll_viewport(&mut app, true);
+        assert_eq!(app.chat_list.scroll_offset, 1);
+    }
+
+    /// An empty list clamps to 0 rather than underflowing `len - 1`.
+    #[test]
+    fn wheel_on_empty_list_stays_at_zero() {
+        let mut app = fixture_state();
+        scroll_viewport(&mut app, false);
+        assert_eq!(app.chat_list.scroll_offset, 0);
+        scroll_viewport(&mut app, true);
+        assert_eq!(app.chat_list.scroll_offset, 0);
+    }
+
+    /// A folder switch resets the selection to the new list's first row
+    /// (existing behavior); the scroll position the wheel left on the old
+    /// list is now stale and must not carry over and point mid-list into
+    /// the new one.
+    #[test]
+    fn folder_switch_resets_stale_scroll_offset() {
+        let mut app = fixture_state();
+        handle_td(
+            &mut app,
+            &new_chat_with_position(1, "Main A", ChatListId::Main, 20, false),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(2, "Main B", ChatListId::Main, 10, false),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(3, "Work", ChatListId::Folder(1), 10, false),
+        );
+
+        // Wheel Main's viewport down to its last row (index 1).
+        scroll_viewport(&mut app, false);
+        assert_eq!(app.chat_list.scroll_offset, 1);
+
+        // Switching to Folder(1) resets selection to its first row; the
+        // stale offset from Main (which had 2 rows) must not carry over and
+        // point past Folder(1)'s single row.
+        cycle_folder(&mut app, true);
+        assert_eq!(app.chat_list.active_list, ChatListId::Folder(1));
+        assert_eq!(app.chat_list.scroll_offset, 0);
+
+        // Scroll Folder(1), then toggle to the (single-row) archive: same
+        // reset on that axis too.
+        handle_td(
+            &mut app,
+            &new_chat_with_position(4, "Old", ChatListId::Archive, 5, false),
+        );
+        toggle_archive(&mut app);
+        assert_eq!(app.chat_list.active_list, ChatListId::Archive);
+        assert_eq!(app.chat_list.scroll_offset, 0);
+    }
+
+    /// Keyboard selection can walk above a scroll position the wheel left
+    /// behind; `move_selection` pulls the window back down so the newly
+    /// selected row is not scrolled off above the top.
+    #[test]
+    fn keyboard_selection_pulls_scroll_offset_down_to_stay_visible_from_above() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 30));
+        handle_td(&mut app, &new_chat_with_order(2, "Bob", 20));
+        handle_td(&mut app, &new_chat_with_order(3, "Carol", 10));
+        app.chat_list.selected = Some(ChatId(3));
+
+        // Wheel down to the bottom of the (3-row) list.
+        scroll_viewport(&mut app, false);
+        scroll_viewport(&mut app, false);
+        assert_eq!(app.chat_list.scroll_offset, 2);
+
+        // `↑` moves the selection from row 2 (Carol) to row 1 (Bob), above
+        // the wheel-scrolled window: the offset follows it back down.
+        move_selection(&mut app, -1);
+        assert_eq!(app.chat_list.selected, Some(ChatId(2)));
+        assert_eq!(app.chat_list.scroll_offset, 1);
     }
 }

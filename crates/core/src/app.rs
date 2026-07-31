@@ -879,19 +879,17 @@ impl App {
         effects
     }
 
-    /// Wheel over the sidebar: moves `chat_list.selected` like `↑`/`↓` do,
-    /// without touching the focus stack — a chat-list scroll is claimed by
-    /// the pane regardless of what holds the keyboard (architecture §7.5),
-    /// which is exactly what the `Focus::ChatList` push/pop bracket in
-    /// [`Self::click_chat_row`] buys here too: `chat_list::handle_key`'s
-    /// real `Up`/`Down` arms run, and the stack is back to whatever it was
-    /// before this call returns.
+    /// Wheel over the sidebar: moves the viewport (`chat_list.scroll_offset`)
+    /// and leaves `chat_list.selected` alone — the wheel is for looking
+    /// around, the selection is where the user's intent is pointed, and
+    /// conflating the two was this task's bug (a mouse wheel used to move
+    /// the selection like `↑`/`↓`). Claimed independently of focus, same as
+    /// every other `ScrollArea` arm, so no `Focus::ChatList` push/pop is
+    /// needed here — unlike [`Self::click_chat_row`], this never calls into
+    /// key handling.
     fn scroll_chat_list(&mut self, up: bool) -> Vec<Effect> {
-        self.state.focus.push(Focus::ChatList);
-        let key = if up { Key::Up } else { Key::Down };
-        let effects = chat_list::handle_key(&mut self.state, key).unwrap_or_default();
-        self.state.focus.pop();
-        effects
+        chat_list::scroll_viewport(&mut self.state, up);
+        Vec::new()
     }
 
     /// Wheel over the conversation viewport: extends
@@ -2731,11 +2729,14 @@ mod routing {
         );
     }
 
-    /// The chat-list wheel claims the pane on its own — moving `selected`
-    /// even while the keyboard focus is elsewhere — and gives the focus
-    /// stack back exactly as found.
+    /// The chat-list wheel claims the pane on its own — even while the
+    /// keyboard focus is elsewhere — but moves only `scroll_offset`, the
+    /// viewport. `selected` and the focus stack are untouched: a mouse
+    /// wheel looks around, it doesn't move the user's selection (this
+    /// task's fix — the wheel used to replay `↑`/`↓` and drag the selection
+    /// along with it).
     #[test]
-    fn scroll_chat_list_moves_selection_without_focus_change() {
+    fn scroll_chat_list_moves_viewport_without_selection_or_focus_change() {
         let mut app = chat_open();
         app.update(Action::Td(chat(2, "Bob", 20)));
         assert_eq!(app.state().chat_list.selected, Some(ChatId(1)));
@@ -2744,10 +2745,11 @@ mod routing {
         let focus_before = app.state().focus.current().clone();
         let effects = app.update(Action::Scroll {
             area: ScrollArea::ChatList,
-            up: true,
+            up: false,
         });
         assert!(effects.is_empty());
-        assert_eq!(app.state().chat_list.selected, Some(ChatId(2)));
+        assert_eq!(app.state().chat_list.selected, Some(ChatId(1)));
+        assert_eq!(app.state().chat_list.scroll_offset, 1);
         assert_eq!(*app.state().focus.current(), focus_before);
         assert_eq!(app.state().focus.depth(), 1);
         assert!(app.take_dirty());
