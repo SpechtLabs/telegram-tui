@@ -16,10 +16,17 @@ env:
 
 jobs:
   check:
-    name: Checks
-    # aarch64-apple-darwin is the only supported target (spec §2), so the
-    # gates run where the code actually ships.
-    runs-on: macos-15
+    # macOS is the supported platform and the only one a release is built for
+    # (see release.yaml). Linux and Windows are experimental: they are built
+    # and tested here so a port regression is caught, but nobody has run the
+    # client on them. A failure on any of the three is a real failure — an
+    # ignored job would be worse than no job.
+    name: Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -53,7 +60,12 @@ jobs:
       - name: Tests
         run: mise run test
 
+      # A bash script reading `cargo tree`. The forbidden edges are the same
+      # everywhere, so running it once is the whole signal; the other two
+      # would only add shell-portability failures that say nothing about the
+      # dependency graph.
       - name: Crate boundaries
+        if: matrix.os == 'ubuntu-latest'
         run: mise run boundaries
 
       - name: Pending snapshots
