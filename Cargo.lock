@@ -5461,7 +5461,7 @@ dependencies = [
 
 [[package]]
 name = "tgt-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arboard",
  "async-trait",
@@ -5500,7 +5500,7 @@ dependencies = [
 
 [[package]]
 name = "tgt-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "hmac 0.13.0",
@@ -5516,7 +5516,7 @@ dependencies = [
 
 [[package]]
 name = "tgt-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossterm",
  "image",
