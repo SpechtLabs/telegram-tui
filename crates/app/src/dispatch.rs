@@ -3,8 +3,18 @@
 //! `Action::TdResult` / `Action::Io`, which is the only way a result ever
 //! reaches the pure `update()`.
 //!
-//! Wired so far: `Quit`, `Telemetry`, `Td`, `SaveConfig`. Clipboard,
-//! `OpenExternal` (T32) and `Alert` (T44) are still logged and dropped.
+//! Wired so far: `Quit`, `Telemetry`, `Td`, `SaveConfig`, `CopyToClipboard`,
+//! `OpenExternal`. `Alert` (T44) is still logged and dropped.
+//!
+//! # Opening a file externally
+//!
+//! `OpenExternal` shells out to `open` on macOS, overridable through
+//! `TGT_OPENER` — which is what the integration tests point at a harmless
+//! command, and what a user on a non-macOS terminal would set to
+//! `xdg-open`. The child is spawned and awaited for its exit status only:
+//! nothing it writes is read, because a viewer inheriting this process's
+//! stdio would paint over the TUI. `Stdio::null()` on all three streams is
+//! the enforcement.
 //!
 //! # `SetTdlibParameters` — the impure boundary
 //!
@@ -28,7 +38,7 @@ use tokio::sync::{mpsc, watch};
 
 use tgt_core::action::{Action, IoErrorKind, IoResult, TdResult};
 use tgt_core::effect::{ConfigPatch, Effect};
-use tgt_core::model::ids::ChatId;
+use tgt_core::model::ids::{ChatId, FileId, MessageId};
 use tgt_core::model::message::MessageView;
 use tgt_core::td::error::TdError;
 use tgt_core::td::request::{TdRequest, TdResponse, TdlibParams};
@@ -52,6 +62,11 @@ pub struct TdBootParams {
 /// `system_version` is left to TDLib, which probes the OS itself.
 const SYSTEM_LANGUAGE_CODE: &str = "en";
 const DEVICE_MODEL: &str = "Mac";
+
+/// Command `Effect::OpenExternal` runs, and the environment variable that
+/// overrides it. See the module docs.
+const DEFAULT_OPENER: &str = "open";
+const OPENER_ENV: &str = "TGT_OPENER";
 
 /// Executes `Effect`s produced by `App::update`. Everything an effect needs
 /// lives behind one `Arc` so a spawned task can outlive the call that
@@ -110,6 +125,14 @@ impl Dispatcher {
             Effect::SaveConfig(patch) => {
                 let inner = Arc::clone(&self.inner);
                 tokio::spawn(async move { inner.save_config(patch).await });
+            }
+            Effect::CopyToClipboard { text } => {
+                let inner = Arc::clone(&self.inner);
+                tokio::spawn(async move { inner.copy_to_clipboard(text).await });
+            }
+            Effect::OpenExternal { path } => {
+                let inner = Arc::clone(&self.inner);
+                tokio::spawn(async move { inner.open_external(path).await });
             }
             other => {
                 tracing::debug!(
@@ -220,6 +243,78 @@ impl Inner {
             self.send_tdlib_parameters().await;
         }
     }
+
+    /// `arboard` talks to the platform clipboard synchronously (a round trip
+    /// through NSPasteboard on macOS), so it goes on the blocking pool like
+    /// every other blocking call in this crate.
+    ///
+    /// The `Clipboard` handle is built and dropped inside the task rather
+    /// than cached on `Inner`: it is neither `Sync` nor cheap to hold across
+    /// a suspended TUI, and a copy happens at human speed.
+    async fn copy_to_clipboard(&self, text: String) {
+        let copied = tokio::task::spawn_blocking(move || {
+            arboard::Clipboard::new()
+                .and_then(|mut clipboard| clipboard.set_text(text))
+                .map_err(|e| e.to_string())
+        })
+        .await;
+
+        let outcome = match copied {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "could not write to the clipboard");
+                Err(IoErrorKind::Other)
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "the clipboard task did not finish");
+                Err(IoErrorKind::Other)
+            }
+        };
+        let _ = self
+            .action_tx
+            .send(Action::Io(IoResult::ClipboardCopied { outcome }))
+            .await;
+    }
+
+    /// Hands a downloaded file to the platform viewer. See the module docs
+    /// for the opener command and why the child's stdio is discarded.
+    async fn open_external(&self, path: PathBuf) {
+        let opener = std::env::var(OPENER_ENV).unwrap_or_else(|_| DEFAULT_OPENER.to_string());
+        let status = tokio::process::Command::new(&opener)
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+
+        let outcome = match status {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => {
+                tracing::warn!(opener, ?status, "the opener exited non-zero");
+                Err(IoErrorKind::Other)
+            }
+            // A missing opener binary is the one failure with a distinct
+            // cause worth telling the domain about: everything else the
+            // viewer might do is `Other`.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(opener, "no such opener command");
+                Err(IoErrorKind::NotFound)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(opener, "not allowed to run the opener");
+                Err(IoErrorKind::Denied)
+            }
+            Err(err) => {
+                tracing::warn!(opener, error = %err, "could not run the opener");
+                Err(IoErrorKind::Other)
+            }
+        };
+        let _ = self
+            .action_tx
+            .send(Action::Io(IoResult::ExternalOpened { path, outcome }))
+            .await;
+    }
 }
 
 /// Which `TdResult` a request's response becomes. The mapping is by request
@@ -237,6 +332,34 @@ enum Completion {
     History {
         chat_id: ChatId,
         only_local: bool,
+    },
+    /// `sendMessage` returned the optimistic message with its temporary id.
+    Sent {
+        chat_id: ChatId,
+    },
+    MessageProperties {
+        chat_id: ChatId,
+        message_id: MessageId,
+    },
+    Edit {
+        chat_id: ChatId,
+        message_id: MessageId,
+    },
+    Delete {
+        chat_id: ChatId,
+    },
+    Forward {
+        to_chat_id: ChatId,
+    },
+    Reaction {
+        chat_id: ChatId,
+        message_id: MessageId,
+    },
+    Download {
+        file_id: FileId,
+    },
+    Search {
+        chat_id: ChatId,
     },
     LogOut,
     /// Executed for its effect inside TDLib; whatever state it changes comes
@@ -269,9 +392,41 @@ fn completion_for(request: &TdRequest) -> Completion {
         | TdRequest::CloseChat { .. }
         | TdRequest::ViewMessages { .. } => Completion::FireAndForget,
         TdRequest::LogOut => Completion::LogOut,
-        // Send, edit, delete, forward, reactions, downloads and search
-        // complete into their own variants from M4 on.
-        _ => Completion::Unwired,
+        TdRequest::SendMessageText { chat_id, .. } => Completion::Sent { chat_id: *chat_id },
+        TdRequest::GetMessageProperties {
+            chat_id,
+            message_id,
+        } => Completion::MessageProperties {
+            chat_id: *chat_id,
+            message_id: *message_id,
+        },
+        TdRequest::EditMessageText {
+            chat_id,
+            message_id,
+            ..
+        } => Completion::Edit {
+            chat_id: *chat_id,
+            message_id: *message_id,
+        },
+        TdRequest::DeleteMessages { chat_id, .. } => Completion::Delete { chat_id: *chat_id },
+        TdRequest::ForwardMessages { to_chat_id, .. } => Completion::Forward {
+            to_chat_id: *to_chat_id,
+        },
+        TdRequest::ToggleReaction {
+            chat_id,
+            message_id,
+            ..
+        } => Completion::Reaction {
+            chat_id: *chat_id,
+            message_id: *message_id,
+        },
+        TdRequest::DownloadFile { file_id, .. } => Completion::Download { file_id: *file_id },
+        TdRequest::SearchChatMessages { chat_id, .. } => Completion::Search { chat_id: *chat_id },
+        // Uploads (T39) and download cancellation (T36) are the last two
+        // without a consumer for their completion.
+        TdRequest::SendMessageFile { .. } | TdRequest::CancelDownloadFile { .. } => {
+            Completion::Unwired
+        }
     }
 }
 
@@ -297,7 +452,101 @@ fn map_completion(
             only_local,
             outcome: outcome.map(messages_of),
         }),
+        Completion::Sent { chat_id } => Some(TdResult::MessageSent {
+            chat_id,
+            outcome: outcome.and_then(|response| match response {
+                TdResponse::Message(view) => Ok(view),
+                other => Err(unexpected_response("sendMessage", "a Message", &other)),
+            }),
+        }),
+        Completion::MessageProperties {
+            chat_id,
+            message_id,
+        } => Some(TdResult::MessagePropertiesLoaded {
+            chat_id,
+            message_id,
+            outcome: outcome.and_then(|response| match response {
+                TdResponse::MessageProperties(caps) => Ok(caps),
+                other => Err(unexpected_response(
+                    "getMessageProperties",
+                    "MessageProperties",
+                    &other,
+                )),
+            }),
+        }),
+        Completion::Edit {
+            chat_id,
+            message_id,
+        } => Some(TdResult::EditDone {
+            chat_id,
+            message_id,
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::Delete { chat_id } => Some(TdResult::DeleteDone {
+            chat_id,
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::Forward { to_chat_id } => Some(TdResult::ForwardDone {
+            to_chat_id,
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::Reaction {
+            chat_id,
+            message_id,
+        } => Some(TdResult::ReactionDone {
+            chat_id,
+            message_id,
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::Download { file_id } => Some(TdResult::DownloadStarted {
+            file_id,
+            outcome: outcome.and_then(|response| match response {
+                TdResponse::File(file) => Ok(file),
+                other => Err(unexpected_response("downloadFile", "a File", &other)),
+            }),
+        }),
+        Completion::Search { chat_id } => Some(TdResult::SearchDone {
+            chat_id,
+            outcome: outcome.map(found_message_ids),
+        }),
         Completion::FireAndForget | Completion::Unwired => None,
+    }
+}
+
+/// A response of the wrong shape for its request, reported to the domain as
+/// an error rather than swallowed.
+///
+/// The three completions that use this — send, capability lookup, download —
+/// each carry a payload the state machine cannot invent, and each has a
+/// well-defined error path: a failed send restores the composer text (spec
+/// §14), failed caps leave the chip row alone, a failed download leaves the
+/// affordance on Download. Dropping the completion instead would strand the
+/// state that is waiting for it.
+fn unexpected_response(request: &str, expected: &str, got: &TdResponse) -> TdError {
+    tracing::warn!(
+        request,
+        expected,
+        response = ?std::mem::discriminant(got),
+        "td response has the wrong shape for its request"
+    );
+    TdError::Other {
+        code: 0,
+        message: format!("{request} did not answer with {expected}"),
+    }
+}
+
+/// Search answers with ids or, if the mapping layer produced something else,
+/// with none — an empty hit list is a value the search state has a rule for.
+fn found_message_ids(response: TdResponse) -> Vec<MessageId> {
+    match response {
+        TdResponse::FoundMessages { message_ids } => message_ids,
+        other => {
+            tracing::debug!(
+                response = ?std::mem::discriminant(&other),
+                "searchChatMessages answered with a non-FoundMessages response; treated as no hits"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -493,6 +742,165 @@ mod tests {
                 outcome: Ok(ref msgs),
             }) if msgs.is_empty()
         ));
+    }
+
+    #[tokio::test]
+    async fn send_message_completes_with_the_optimistic_message() {
+        let mut optimistic = message(ChatId(9), -1);
+        optimistic.send_state = SendState::Sending;
+        let script = ScriptStep::Await {
+            expect: RequestMatcher::Kind("SendMessageText".to_string()),
+            respond: RespondWith::Ok(TdResponse::Message(optimistic.clone())),
+        };
+        let (dispatcher, mut action_rx, _quit_rx) = dispatcher_with(
+            fake_runtime(&serde_json::to_string(&script).unwrap()),
+            Config::default(),
+        );
+
+        dispatcher.dispatch(Effect::Td(TdRequest::SendMessageText {
+            chat_id: ChatId(9),
+            reply_to: None,
+            text: FormattedText {
+                text: "hi".to_string(),
+                entities: Vec::new(),
+            },
+        }));
+
+        let action = action_rx.recv().await.expect("completion action");
+        let Action::TdResult(TdResult::MessageSent { chat_id, outcome }) = action else {
+            panic!("expected MessageSent, got {action:?}");
+        };
+        assert_eq!(chat_id, ChatId(9));
+        assert_eq!(outcome.unwrap(), optimistic);
+    }
+
+    /// The composer is holding the user's text until this completion arrives
+    /// (spec §14). A response the mapping cannot read must therefore come
+    /// back as an error, not as a dropped completion that strands the text.
+    #[tokio::test]
+    async fn send_answered_with_the_wrong_shape_is_an_error_not_a_dropped_completion() {
+        // `FakeTd` answers an unscripted request with a bare `Ok`.
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(fake_runtime(""), Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::SendMessageText {
+            chat_id: ChatId(9),
+            reply_to: None,
+            text: FormattedText {
+                text: "hi".to_string(),
+                entities: Vec::new(),
+            },
+        }));
+
+        let action = action_rx.recv().await.expect("completion action");
+        assert!(
+            matches!(
+                action,
+                Action::TdResult(TdResult::MessageSent {
+                    outcome: Err(_),
+                    ..
+                })
+            ),
+            "got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_message_properties_completes_with_the_fetched_caps() {
+        let caps = MessageCaps {
+            can_be_edited: true,
+            can_be_deleted_for_all_users: true,
+            can_be_deleted_only_for_self: true,
+            can_be_forwarded: true,
+            can_be_saved: true,
+        };
+        let script = ScriptStep::Await {
+            expect: RequestMatcher::Kind("GetMessageProperties".to_string()),
+            respond: RespondWith::Ok(TdResponse::MessageProperties(caps)),
+        };
+        let (dispatcher, mut action_rx, _quit_rx) = dispatcher_with(
+            fake_runtime(&serde_json::to_string(&script).unwrap()),
+            Config::default(),
+        );
+
+        dispatcher.dispatch(Effect::Td(TdRequest::GetMessageProperties {
+            chat_id: ChatId(9),
+            message_id: MessageId(3),
+        }));
+
+        let action = action_rx.recv().await.expect("completion action");
+        // Which message the caps belong to is not in the response: like
+        // `getChatHistory`, it can only come from the request.
+        let Action::TdResult(TdResult::MessagePropertiesLoaded {
+            chat_id,
+            message_id,
+            outcome,
+        }) = action
+        else {
+            panic!("expected MessagePropertiesLoaded, got {action:?}");
+        };
+        assert_eq!(chat_id, ChatId(9));
+        assert_eq!(message_id, MessageId(3));
+        assert_eq!(outcome.unwrap(), caps);
+    }
+
+    #[tokio::test]
+    async fn delete_completes_as_delete_done_for_its_chat() {
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(fake_runtime(""), Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::DeleteMessages {
+            chat_id: ChatId(9),
+            message_ids: vec![MessageId(3)],
+            revoke: true,
+        }));
+
+        assert!(matches!(
+            action_rx.recv().await.expect("completion action"),
+            Action::TdResult(TdResult::DeleteDone {
+                chat_id: ChatId(9),
+                outcome: Ok(()),
+            })
+        ));
+    }
+
+    /// Whether this machine has a usable clipboard is not what is under test
+    /// — that the effect is executed and reports back exactly once is.
+    #[tokio::test]
+    async fn clipboard_effect_reports_an_io_completion() {
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(fake_runtime(""), Config::default());
+
+        dispatcher.dispatch(Effect::CopyToClipboard {
+            text: "copied".to_string(),
+        });
+
+        assert!(matches!(
+            action_rx.recv().await.expect("completion action"),
+            Action::Io(IoResult::ClipboardCopied { .. })
+        ));
+    }
+
+    /// The opener is spawned for real. A path that cannot be opened is the
+    /// safe way to prove it: the completion still has to come back, and it
+    /// has to carry the path the domain asked about (nothing else in the
+    /// response identifies it).
+    #[tokio::test]
+    async fn open_external_reports_back_with_the_path_it_was_given() {
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(fake_runtime(""), Config::default());
+        let target = PathBuf::from("/nonexistent/tgt-open-external-test");
+
+        dispatcher.dispatch(Effect::OpenExternal {
+            path: target.clone(),
+        });
+
+        let action = action_rx.recv().await.expect("completion action");
+        let Action::Io(IoResult::ExternalOpened { path, outcome }) = action else {
+            panic!("expected ExternalOpened, got {action:?}");
+        };
+        assert_eq!(path, target);
+        assert!(outcome.is_err(), "opening a missing file cannot succeed");
     }
 
     #[tokio::test]

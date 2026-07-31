@@ -22,9 +22,13 @@ use tgt_core::state::focus::Focus;
 
 use crate::render::cache::LayoutCache;
 use crate::theme::Theme;
-use crate::view::{chat_list, conversation, header, hint_bar};
+use crate::view::{chat_list, chips, composer, conversation, header, hint_bar, modal};
 
 const SIDEBAR_WIDTH: u16 = 30;
+
+/// The composer's bare rounded box: two border rows and one row of text.
+/// Banners stack on top of it (see [`composer_banner_rows`]).
+const COMPOSER_BOX_ROWS: u16 = 3;
 
 /// `cache` is threaded down to the conversation pane, the only view that lays
 /// messages out and therefore the only one that can hit or fill it.
@@ -42,6 +46,26 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCa
         draw_two_pane(inner, state, theme, f, cache);
     } else {
         draw_single_pane(inner, state, theme, f, cache);
+    }
+
+    // Last, and over the whole frame: a modal dims and covers the panes it
+    // is raised above, and core guarantees `Focus::Modal` is on top of the
+    // stack exactly while one is open (`app.rs::sync_modal_storage`).
+    if matches!(state.focus.current(), Focus::Modal(_)) {
+        modal::draw(state, theme, f);
+    }
+}
+
+/// The bottom row: selection mode replaces the hint bar with its chip row
+/// (spec §6.3), every other focus gets the hint line for its context.
+/// `hint_bar::hint_for` returning `None` for `Focus::Selection` is that
+/// module's way of saying "not mine to draw"; this is where the alternative
+/// is chosen, because the frame layout is what knows there is a row here.
+fn draw_bottom_row(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
+    if matches!(state.focus.current(), Focus::Selection) {
+        chips::draw(area, state, theme, f);
+    } else {
+        hint_bar::draw_for(area, state.focus.current(), theme, f);
     }
 }
 
@@ -68,9 +92,7 @@ fn draw_two_pane(
     header::draw(header_area, state, theme, f);
     draw_conversation_and_composer(body_area, state, theme, f, cache);
 
-    // T32 wires selection mode's chip row (view::chips::draw) in place of
-    // the hint bar.
-    hint_bar::draw(hint_area, theme, f);
+    draw_bottom_row(hint_area, state, theme, f);
 }
 
 /// Single-pane stack below the breakpoint (spec §6.1): full-width chat list,
@@ -90,7 +112,7 @@ fn draw_single_pane(
         let [list_area, hint_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
         chat_list::draw(list_area, state, theme, f);
-        hint_bar::draw(hint_area, theme, f);
+        draw_bottom_row(hint_area, state, theme, f);
         return;
     }
 
@@ -103,9 +125,7 @@ fn draw_single_pane(
 
     draw_breadcrumb(breadcrumb_area, state, theme, f);
     draw_conversation_and_composer(body_area, state, theme, f, cache);
-    // T32 wires selection mode's chip row (view::chips::draw) in place of
-    // the hint bar.
-    hint_bar::draw(hint_area, theme, f);
+    draw_bottom_row(hint_area, state, theme, f);
 }
 
 /// `telegram ▸ <chat title>` (spec §6.1): the single-pane stack's back
@@ -138,24 +158,27 @@ fn draw_conversation_and_composer(
     f: &mut Frame,
     cache: &mut LayoutCache,
 ) {
+    let composer_height = COMPOSER_BOX_ROWS + composer_banner_rows(state);
     let [conversation_area, composer_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
+        Layout::vertical([Constraint::Min(0), Constraint::Length(composer_height)]).areas(area);
 
     conversation::draw(conversation_area, state, theme, f, cache);
-    draw_composer_placeholder(composer_area, theme, f);
+    composer::draw(composer_area, state, theme, f);
 }
 
-/// Composer placeholder: real input handling lands in T30. T32 wires
-/// `view::composer::draw` in here once that module has a real implementation
-/// (it is still a stub in this worktree).
-fn draw_composer_placeholder(area: Rect, theme: &Theme, f: &mut Frame) {
-    let composer_block = Block::bordered().border_style(Style::new().fg(theme.text_muted));
-    let composer_inner = composer_block.inner(area);
-    f.render_widget(composer_block, area);
-    f.render_widget(
-        Paragraph::new("›  message…").style(Style::new().fg(theme.text_muted)),
-        composer_inner,
-    );
+/// How many banner rows `view::composer` will stack above its input box.
+/// That module takes the `Rect` it is handed and never grows it, so sizing
+/// the area is this caller's job — and getting it wrong is not cosmetic: a
+/// bare three-row area with one banner in it leaves the bordered box zero
+/// rows of interior, and the text being typed disappears.
+///
+/// Mirrors the banner conditions in `view::composer::draw`, which stays the
+/// source of truth for what actually renders.
+fn composer_banner_rows(state: &AppState) -> u16 {
+    let composer = &state.composer;
+    u16::from(composer.reply_to.is_some())
+        + u16::from(composer.editing.is_some())
+        + u16::from(composer.pending_send.is_some())
 }
 
 #[cfg(test)]
@@ -167,7 +190,8 @@ mod tests {
     use tgt_core::app::{AppState, Screen};
     use tgt_core::effect::TelemetryMode;
     use tgt_core::model::chat::{ChatKind, ChatOrderKey, ChatView};
-    use tgt_core::model::ids::ChatId;
+    use tgt_core::model::chips::Chip;
+    use tgt_core::model::ids::{ChatId, MessageId};
     use tgt_core::model::key::KeyBindings;
     use tgt_core::model::time::Millis;
     use tgt_core::state::auth::{AuthField, AuthState, InputField};
@@ -175,10 +199,12 @@ mod tests {
     use tgt_core::state::composer::ComposerState;
     use tgt_core::state::consent::{ConsentChoice, ConsentState};
     use tgt_core::state::conversation::{ConversationState, Scroll};
-    use tgt_core::state::focus::FocusStack;
+    use tgt_core::state::focus::{FocusStack, ModalKind};
     use tgt_core::state::history::PagingState;
     use tgt_core::state::media::MediaState;
+    use tgt_core::state::modal::ModalState;
     use tgt_core::state::presence::PresenceState;
+    use tgt_core::state::selection::SelectionState;
     use tgt_core::state::toasts::ToastState;
     use tgt_core::td::update::{AuthPhase, ConnectionPhase};
 
@@ -324,6 +350,72 @@ mod tests {
         assert!(rendered.contains("Alice Müller"));
         assert!(rendered.contains("message…"));
         insta::assert_snapshot!(rendered);
+    }
+
+    /// Spec §6.3: while a message is selected, the chip row *replaces* the
+    /// hint bar rather than sharing the row with it.
+    #[test]
+    fn selection_mode_draws_the_chip_row_instead_of_the_hint_bar() {
+        let mut state = fixture_state(120, Some(CHAT), FocusStack::new(Focus::Composer));
+        state.focus.push(Focus::Selection);
+        state.conversations.get_mut(&CHAT).unwrap().selection = Some(SelectionState {
+            message_id: MessageId(1),
+            chips: vec![Chip::Reply, Chip::Copy, Chip::Delete],
+            chip_cursor: 0,
+            chip_scroll: 0,
+        });
+
+        let rendered = render_to_string(120, 30, &state);
+        assert!(
+            rendered.contains("[R Reply]"),
+            "chip row missing:\n{rendered}"
+        );
+        assert!(rendered.contains("[X Delete]"));
+        assert!(
+            !rendered.contains(hint_bar::HINT_TEXT),
+            "the hint bar must give the row up entirely:\n{rendered}"
+        );
+    }
+
+    /// The modal is drawn last, over everything: the sidebar behind it is
+    /// covered, not merely overlapped.
+    #[test]
+    fn modal_overlay_covers_the_panes_beneath_it() {
+        let mut state = fixture_state(120, Some(CHAT), FocusStack::new(Focus::Composer));
+        state.focus.push(Focus::Modal(ModalKind::ConfirmDelete {
+            chat_id: CHAT,
+            message_id: MessageId(1),
+            can_revoke: true,
+        }));
+        state.modal_ui = Some(ModalState::default());
+
+        let rendered = render_to_string(120, 30, &state);
+        assert!(
+            rendered.contains("Delete for everyone"),
+            "modal missing:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Alice Müller"),
+            "the sidebar shows through the modal:\n{rendered}"
+        );
+    }
+
+    /// The composer's banners are rows the *caller* has to reserve. Without
+    /// the extra row the bordered box has no interior and the draft the user
+    /// is replying with vanishes.
+    #[test]
+    fn reply_banner_gets_a_row_of_its_own_without_squeezing_the_input() {
+        let mut state = fixture_state(120, Some(CHAT), FocusStack::new(Focus::Composer));
+        state.composer.reply_to = Some(MessageId(1));
+        state.composer.input.text = "on it".to_string();
+        state.composer.input.cursor = 5;
+
+        assert_eq!(composer_banner_rows(&state), 1);
+        let rendered = render_to_string(120, 30, &state);
+        assert!(
+            rendered.contains("on it"),
+            "the draft was squeezed out by the banner:\n{rendered}"
+        );
     }
 
     #[test]

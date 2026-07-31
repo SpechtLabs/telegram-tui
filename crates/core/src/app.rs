@@ -215,13 +215,31 @@ impl App {
                 }
                 Vec::new()
             }
-            // The send RPC returned. The composer's half is the held text
-            // (dropped on success, restored on failure — spec §14); the
-            // optimistic append into the window is `conversation.rs`'s and
-            // arrives with T32.
+            // The send RPC returned. Two halves: the composer's is the held
+            // text (dropped on success, restored on failure — spec §14), the
+            // window's is architecture §5.2's optimistic append of the
+            // message TDLib just minted with a temporary id, so the user sees
+            // it before the confirmation push arrives.
+            //
+            // The append is routed through `conversation::handle_td`'s
+            // existing `NewMessage` arm rather than through a second append
+            // path: it is the same operation (dedupe by id, insert in id
+            // order, evict to the window bound, drop a dangling selection),
+            // and TDLib pushes `updateNewMessage` for this very message as
+            // well — which that dedupe is exactly what makes harmless.
             Action::TdResult(result @ TdResult::MessageSent { .. }) => {
                 self.dirty = true;
-                composer::handle_td_result(&mut self.state, &result)
+                let mut effects = composer::handle_td_result(&mut self.state, &result);
+                if let TdResult::MessageSent {
+                    outcome: Ok(view), ..
+                } = &result
+                {
+                    effects.extend(conversation::handle_td(
+                        &mut self.state,
+                        &TdUpdate::NewMessage(view.clone()),
+                    ));
+                }
+                effects
             }
             // Capability flags for the message selection mode landed on
             // (architecture §7). An `Err` deliberately keeps the chips the
@@ -234,9 +252,14 @@ impl App {
                 self.dirty = true;
                 selection::handle_td_result(&mut self.state, chat_id, message_id, &outcome)
             }
-            // Paste, the remaining `TdResult` completions and `Io` land with
-            // the tasks that own their state (T36, T39, ...). Left as a
-            // deliberate no-op so `update` stays total over `Action`.
+            // Paste and the remaining completions land with the tasks that
+            // own their state. T32 wired the dispatcher end of all of them,
+            // so `EditDone`/`DeleteDone`/`ForwardDone`/`ReactionDone` and the
+            // `Io` results genuinely arrive here now — they are no-ops
+            // because what the user sees of them is the push update that
+            // follows (`MessageContentChanged`, `MessagesDeleted`, ...); it
+            // is their *failure* that still needs a home, which is T44's
+            // toasts. Left total over `Action` either way.
             _ => Vec::new(),
         }
     }

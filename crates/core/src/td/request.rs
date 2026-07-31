@@ -3,7 +3,7 @@
 use crate::model::chat::ChatListId;
 use crate::model::entity::FormattedText;
 use crate::model::ids::{ChatId, FileId, MessageId};
-use crate::model::message::{FileSnapshot, MessageView};
+use crate::model::message::{FileSnapshot, MessageCaps, MessageView};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -153,11 +153,22 @@ impl TdRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TdResponse {
     Ok,
-    Chats { chat_ids: Vec<ChatId> },
-    Messages { messages: Vec<MessageView> },
+    Chats {
+        chat_ids: Vec<ChatId>,
+    },
+    Messages {
+        messages: Vec<MessageView>,
+    },
     Message(MessageView),
-    FoundMessages { message_ids: Vec<MessageId> },
+    FoundMessages {
+        message_ids: Vec<MessageId>,
+    },
     File(FileSnapshot),
+    /// `getMessageProperties`: the capability flags TDLib withholds from
+    /// `message` (architecture §7). Carried on its own rather than folded
+    /// into a `MessageView` because the request answers about a message the
+    /// window already holds — only the caps are new.
+    MessageProperties(MessageCaps),
 }
 
 #[cfg(test)]
@@ -333,6 +344,20 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: TdRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn td_response_message_properties_serde_round_trips() {
+        let resp = TdResponse::MessageProperties(MessageCaps {
+            can_be_edited: true,
+            can_be_deleted_for_all_users: true,
+            can_be_deleted_only_for_self: true,
+            can_be_forwarded: false,
+            can_be_saved: true,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: TdResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
     }
 
     #[test]

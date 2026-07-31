@@ -1249,8 +1249,8 @@ impl TdRequest {
     pub fn kind(&self) -> &'static str;
 }
 // `GetMessageProperties` + `TdResult::MessagePropertiesLoaded` (§4.3) execute
-// the pending contract change recorded in §7; landed with T26. The
-// `TdResponse` carrier for the caps and the runtime/dispatch mapping land
+// the pending contract change recorded in §7; landed with T26, and the
+// `TdResponse::MessageProperties` carrier plus the runtime/dispatch mapping
 // with T32.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1261,6 +1261,8 @@ pub enum TdResponse {
     Message(MessageView),
     FoundMessages { message_ids: Vec<MessageId> },
     File(FileSnapshot),
+    /// getMessageProperties: the caps TDLib withholds from `message` (§7).
+    MessageProperties(MessageCaps),
 }
 ```
 
@@ -2009,9 +2011,13 @@ on later tasks):
   defaults the rest to `false`. **T26 must add a
   `TdRequest::GetMessageProperties { chat_id, message_id }` variant (+
   matching `TdResult` completion) and fetch properties when a message is
-  selected** — otherwise edit/delete/forward chips never light up. **Landed
-  in T26**: §4.7 carries the request, §4.3 the completion; the `TdResponse`
-  carrier and the runtime/dispatch mapping land with T32.
+  selected** — otherwise edit/delete/forward chips never light up. **Closed
+  out in T32**: T26 added the request (§4.7) and the completion (§4.3); T32
+  added the `TdResponse::MessageProperties(MessageCaps)` carrier, the real
+  `getMessageProperties` call in `TdlibRuntime`, and the dispatcher mapping
+  that turns it into `TdResult::MessagePropertiesLoaded`. `map_caps` on
+  `message` still yields `can_be_saved` only — it is the pessimistic starting
+  point the fetched caps replace, not a second source of truth.
 - **Reply excerpts are empty for same-chat replies** (TDLib only inlines
   quote/content for cross-chat replies). The conversation/selection layer
   (T16/T25/T26) fills `ReplyPreview.excerpt` from its own message window when

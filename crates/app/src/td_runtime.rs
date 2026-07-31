@@ -202,13 +202,22 @@ impl TdlibRuntime {
                     messages: self.map_messages(messages.messages),
                 })
             }
-            // T26 added the request (core issues it on every selection move);
-            // the `TdResponse` carrier for `MessageCaps` and the real
-            // `getMessageProperties` call belong to T32 together with the
-            // dispatch mapping, which today classifies this request as
-            // `Completion::Unwired`. Answering `Ok` keeps the boundary total
-            // without inventing capability flags nobody asked TDLib for.
-            TdRequest::GetMessageProperties { .. } => Ok(TdResponse::Ok),
+            // The flags `map_caps` cannot read off `message` (architecture
+            // §7). Selection mode fires this for every message it lands on,
+            // so the chip row is what TDLib will actually accept rather than
+            // a guess.
+            TdRequest::GetMessageProperties {
+                chat_id,
+                message_id,
+            } => {
+                let td_enums::MessageProperties::MessageProperties(props) =
+                    functions::get_message_properties(chat_id.0, message_id.0, client_id)
+                        .await
+                        .map_err(map_td_error)?;
+                Ok(TdResponse::MessageProperties(map_message_properties(
+                    &props,
+                )))
+            }
             TdRequest::ViewMessages {
                 chat_id,
                 message_ids,
@@ -927,12 +936,11 @@ fn map_send_state(state: Option<&td_enums::MessageSendingState>) -> SendState {
 /// TDLib 1.8.5x moved the per-message capability flags off `message` and onto
 /// `messageProperties`, fetched per message with `getMessageProperties`. Only
 /// `can_be_saved` still rides along on the message itself.
-//
-// TODO(T26 verification): chips derive from these flags (spec §5.3), so T26
-// must either fetch `getMessageProperties` for the focused message or accept
-// that edit/delete/forward chips never light up. Defaulting to `false` keeps
-// the UI honest — it under-promises rather than offering an action TDLib will
-// refuse.
+///
+/// These are therefore the *pessimistic* caps a message carries until
+/// selection mode asks for the real ones (`TdRequest::GetMessageProperties`
+/// → [`map_message_properties`]). Defaulting to `false` keeps the UI honest —
+/// it under-promises rather than offering an action TDLib will refuse.
 fn map_caps(message: &td_types::Message) -> MessageCaps {
     MessageCaps {
         can_be_edited: false,
@@ -940,6 +948,19 @@ fn map_caps(message: &td_types::Message) -> MessageCaps {
         can_be_deleted_only_for_self: false,
         can_be_forwarded: false,
         can_be_saved: message.can_be_saved,
+    }
+}
+
+/// The real caps, from `getMessageProperties`. TDLib's `messageProperties`
+/// carries three dozen flags; only the five the chip row is derived from
+/// (`model/chips.rs`) cross into `tgt_core`.
+fn map_message_properties(props: &td_types::MessageProperties) -> MessageCaps {
+    MessageCaps {
+        can_be_edited: props.can_be_edited,
+        can_be_deleted_for_all_users: props.can_be_deleted_for_all_users,
+        can_be_deleted_only_for_self: props.can_be_deleted_only_for_self,
+        can_be_forwarded: props.can_be_forwarded,
+        can_be_saved: props.can_be_saved,
     }
 }
 
