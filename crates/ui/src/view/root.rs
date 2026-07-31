@@ -22,7 +22,9 @@ use tgt_core::state::focus::Focus;
 
 use crate::render::cache::LayoutCache;
 use crate::theme::Theme;
-use crate::view::{chat_list, chips, composer, conversation, header, hint_bar, modal};
+use crate::view::{
+    chat_list, chips, composer, conversation, header, hint_bar, modal, palette, toast,
+};
 
 const SIDEBAR_WIDTH: u16 = 30;
 
@@ -48,11 +50,34 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCa
         draw_single_pane(inner, state, theme, f, cache);
     }
 
-    // Last, and over the whole frame: a modal dims and covers the panes it
-    // is raised above, and core guarantees `Focus::Modal` is on top of the
-    // stack exactly while one is open (`app.rs::sync_modal_storage`).
+    draw_overlays(state, theme, f);
+}
+
+/// The layers that sit over the whole frame rather than inside a pane, in
+/// the order they stack.
+///
+/// A modal and the palette are both raised by a focus level and are mutually
+/// exclusive by construction: `ctrl+p` is a global-layer key, and a modal is
+/// the one context that never lets a key reach that layer (spec §6.2), so at
+/// most one of these two is on top at a time. Each draws only while its own
+/// level is current — core guarantees the transient state exists exactly
+/// then (`app.rs::sync_modal_storage` for the modal, `toggle_palette` for
+/// the palette).
+///
+/// Toasts go last, unconditionally: they belong to no focus level (nothing
+/// is focused on them — `esc` dismisses the newest from wherever the user
+/// is), and `view::toast` is written to paint over whatever the frame
+/// already holds. A toast that arrived while the palette is up is still the
+/// newest thing on screen and still has to be readable.
+fn draw_overlays(state: &AppState, theme: &Theme, f: &mut Frame) {
     if matches!(state.focus.current(), Focus::Modal(_)) {
         modal::draw(state, theme, f);
+    }
+    if matches!(state.focus.current(), Focus::Palette) {
+        palette::draw(state, theme, f);
+    }
+    if !state.toasts.toasts.is_empty() {
+        toast::draw(state, theme, f);
     }
 }
 
@@ -183,7 +208,7 @@ fn composer_banner_rows(state: &AppState) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -203,9 +228,10 @@ mod tests {
     use tgt_core::state::history::PagingState;
     use tgt_core::state::media::MediaState;
     use tgt_core::state::modal::ModalState;
+    use tgt_core::state::palette::{CommandId, PaletteItem, PaletteState};
     use tgt_core::state::presence::PresenceState;
     use tgt_core::state::selection::SelectionState;
-    use tgt_core::state::toasts::ToastState;
+    use tgt_core::state::toasts::{Toast, ToastState};
     use tgt_core::td::update::{AuthPhase, ConnectionPhase};
 
     use super::*;
@@ -398,6 +424,64 @@ mod tests {
             !rendered.contains("Alice Müller"),
             "the sidebar shows through the modal:\n{rendered}"
         );
+    }
+
+    /// The palette is a second overlay above the same panes the modal covers,
+    /// raised by `Focus::Palette` rather than by `Focus::Modal`. Without this
+    /// wiring T46's view is unreachable from the running binary.
+    #[test]
+    fn palette_overlay_draws_over_the_two_pane_arrangement_120x40() {
+        let mut state = fixture_state(120, Some(CHAT), FocusStack::new(Focus::Composer));
+        state.height = 40;
+        state.focus.push(Focus::Palette);
+        state.palette = Some(PaletteState {
+            input: InputField {
+                text: "al".to_string(),
+                cursor: 2,
+            },
+            results: vec![
+                PaletteItem::Chat {
+                    id: CHAT,
+                    score: 120,
+                },
+                PaletteItem::Command {
+                    id: CommandId::ToggleTheme,
+                    score: 40,
+                },
+            ],
+            selected: 0,
+        });
+
+        let rendered = render_to_string(120, 40, &state);
+        assert!(
+            rendered.contains("palette"),
+            "the palette overlay is missing:\n{rendered}"
+        );
+        assert!(rendered.contains("Toggle theme"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// Toasts are the last thing painted and belong to no focus level, so
+    /// the chat list keeps its focus (and its hint bar) underneath them.
+    #[test]
+    fn toast_stack_draws_over_the_frame_120x40() {
+        let mut state = fixture_state(120, Some(CHAT), FocusStack::new(Focus::Composer));
+        state.height = 40;
+        state.toasts = ToastState {
+            toasts: VecDeque::from(vec![Toast {
+                chat_id: ChatId(2),
+                title: "Grace Hopper".to_string(),
+                body: "the compiler is done".to_string(),
+                expires_at: Millis(5_000),
+            }]),
+        };
+
+        let rendered = render_to_string(120, 40, &state);
+        assert!(
+            rendered.contains("the compiler is done"),
+            "the toast is missing:\n{rendered}"
+        );
+        insta::assert_snapshot!(rendered);
     }
 
     /// The composer's banners are rows the *caller* has to reserve. Without

@@ -22,11 +22,16 @@
 //! - `Scroll::At` looks up the anchor's real position in the window and
 //!   evicts from whichever end is currently farther from it. Because history
 //!   paging ([`apply_history_page`]) only ever fires while the anchor is
-//!   within `history::PAGE_TRIGGER_MESSAGES` of the oldest loaded message
-//!   (see `handle_key`'s near-top check), "farthest from the anchor" reduces
-//!   to the newest/back end in that case — i.e. the newly prepended page is
+//!   within `history::PAGE_TRIGGER_MESSAGES` of the oldest loaded message —
+//!   or older than the window entirely, see
+//!   [`trigger_paging_if_near_top`] — "farthest from the anchor" reduces to
+//!   the newest/back end in that case, i.e. the newly prepended page is
 //!   always kept and older *already-read* context nearer the anchor is never
-//!   what gets dropped.
+//!   what gets dropped. An anchor older than the whole window — a search hit
+//!   whose page has not arrived yet — cannot be located, and [`evict_excess`]
+//!   falls back to dropping from the front, which is the wrong end for it;
+//!   that only becomes reachable at a full `WINDOW_MAX_MESSAGES` window, and
+//!   ends the moment the page carrying the anchor lands.
 //!
 //! ## Reply excerpts (architecture §7 / T09 findings)
 //!
@@ -375,6 +380,13 @@ pub(crate) fn anchor_to(
     trigger_paging_if_near_top(convo, chat_id, now)
 }
 
+/// Whether `id` names a message older than every message loaded, which is
+/// the one way an anchor can point outside the window and still be reachable
+/// by paging (older history is the only direction v1 ever fetches).
+fn is_older_than_window(messages: &VecDeque<MessageView>, id: MessageId) -> bool {
+    messages.front().is_some_and(|oldest| id < oldest.id)
+}
+
 /// Binary search for `id` in the ascending-by-id window.
 pub(crate) fn index_of(messages: &VecDeque<MessageView>, id: MessageId) -> Option<usize> {
     let idx = messages.partition_point(|m| m.id < id);
@@ -458,9 +470,18 @@ fn move_anchor(
         }
         Scroll::At { message_id, .. } => match index_of(&convo.messages, message_id) {
             Some(idx) => idx as isize,
+            // Anchor older than everything loaded: a deliberate jump past
+            // the top of the window, waiting for the page that contains it
+            // (see [`trigger_paging_if_near_top`]). Moving it by `delta`
+            // is meaningless — there is nothing loaded around it to move
+            // through — so it stays put and the scroll spends itself on
+            // asking for that page instead.
+            None if is_older_than_window(&convo.messages, message_id) => {
+                return trigger_paging_if_near_top(convo, chat_id, now);
+            }
             None => {
-                // Anchor evicted or otherwise fell out of the window: the
-                // safest recovery is to re-pin to the newest known state.
+                // Evicted at the newest end, or otherwise gone: the safest
+                // recovery is to re-pin to the newest known state.
                 convo.scroll = Scroll::Bottom;
                 return Vec::new();
             }
@@ -483,8 +504,16 @@ fn move_anchor(
 
 /// Anchor is "near the top" when fewer than `PAGE_TRIGGER_MESSAGES` older
 /// messages remain loaded before it (index `< PAGE_TRIGGER_MESSAGES`,
-/// counting from the oldest loaded message at index 0).
-fn trigger_paging_if_near_top(
+/// counting from the oldest loaded message at index 0) — or when it names a
+/// message older than the whole window, which is *past* the top rather than
+/// near it.
+///
+/// That second case is not hypothetical: `state::search`'s `n` steps the
+/// anchor onto a search hit that TDLib found anywhere in the chat's history,
+/// which is routinely older than the page or two currently loaded. Bailing
+/// out on an anchor that isn't in the window would mean the one anchor move
+/// that most needs history fetched is the one that never asks for it.
+pub(crate) fn trigger_paging_if_near_top(
     convo: &mut ConversationState,
     chat_id: ChatId,
     now: Millis,
@@ -492,10 +521,11 @@ fn trigger_paging_if_near_top(
     let Scroll::At { message_id, .. } = convo.scroll else {
         return Vec::new();
     };
-    let Some(idx) = index_of(&convo.messages, message_id) else {
-        return Vec::new();
+    let near_top = match index_of(&convo.messages, message_id) {
+        Some(idx) => idx < history::PAGE_TRIGGER_MESSAGES,
+        None => is_older_than_window(&convo.messages, message_id),
     };
-    if idx >= history::PAGE_TRIGGER_MESSAGES {
+    if !near_top {
         return Vec::new();
     }
     let oldest_loaded = convo.messages.front().map(|m| m.id);
@@ -1331,6 +1361,70 @@ mod tests {
                 only_local: false,
             }
         );
+    }
+
+    /// An anchor older than the whole window is where `state::search`'s `n`
+    /// leaves the viewport when the hit TDLib found is off-window. Scrolling
+    /// from there must fetch the page that contains it — re-pinning to the
+    /// bottom instead would throw the jump away before it could ever be
+    /// drawn.
+    #[test]
+    fn scrolling_with_an_anchor_older_than_the_window_pages_instead_of_repinning() {
+        let mut app = fixture_state();
+        fixture_open(&mut app);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 100..=130 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.scroll = Scroll::At {
+            message_id: MessageId(42),
+            line_offset: 0,
+        };
+
+        let effects = handle_key(&mut app, Key::PageUp).unwrap();
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Td(TdRequest::GetChatHistory {
+                    chat_id: CHAT,
+                    from_message_id: MessageId(100),
+                    only_local: false,
+                    ..
+                })]
+            ),
+            "expected a page request from the oldest loaded message, got {effects:?}"
+        );
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(42),
+                line_offset: 0,
+            },
+            "the anchor must survive the scroll that pages it in"
+        );
+    }
+
+    /// The other half of the rule: an anchor that is *newer* than everything
+    /// loaded was evicted at the back, and no amount of older history will
+    /// bring it back — that one still re-pins.
+    #[test]
+    fn scrolling_with_an_anchor_newer_than_the_window_repins_to_bottom() {
+        let mut app = fixture_state();
+        fixture_open(&mut app);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 100..=130 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.scroll = Scroll::At {
+            message_id: MessageId(500),
+            line_offset: 0,
+        };
+
+        let effects = handle_key(&mut app, Key::PageUp).unwrap();
+
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
     }
 
     #[test]
