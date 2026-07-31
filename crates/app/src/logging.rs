@@ -2,40 +2,79 @@
 //! writer while the TUI is active, since nothing may reach stdout/stderr
 //! once raw mode and the alternate screen are engaged. See
 //! docs/architecture.md §9.3.
+//!
+//! This module owns the process's single subscriber. The OTLP exporter
+//! (`otel`) is a second layer in that same registry rather than a second
+//! subscriber, because only one subscriber can be global.
+//!
+//! # Why the export layer arrives late
+//!
+//! Whether to export at all depends on the config file (consent, mode,
+//! endpoint), and reading that config already wants to warn about unknown
+//! keys — which needs a subscriber. Rather than choosing which of the two
+//! loses, `init` installs a [`tracing_subscriber::reload`] placeholder for
+//! the exporter and hands back a handle; `main` fills it in once the config
+//! has been read and consent checked. Nothing is exported before that call,
+//! and the log file is live from the first line of `run_tui`.
 
 use std::path::PathBuf;
 
 use color_eyre::eyre;
 use etcetera::BaseStrategy;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
 const APP_DIR: &str = "telegram-tui";
 const LOG_FILE_PREFIX: &str = "tgt.log";
 
+/// The exporter layer, boxed so `logging` need not name the OTLP types.
+/// Layered directly onto the `Registry`, which is what lets it be boxed
+/// against a single, stable subscriber type.
+pub type ExportLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync + 'static>;
+
+/// Swaps the exporter into the live subscriber. See [`install_export_layer`].
+pub type ExportHandle = reload::Handle<Option<ExportLayer>, Registry>;
+
 /// Installs a daily-rolling, non-blocking file logger as the global tracing
-/// subscriber and returns its `WorkerGuard`. The guard must be held for the
-/// process lifetime: dropping it flushes and stops the writer thread.
-pub fn init() -> eyre::Result<WorkerGuard> {
+/// subscriber, with an empty slot reserved for the OTLP exporter.
+///
+/// The returned `WorkerGuard` must be held for the process lifetime:
+/// dropping it flushes and stops the writer thread.
+pub fn init() -> eyre::Result<(WorkerGuard, ExportHandle)> {
     let dir = state_dir()?;
     std::fs::create_dir_all(&dir)?;
 
     let file_appender = tracing_appender::rolling::daily(&dir, LOG_FILE_PREFIX);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
+    // `RUST_LOG` is a knob for the local file, so it is a per-layer filter
+    // rather than a global one. Turning the file log down to `warn` while
+    // debugging something noisy must not also silence telemetry, whose
+    // events are emitted at `info`.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_filter(env_filter);
+
+    let (export_slot, export_handle) = reload::Layer::new(None::<ExportLayer>);
 
     tracing_subscriber::registry()
-        .with(env_filter)
+        .with(export_slot)
         .with(file_layer)
         .try_init()
         .map_err(|err| eyre::eyre!("failed to install tracing subscriber: {err}"))?;
 
-    Ok(guard)
+    Ok((guard, export_handle))
+}
+
+/// Puts the OTLP exporter into the slot `init` reserved. Every event emitted
+/// after this returns is offered to it; everything before is file-only.
+pub fn install_export_layer(handle: &ExportHandle, layer: ExportLayer) -> eyre::Result<()> {
+    handle
+        .reload(Some(layer))
+        .map_err(|err| eyre::eyre!("failed to install the telemetry export layer: {err}"))
 }
 
 /// `$XDG_STATE_HOME/telegram-tui/`, defaulting to `~/.local/state/telegram-tui/`.
@@ -49,18 +88,26 @@ fn state_dir() -> eyre::Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
+pub(crate) mod tests {
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
 
-    // `XDG_STATE_HOME` is process-wide; serialize any test that mutates it
-    // so parallel `cargo test` runs don't race each other.
+    // The environment is process-wide; serialize any test that mutates it
+    // so parallel `cargo test` runs don't race each other. Shared with
+    // `otel`'s tests, which set `XDG_CONFIG_HOME`.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Held for as long as a test needs the process environment to itself.
+    /// Poisoning is ignored: a panicking test leaves the environment dirty,
+    /// not the lock's data, and every holder sets what it needs anyway.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
 
     #[test]
     fn logging_writes_under_state_dir() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
 
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: serialized by ENV_LOCK above; no other thread reads or
@@ -69,7 +116,8 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", tmp.path());
         }
 
-        let guard = init().expect("logging::init should succeed against a tempdir");
+        let (guard, _export_handle) =
+            init().expect("logging::init should succeed against a tempdir");
         tracing::info!("logging smoke test event");
         drop(guard);
 

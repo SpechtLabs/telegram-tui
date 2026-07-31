@@ -1940,6 +1940,11 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["opentelemetry"] }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["logs"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs", "internal-logs"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry-appender-tracing = "=0.32.0"
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [dev-dependencies]
 insta = { workspace = true }
@@ -1960,6 +1965,15 @@ Notes:
   `default-features = false` is load-bearing: the crate enables `sentry` by
   default and v1 ships exactly one egress destination (spec §13.1). If the repo
   goes stale, vendor it.
+- The four `opentelemetry*` crates are the stack `tracing-batteries` wraps,
+  driven directly by `app/src/otel.rs` (T49). The battery itself is unusable
+  here: `OpenTelemetry::setup` calls `.init()` on a registry it builds
+  privately, so it cannot coexist with the rolling file layer, and its layers
+  are filtered only by level — every `tracing::info!` in the process would be
+  shipped, which is the leak §13.2 exists to prevent. `reqwest` is a direct
+  dependency for its feature flags alone (the exporter's blocking HTTP client
+  needs a TLS backend); no code in this workspace names it. The pins match the
+  versions `tracing-batteries` resolves, so nothing is compiled twice.
 - `axum` + `opentelemetry-proto` + `prost` exist only for the CI allowlist test
   (§13.8): an in-process OTLP collector stub that decodes export requests and
   drains attribute keys.

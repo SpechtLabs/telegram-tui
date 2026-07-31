@@ -28,6 +28,17 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["opentelemetry"] }
+# The OTLP stack `tracing-batteries` wraps, driven directly: its battery
+# installs its own global subscriber and filters only by level, neither of
+# which can coexist with the file log or the allowlist. See otel.rs's module
+# docs. Versions match the ones batteries resolves, so nothing is duplicated.
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["logs"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs", "internal-logs"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry-appender-tracing = "=0.32.0"
+# Not used directly: it pins the TLS backend for the OTLP exporter's blocking
+# HTTP client, which otherwise cannot talk to an https collector.
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [dev-dependencies]
 insta = { workspace = true }
