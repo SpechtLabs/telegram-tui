@@ -212,6 +212,13 @@ jobs:
     if: always() && needs.build.result == 'success'
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+      # This is the only job here that never checks the repository out — it
+      # only needs the uploaded checksum artifacts. `gh` otherwise infers the
+      # repository from a git remote, so without this it fails with "not a git
+      # repository" and takes the Homebrew job down with it (v0.1.4 shipped
+      # eight assets and no SHA256SUMS that way). Setting GH_REPO is cheaper
+      # than adding a checkout purely to give `gh` something to read.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Download the per-target checksums
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
