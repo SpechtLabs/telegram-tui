@@ -4,8 +4,23 @@
 //! priority order: the TDLib connection indicator (spec §14: "connecting…" /
 //! "updating…" must be visible rather than manifesting as silence — this
 //! predates T35 and keeps first claim on the slot since a reconnect matters
-//! more than whether the other person is typing), then a live "typing…"
-//! indicator, then the other party's presence.
+//! more than whether the other person is typing), then the in-chat search
+//! hit-count (T47), then a live "typing…" indicator, then the other party's
+//! presence.
+//!
+//! ## Search wins over typing/presence (T47)
+//!
+//! The search hit-count (`3/7`, `ChatSearchState::current_hit + 1` over
+//! `ConversationState::search_hits.len()`) slots in right after the
+//! connection indicator and ahead of typing/presence. Rationale: search is
+//! `Focus::ChatSearch` — an explicit mode the user is actively in (spec
+//! §11's `/`-then-`n`/`N` flow) — the same reason connection status already
+//! outranks the other two: a mode the user deliberately entered and is
+//! reading feedback from beats an ambient status update. It only shows once
+//! there are hits to count (`handle_td_result` has answered with a non-empty
+//! list); an empty or not-yet-submitted query falls through to
+//! typing/presence exactly as before, so opening search on a chat with no
+//! result yet doesn't blank out its presence line.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -33,7 +48,7 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
         let used = title.width() + label.width();
         let pad = (inner.width as usize).saturating_sub(used);
         spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(label.to_string(), style));
+        spans.push(Span::styled(label, style));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
@@ -59,24 +74,49 @@ fn connection_label(phase: ConnectionPhase) -> Option<&'static str> {
 }
 
 /// The right-aligned label plus its style, in priority order: connection
-/// state (unchanged from pre-T35), then typing, then presence. Only the
-/// open chat contributes typing/presence — there is nothing to show them
-/// for when the chat list itself has focus.
-fn right_indicator(state: &AppState, theme: &Theme) -> Option<(&'static str, Style)> {
+/// state (unchanged from pre-T35), then the search hit-count (T47, module
+/// docs' "Search wins over typing/presence"), then typing, then presence.
+/// Only the open chat contributes search/typing/presence — there is nothing
+/// to show them for when the chat list itself has focus.
+fn right_indicator(state: &AppState, theme: &Theme) -> Option<(String, Style)> {
     if let Some(label) = connection_label(state.connection) {
-        return Some((label, Style::new().fg(theme.warning)));
+        return Some((label.to_string(), Style::new().fg(theme.warning)));
     }
 
     let chat_id = state.open_chat?;
+    if let Some(label) = search_hit_count_label(state, chat_id) {
+        return Some((label, Style::new().fg(theme.warning)));
+    }
     if is_typing_in(state, chat_id) {
-        return Some(("typing…", Style::new().fg(theme.accent)));
+        return Some(("typing…".to_string(), Style::new().fg(theme.accent)));
     }
 
     match other_party_presence(state, chat_id) {
-        Some(PresenceStatus::Online) => Some(("online", Style::new().fg(theme.accent))),
-        Some(PresenceStatus::Recently) => Some(("recently", Style::new().fg(theme.text_muted))),
+        Some(PresenceStatus::Online) => Some(("online".to_string(), Style::new().fg(theme.accent))),
+        Some(PresenceStatus::Recently) => {
+            Some(("recently".to_string(), Style::new().fg(theme.text_muted)))
+        }
         Some(PresenceStatus::Offline) | None => None,
     }
+}
+
+/// `3/7`-style hit count for in-chat search (T47): `current_hit + 1` over
+/// `search_hits.len()`, one-based since "hit 0 of 7" would read as an off-by
+/// -one bug rather than the first hit. `None` whenever search isn't active
+/// (`chat_search` is `None`) or hasn't found anything yet — a submitted
+/// query with zero results, or one not yet answered, falls through to
+/// typing/presence (module docs).
+fn search_hit_count_label(state: &AppState, chat_id: ChatId) -> Option<String> {
+    let search = state.chat_search.as_ref()?;
+    let convo = state.conversations.get(&chat_id)?;
+    if convo.search_hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        search.current_hit + 1,
+        convo.search_hits.len()
+    ))
 }
 
 /// Any typing entry for `chat_id` that has not yet swept past its TTL. Reads
@@ -124,6 +164,7 @@ mod tests {
     use tgt_core::state::history::PagingState;
     use tgt_core::state::media::MediaState;
     use tgt_core::state::presence::PresenceState;
+    use tgt_core::state::search::ChatSearchState;
     use tgt_core::state::toasts::ToastState;
     use tgt_core::td::update::AuthPhase;
 
@@ -319,6 +360,89 @@ mod tests {
         assert!(rendered.contains("connecting…"));
         assert!(!rendered.contains("typing…"));
         assert!(!rendered.contains("online"));
+    }
+
+    // --- search hit-count indicator (T47) ---------------------------------
+
+    /// `3/7`: `current_hit` is zero-based (2) so the label is one-based
+    /// (3), over `search_hits.len()` (7).
+    #[test]
+    fn search_hit_count_shows_current_over_total_80x3() {
+        let mut state = fixture_state();
+        state.conversations.get_mut(&CHAT).unwrap().search_hits =
+            (1..=7).map(tgt_core::model::ids::MessageId).collect();
+        state.chat_search = Some(ChatSearchState {
+            input: InputField::default(),
+            current_hit: 2,
+            in_flight: false,
+        });
+
+        let rendered = render_to_string(80, 3, &state);
+        assert!(rendered.contains("3/7"), "hit count missing:\n{rendered}");
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// Search wins the right-hand slot over typing/presence while it has
+    /// hits (module docs' "Search wins over typing/presence").
+    #[test]
+    fn search_hit_count_wins_over_typing_and_presence() {
+        let mut state = fixture_state();
+        state.presence.users.insert(USER, PresenceStatus::Online);
+        state
+            .presence
+            .typing
+            .insert((CHAT, USER), Millis(state.now.0 + 5_000));
+        state.conversations.get_mut(&CHAT).unwrap().search_hits = vec![
+            tgt_core::model::ids::MessageId(1),
+            tgt_core::model::ids::MessageId(2),
+        ];
+        state.chat_search = Some(ChatSearchState {
+            input: InputField::default(),
+            current_hit: 0,
+            in_flight: false,
+        });
+
+        let rendered = render_to_string(80, 3, &state);
+        assert!(rendered.contains("1/2"));
+        assert!(!rendered.contains("typing…"));
+        assert!(!rendered.contains("online"));
+    }
+
+    /// The connection indicator still keeps first claim on the slot even
+    /// once search has hits (unchanged priority: connection > search).
+    #[test]
+    fn connection_indicator_still_wins_over_search() {
+        let mut state = fixture_state();
+        state.connection = ConnectionPhase::Connecting;
+        state.conversations.get_mut(&CHAT).unwrap().search_hits =
+            vec![tgt_core::model::ids::MessageId(1)];
+        state.chat_search = Some(ChatSearchState {
+            input: InputField::default(),
+            current_hit: 0,
+            in_flight: false,
+        });
+
+        let rendered = render_to_string(80, 3, &state);
+        assert!(rendered.contains("connecting…"));
+        assert!(!rendered.contains("1/1"));
+    }
+
+    /// An open search overlay with no hits yet (query not submitted, or
+    /// submitted and still in flight) falls through to typing/presence —
+    /// opening search must not blank out the header's existing indicator.
+    #[test]
+    fn search_with_no_hits_falls_through_to_presence() {
+        let mut state = fixture_state();
+        state.presence.users.insert(USER, PresenceStatus::Online);
+        state.chat_search = Some(ChatSearchState {
+            input: InputField::default(),
+            current_hit: 0,
+            in_flight: true,
+        });
+
+        let rendered = render_to_string(80, 3, &state);
+        assert!(rendered.contains("online"));
+        assert!(!rendered.contains('/'));
     }
 
     /// Groups and channels have no single "online" peer.
