@@ -19,5 +19,6 @@ expression: "render_to_string(70, 20, &state)"
                       █ ▀▀▀ █ █ █▄▄ ▀█▄▀ ▀█ ▀▄▀                       
                       ▀▀▀▀▀▀▀ ▀▀ ▀ ▀ ▀▀ ▀▀   ▀▀                       
                                                                       
-                                                                      
-               Settings → Devices → Link Desktop Device
+                    Sign in with phone number instead                 
+               Settings → Devices → Link Desktop Device               
+                         ↑↓ select · ⏎ confirm

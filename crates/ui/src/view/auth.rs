@@ -1,17 +1,20 @@
 //! Auth wizard screens (spec §9, architecture §4.6). The whole frame belongs
 //! to the wizard: `draw` is the screen, not a pane inside the two-pane shell.
 //!
-//! Dispatch mirrors T11's `state::auth::route_auth_key` contract exactly, so
-//! the rendered screen always matches which keys are actually live:
+//! Dispatch mirrors T11's `state::auth::route_auth_key`/`handle_qr_screen_key`
+//! contract exactly, so the rendered screen always matches which keys are
+//! actually live:
 //! - `active_field ∈ {ApiId, ApiHash}` means the credentials wizard owns the
 //!   screen, regardless of `phase` (T11's module docs on
 //!   `crates/core/src/state/auth.rs`).
-//! - `phase == WaitPhoneNumber && method != Some(Phone)` is the method-choice
-//!   screen; it covers both "nothing picked yet" (`method: None`) and
-//!   "QR armed but not confirmed" (`method: Some(Qr)`) — Up/Down/'q' can
-//!   still flip the choice back to Phone until Enter fires the request.
-//! - `phase == WaitPhoneNumber && method == Some(Phone)` means picking Phone
-//!   already confirmed it: the screen goes straight to the phone field.
+//! - `phase ∈ {WaitPhoneNumber, WaitOtherDeviceConfirmation}` is one QR-first
+//!   screen (T77): `method == Some(Phone)` always means the phone field is
+//!   showing, *regardless of which of those two phases we're actually in* —
+//!   that's what lets a QR link arriving mid-typing not yank the user back
+//!   to the QR view. Otherwise it's the QR itself (`WaitOtherDeviceConfirmation`,
+//!   real link) or its loading placeholder (`WaitPhoneNumber`, no link yet),
+//!   with "Sign in with phone number instead" underneath, highlighted when
+//!   `method == Some(PhoneSelected)`.
 //!
 //! `AuthPhase::Unsupported` renders its name rather than being swallowed
 //! (spec §9.2's dead-end-screen requirement).
@@ -46,16 +49,15 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
 
     match &auth.phase {
         AuthPhase::WaitTdlibParameters => draw_status(area, theme, f, "Starting Telegram client…"),
-        AuthPhase::WaitPhoneNumber if auth.method != Some(LoginMethod::Phone) => {
-            draw_method_choice(area, auth, theme, f);
-        }
-        AuthPhase::WaitPhoneNumber => draw_phone(area, state, theme, f),
+        AuthPhase::WaitPhoneNumber => draw_qr_stage(area, state, theme, f, None),
         AuthPhase::WaitCode {
             delivery_hint,
             length,
         } => draw_code(area, state, theme, f, delivery_hint, *length),
         AuthPhase::WaitPassword { hint } => draw_password(area, state, theme, f, hint.as_deref()),
-        AuthPhase::WaitOtherDeviceConfirmation { link } => draw_qr(area, theme, f, link),
+        AuthPhase::WaitOtherDeviceConfirmation { link } => {
+            draw_qr_stage(area, state, theme, f, Some(link));
+        }
         AuthPhase::Ready => draw_status(area, theme, f, "Signed in"),
         AuthPhase::LoggingOut => draw_status(area, theme, f, "Logging out…"),
         AuthPhase::Closing => draw_status(area, theme, f, "Closing…"),
@@ -267,50 +269,6 @@ fn option_line(label: &str, active: bool) -> Line<'static> {
     Line::from(Span::raw(format!("{marker}{label}")))
 }
 
-fn draw_method_choice(area: Rect, auth: &AuthState, theme: &Theme, f: &mut Frame) {
-    let inner = panel(area, theme, f, 50, 10, "Sign in");
-    // `method: None` has no confirmed choice yet, but Up/Down's first press
-    // always lands on Phone (state::auth::handle_method_choice_key), so
-    // Phone is the visual default cursor position until something is armed.
-    let selected = auth.method.unwrap_or(LoginMethod::Phone);
-
-    let [intro_area, _gap1, phone_area, qr_area, _gap2, hint_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .areas(inner);
-
-    f.render_widget(
-        Paragraph::new("How would you like to sign in?").style(Style::new().fg(theme.text)),
-        intro_area,
-    );
-
-    let phone_style = option_style(selected == LoginMethod::Phone, theme);
-    let qr_style = option_style(selected == LoginMethod::Qr, theme);
-    f.render_widget(
-        Paragraph::new(option_line("Phone number", selected == LoginMethod::Phone))
-            .style(phone_style),
-        phone_area,
-    );
-    f.render_widget(
-        Paragraph::new(option_line("QR code", selected == LoginMethod::Qr)).style(qr_style),
-        qr_area,
-    );
-
-    f.render_widget(
-        Paragraph::new(format!(
-            "↑↓ choose · p phone · q qr · ⏎ continue{}",
-            in_flight_marker(auth)
-        ))
-        .style(Style::new().fg(theme.text_muted)),
-        hint_area,
-    );
-}
-
 fn option_style(active: bool, theme: &Theme) -> Style {
     if active {
         Style::new()
@@ -435,10 +393,24 @@ fn draw_password(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hin
     );
 }
 
-fn draw_qr(area: Rect, theme: &Theme, f: &mut Frame, link: &str) {
-    let [title_area, body_area, footer_area] = Layout::vertical([
+/// The QR-first screen: `WaitPhoneNumber` (`link: None`, still requesting)
+/// and `WaitOtherDeviceConfirmation` (`link: Some(..)`, real code) share this
+/// layout and the "sign in with phone number instead" escape hatch below it.
+/// `method == Some(Phone)` overrides both — the escape hatch was confirmed,
+/// so the phone field takes the whole screen regardless of which of the two
+/// phases TDLib happens to be reporting (module docs on why that can change
+/// mid-typing without yanking the screen back to the QR).
+fn draw_qr_stage(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, link: Option<&str>) {
+    let auth = &state.auth;
+    if auth.method == Some(LoginMethod::Phone) {
+        draw_phone(area, state, theme, f);
+        return;
+    }
+
+    let [title_area, body_area, escape_area, footer_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(2),
     ])
     .areas(area);
@@ -450,22 +422,61 @@ fn draw_qr(area: Rect, theme: &Theme, f: &mut Frame, link: &str) {
         title_area,
     );
 
-    let lines = build_qr_lines(link, theme).filter(|lines| fits(lines, body_area));
+    match link {
+        Some(link) => draw_qr_body(body_area, theme, f, link),
+        None => draw_qr_loading(body_area, theme, f),
+    }
+
+    draw_phone_escape_hint(f, escape_area, auth, theme);
+
+    let mut footer_lines = Vec::with_capacity(2);
+    if link.is_some() {
+        footer_lines.push(Line::from("Settings → Devices → Link Desktop Device"));
+    }
+    footer_lines.push(Line::from("↑↓ select · ⏎ confirm"));
+    f.render_widget(
+        Paragraph::new(footer_lines)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(theme.text_muted)),
+        footer_area,
+    );
+}
+
+fn draw_qr_body(area: Rect, theme: &Theme, f: &mut Frame, link: &str) {
+    let lines = build_qr_lines(link, theme).filter(|lines| fits(lines, area));
     match lines {
         Some(lines) => {
             let qr_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
             let qr_height = lines.len() as u16;
-            let qr_rect = centered(body_area, qr_width, qr_height);
+            let qr_rect = centered(area, qr_width, qr_height);
             f.render_widget(Paragraph::new(lines), qr_rect);
         }
-        None => draw_qr_fallback(body_area, theme, f, link),
+        None => draw_qr_fallback(area, theme, f, link),
     }
+}
 
+/// The gap between arriving at the auth screen and TDLib's QR link actually
+/// coming back — a blank area that silently becomes a QR code would look
+/// broken, so this says so explicitly instead.
+/// No `in_flight_marker` here: this placeholder only ever shows up while the
+/// request is in flight in the first place, so a second "…" marker beside
+/// the sentence's own ellipsis would be redundant.
+fn draw_qr_loading(area: Rect, theme: &Theme, f: &mut Frame) {
     f.render_widget(
-        Paragraph::new("Settings → Devices → Link Desktop Device")
+        Paragraph::new("Requesting a QR code…")
             .alignment(Alignment::Center)
             .style(Style::new().fg(theme.text_muted)),
-        footer_area,
+        centered(area, area.width, 1),
+    );
+}
+
+fn draw_phone_escape_hint(f: &mut Frame, area: Rect, auth: &AuthState, theme: &Theme) {
+    let selected = auth.method == Some(LoginMethod::PhoneSelected);
+    f.render_widget(
+        Paragraph::new(option_line("Sign in with phone number instead", selected))
+            .alignment(Alignment::Center)
+            .style(option_style(selected, theme)),
+        area,
     );
 }
 
@@ -610,6 +621,7 @@ mod tests {
             theme_generation: 0,
             bindings: KeyBindings::default(),
             telemetry_mode: TelemetryMode::Off,
+            crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
         }
@@ -630,20 +642,48 @@ mod tests {
         out
     }
 
+    /// The gap before the QR link comes back (module docs on `handle_td`'s
+    /// guard: by the time this screen is interactive, `method` has already
+    /// been normalized away from `None` to `Some(Qr)`).
     #[test]
-    fn method_choice_120x40() {
-        let mut state = fixture_state();
-        state.auth.phase = AuthPhase::WaitPhoneNumber;
-        state.auth.method = None;
-        insta::assert_snapshot!(render_to_string(120, 40, &state));
-    }
-
-    #[test]
-    fn method_choice_70x20() {
+    fn qr_pending_120x40() {
         let mut state = fixture_state();
         state.auth.phase = AuthPhase::WaitPhoneNumber;
         state.auth.method = Some(LoginMethod::Qr);
+        state.auth.in_flight = true;
+        let rendered = render_to_string(120, 40, &state);
+        assert!(
+            rendered.contains("Requesting a QR code"),
+            "expected the loading placeholder, not a blank area:\n{rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn phone_escape_hint_highlighted_70x20() {
+        let mut state = fixture_state();
+        state.auth.phase = AuthPhase::WaitPhoneNumber;
+        state.auth.method = Some(LoginMethod::PhoneSelected);
         insta::assert_snapshot!(render_to_string(70, 20, &state));
+    }
+
+    /// The escape hatch confirmed while the QR link is already showing: the
+    /// phone field takes over even though `phase` is still
+    /// `WaitOtherDeviceConfirmation` (module docs on why `method` overrides
+    /// `phase` here).
+    #[test]
+    fn phone_field_shown_after_qr_link_arrived() {
+        let mut state = fixture_state();
+        state.auth.phase = AuthPhase::WaitOtherDeviceConfirmation {
+            link: FIXED_QR_LINK.to_string(),
+        };
+        state.auth.method = Some(LoginMethod::Phone);
+        let rendered = render_to_string(120, 40, &state);
+        assert!(
+            rendered.contains("Phone (with country code)"),
+            "expected the phone field, not the QR code:\n{rendered}"
+        );
+        assert!(!rendered.contains(FIXED_QR_LINK));
     }
 
     #[test]

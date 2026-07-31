@@ -1,0 +1,23 @@
+---
+source: crates/ui/src/view/auth.rs
+expression: "render_to_string(70, 20, &state)"
+---
+           Scan this QR code with Telegram on another device          
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                         Requesting a QR code…                        
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                  ▶ Sign in with phone number instead                 
+                         ↑↓ select · ⏎ confirm

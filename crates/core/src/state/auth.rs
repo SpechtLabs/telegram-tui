@@ -36,6 +36,53 @@
 //! it only projects the phase. T14's dispatcher/app wiring is responsible
 //! for issuing `Effect::Td(SetTdlibParameters(..))` once real credentials
 //! and boot facts are available.
+//!
+//! ## QR-first sign-in, and the phone escape hatch
+//!
+//! Arriving at `WaitPhoneNumber` fires `RequestQrCodeAuthentication`
+//! immediately — there is no upfront "phone or QR?" choice. `handle_td`
+//! guards this with `method.is_none()`: `None` only ever exists for the
+//! instant before that first `WaitPhoneNumber` projection, since no key can
+//! reach `route_auth_key`'s `WaitPhoneNumber` arm before `phase` itself
+//! becomes `WaitPhoneNumber`, and `handle_td` flips `method` away from
+//! `None` on that very same update. So the request fires exactly once per
+//! login attempt no matter how many times TDLib re-emits
+//! `updateAuthorizationState` afterwards — the same one-shot-guard shape as
+//! `SeededFiles`/`PagingState`'s loop-guards elsewhere in this crate.
+//!
+//! Below the QR (or its loading placeholder), "Sign in with phone number
+//! instead" is reachable with Up/Down (`LoginMethod::PhoneSelected` — a
+//! pure highlight, no effect) and Enter reveals the phone field
+//! (`LoginMethod::Phone` — still no effect: showing an input box is not
+//! I/O). What submitting *from* that field does next depends on how far
+//! TDLib's own state machine has moved:
+//!
+//! - While `phase` is still `WaitPhoneNumber` (the network gap before the
+//!   QR link has come back), submitting calls `setAuthenticationPhoneNumber`
+//!   directly — legal, identical to the phone-only path that existed before
+//!   this screen defaulted to QR.
+//! - Once `phase` is `WaitOtherDeviceConfirmation` (the QR link has
+//!   arrived), TDLib's `AuthManager::set_phone_number` rejects
+//!   `setAuthenticationPhoneNumber` outright with "Call to
+//!   setAuthenticationPhoneNumber unexpected": `WaitQrCodeConfirmation` is
+//!   not in its allowed-caller list (checked against TDLib's actual C++
+//!   source, not assumed). The only legal way out is `logOut`, which —
+//!   because we are still pre-authorization — takes TDLib's local
+//!   `destroy_auth_keys()` branch rather than a network round trip, and
+//!   reports back through `AuthPhase::LoggingOut`/`Closing`/`Closed`.
+//!   Submitting from `WaitOtherDeviceConfirmation` therefore fires
+//!   `Effect::Td(TdRequest::LogOut)` instead, and deliberately leaves the
+//!   typed phone number sitting in `auth.phone` rather than clearing it:
+//!   `method` stays `Phone`, so if TDLib is ever driven back to a fresh
+//!   `WaitPhoneNumber`, the phone screen simply reappears with the number
+//!   still there for the user to press Enter on again themselves. Nothing
+//!   here auto-resubmits on a background TDLib event — only an explicit
+//!   keypress ever triggers network I/O, the same rule the QR guard above
+//!   exists to protect. **`tgt-core` cannot complete that round trip on its
+//!   own**: `authorizationStateClosed` is a dead end for the existing TDLib
+//!   client instance (see `docs/architecture.md`'s `AuthPhase::Closed`);
+//!   only `tgt-app` can recreate the client to get back to a fresh
+//!   `WaitPhoneNumber`, and it does not do so today (T77 amendment).
 
 use crate::app::{AppState, Screen};
 use crate::effect::{ConfigPatch, Effect};
@@ -48,8 +95,18 @@ use crate::td::update::{AuthPhase, TdUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginMethod {
-    Phone,
+    /// The QR code (or its loading placeholder) is showing; nothing else is
+    /// highlighted. `handle_td` normalizes a fresh `None` into this value
+    /// the moment `WaitPhoneNumber` is first observed — see the module docs
+    /// on the one-shot `RequestQrCodeAuthentication` guard.
     Qr,
+    /// "Sign in with phone number instead" is highlighted via Up/Down but
+    /// not yet confirmed: still the QR/QR-pending screen, just with that
+    /// line marked.
+    PhoneSelected,
+    /// Confirmed via Enter on `PhoneSelected`: the phone number field is
+    /// shown and live.
+    Phone,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,7 +166,19 @@ pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
 
     match phase {
         AuthPhase::WaitTdlibParameters => Vec::new(),
-        AuthPhase::WaitPhoneNumber => Vec::new(),
+        // Fires RequestQrCodeAuthentication exactly once per login attempt
+        // (see module docs): `method` only reads `None` for the instant
+        // before this first projection, and every branch below leaves it at
+        // `Some(_)`, so repeat `WaitPhoneNumber` updates are no-ops here.
+        AuthPhase::WaitPhoneNumber => {
+            if app.auth.method.is_none() {
+                app.auth.method = Some(LoginMethod::Qr);
+                app.auth.in_flight = true;
+                vec![Effect::Td(TdRequest::RequestQrCodeAuthentication)]
+            } else {
+                Vec::new()
+            }
+        }
         AuthPhase::WaitCode { .. } => {
             app.auth.active_field = AuthField::Code;
             Vec::new()
@@ -152,25 +221,83 @@ fn route_auth_key(app: &mut AppState, key: Key) -> Vec<Effect> {
     }
 
     match &app.auth.phase {
-        AuthPhase::WaitPhoneNumber if app.auth.method.is_none() => {
-            handle_method_choice_key(app, key)
+        // Both phases share one QR-first screen (module docs): the QR
+        // itself vs. its loading placeholder is a rendering-only detail of
+        // which phase this is, but the escape-hatch state machine
+        // (`LoginMethod::{Qr,PhoneSelected,Phone}`) is identical either way.
+        AuthPhase::WaitPhoneNumber | AuthPhase::WaitOtherDeviceConfirmation { .. } => {
+            handle_qr_screen_key(app, key)
         }
-        // Picking Qr does not itself fire the request (that would make an
-        // arrow-key press cause network I/O): it stays "armed" until Enter,
-        // and Up/Down may still flip the choice back to Phone.
-        AuthPhase::WaitPhoneNumber if app.auth.method == Some(LoginMethod::Qr) => {
-            handle_qr_armed_key(app, key)
-        }
-        // method == Some(Phone): picking Phone *is* confirming — the next
-        // keys type the phone number directly, and Enter submits it.
-        AuthPhase::WaitPhoneNumber => handle_submit_field_key(app, key, AuthField::Phone),
         AuthPhase::WaitCode { .. } => handle_submit_field_key(app, key, AuthField::Code),
         AuthPhase::WaitPassword { .. } => handle_submit_field_key(app, key, AuthField::Password),
-        // No editable field on these screens (QR, tdlib bootstrap, terminal
+        // No editable field on these screens (tdlib bootstrap, terminal
         // phases): the key is still claimed (this is the only screen up),
         // just a no-op.
         _ => Vec::new(),
     }
+}
+
+fn handle_qr_screen_key(app: &mut AppState, key: Key) -> Vec<Effect> {
+    match app.auth.method {
+        // `handle_td` always sets this to `Some(Qr)` on the very update
+        // that first sets `phase` to a value this function's caller
+        // matches on, so this arm is unreachable in practice; still claim
+        // the key rather than falling through to "unclaimed" mid-screen.
+        None => Vec::new(),
+        Some(LoginMethod::Qr) => {
+            if matches!(key, Key::Up | Key::Down) {
+                app.auth.method = Some(LoginMethod::PhoneSelected);
+            }
+            Vec::new()
+        }
+        Some(LoginMethod::PhoneSelected) => match key {
+            Key::Up | Key::Down => {
+                app.auth.method = Some(LoginMethod::Qr);
+                Vec::new()
+            }
+            // Confirming only reveals the field (a local UI change, not an
+            // effect) — see module docs on why submitting is handled
+            // separately, keyed off `phase`.
+            Key::Enter => {
+                app.auth.method = Some(LoginMethod::Phone);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        },
+        Some(LoginMethod::Phone) => handle_phone_field_key(app, key),
+    }
+}
+
+fn handle_phone_field_key(app: &mut AppState, key: Key) -> Vec<Effect> {
+    match key {
+        Key::Enter => submit_phone(app),
+        _ => {
+            edit_field(field_mut(app, AuthField::Phone), key);
+            Vec::new()
+        }
+    }
+}
+
+/// Branches on `phase`, not just `active_field`, because the legality of
+/// `setAuthenticationPhoneNumber` itself depends on which phase TDLib is
+/// actually in (module docs).
+fn submit_phone(app: &mut AppState) -> Vec<Effect> {
+    match app.auth.phase {
+        AuthPhase::WaitPhoneNumber => submit_field(app, AuthField::Phone),
+        AuthPhase::WaitOtherDeviceConfirmation { .. } => escape_qr_via_logout(app),
+        _ => Vec::new(),
+    }
+}
+
+/// The only TDLib-legal way to abandon `WaitOtherDeviceConfirmation` before
+/// it resolves (module docs). Deliberately does not clear `auth.phone`.
+fn escape_qr_via_logout(app: &mut AppState) -> Vec<Effect> {
+    if is_submission_blocked(app) {
+        return Vec::new();
+    }
+    app.auth.in_flight = true;
+    app.auth.field_error = None;
+    vec![Effect::Td(TdRequest::LogOut)]
 }
 
 fn handle_credentials_key(app: &mut AppState, key: Key) -> Vec<Effect> {
@@ -220,60 +347,6 @@ fn submit_credentials(app: &mut AppState) -> Vec<Effect> {
             Vec::new()
         }
     }
-}
-
-fn handle_method_choice_key(app: &mut AppState, key: Key) -> Vec<Effect> {
-    match key {
-        Key::Up | Key::Down => {
-            app.auth.method = Some(match app.auth.method {
-                Some(LoginMethod::Phone) => LoginMethod::Qr,
-                Some(LoginMethod::Qr) | None => LoginMethod::Phone,
-            });
-            Vec::new()
-        }
-        Key::Char('p') => {
-            app.auth.method = Some(LoginMethod::Phone);
-            Vec::new()
-        }
-        Key::Char('q') => {
-            app.auth.method = Some(LoginMethod::Qr);
-            Vec::new()
-        }
-        Key::Enter => confirm_method(app),
-        _ => Vec::new(),
-    }
-}
-
-fn confirm_method(app: &mut AppState) -> Vec<Effect> {
-    match app.auth.method {
-        Some(LoginMethod::Phone) => {
-            app.auth.active_field = AuthField::Phone;
-            Vec::new()
-        }
-        Some(LoginMethod::Qr) => request_qr_auth(app),
-        None => Vec::new(),
-    }
-}
-
-/// Handles keys while Qr is the picked-but-not-yet-confirmed method:
-/// Enter fires the request, Up/Down flips the choice back to Phone.
-fn handle_qr_armed_key(app: &mut AppState, key: Key) -> Vec<Effect> {
-    match key {
-        Key::Up | Key::Down | Key::Char('p') => {
-            app.auth.method = Some(LoginMethod::Phone);
-            Vec::new()
-        }
-        Key::Enter => request_qr_auth(app),
-        _ => Vec::new(),
-    }
-}
-
-fn request_qr_auth(app: &mut AppState) -> Vec<Effect> {
-    if is_submission_blocked(app) {
-        return Vec::new();
-    }
-    app.auth.in_flight = true;
-    vec![Effect::Td(TdRequest::RequestQrCodeAuthentication)]
 }
 
 fn handle_submit_field_key(app: &mut AppState, key: Key, field: AuthField) -> Vec<Effect> {
@@ -486,6 +559,7 @@ mod tests {
             theme_generation: 0,
             bindings: crate::model::key::KeyBindings::default(),
             telemetry_mode: TelemetryMode::Off,
+            crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
         }
@@ -695,21 +769,93 @@ mod tests {
     }
 
     #[test]
-    fn method_choice_picks_qr_and_requests_qr_auth() {
+    fn wait_phone_number_requests_qr_exactly_once() {
         let mut app = fixture_state();
-        app.auth.phase = AuthPhase::WaitPhoneNumber;
+        app.auth.phase = AuthPhase::WaitTdlibParameters;
         app.auth.method = None;
 
-        handle_key(&mut app, Key::Char('q'));
-        assert_eq!(app.auth.method, Some(LoginMethod::Qr));
-
-        let effects = handle_key(&mut app, Key::Enter).expect("auth screen claims Enter");
+        let effects = handle_td(&mut app, &TdUpdate::Auth(AuthPhase::WaitPhoneNumber));
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             effects[0],
             Effect::Td(TdRequest::RequestQrCodeAuthentication)
         ));
+        assert_eq!(app.auth.method, Some(LoginMethod::Qr));
         assert!(app.auth.in_flight);
+
+        // A duplicate updateAuthorizationState for the same phase (TDLib
+        // does re-emit) must not re-fire the request.
+        let effects = handle_td(&mut app, &TdUpdate::Auth(AuthPhase::WaitPhoneNumber));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn arrow_key_alone_never_fires_a_request() {
+        let mut app = fixture_state();
+        app.auth.phase = AuthPhase::WaitPhoneNumber;
+        app.auth.method = Some(LoginMethod::Qr);
+
+        let effects = handle_key(&mut app, Key::Down).expect("auth screen claims Down");
+        assert!(effects.is_empty());
+        assert_eq!(app.auth.method, Some(LoginMethod::PhoneSelected));
+
+        let effects = handle_key(&mut app, Key::Up).expect("auth screen claims Up");
+        assert!(effects.is_empty());
+        assert_eq!(app.auth.method, Some(LoginMethod::Qr));
+    }
+
+    #[test]
+    fn phone_escape_hatch_reveals_field_and_submits_before_qr_link_arrives() {
+        let mut app = fixture_state();
+        app.auth.phase = AuthPhase::WaitPhoneNumber;
+        app.auth.method = Some(LoginMethod::Qr);
+
+        // Arrow highlights the escape hatch, Enter reveals the field --
+        // neither produces an effect (module docs: only an explicit submit
+        // triggers network I/O).
+        let effects = handle_key(&mut app, Key::Down).expect("auth screen claims Down");
+        assert!(effects.is_empty());
+        assert_eq!(app.auth.method, Some(LoginMethod::PhoneSelected));
+
+        let effects = handle_key(&mut app, Key::Enter).expect("auth screen claims Enter");
+        assert!(effects.is_empty());
+        assert_eq!(app.auth.method, Some(LoginMethod::Phone));
+
+        type_text(&mut app, "+15551234567");
+        let effects = handle_key(&mut app, Key::Enter).expect("auth screen claims Enter");
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::Td(TdRequest::SetAuthenticationPhoneNumber { phone })
+                if phone == "+15551234567"
+        ));
+        assert!(app.auth.in_flight);
+    }
+
+    #[test]
+    fn phone_escape_hatch_after_qr_link_arrives_logs_out_instead_of_submitting() {
+        let mut app = fixture_state();
+        app.auth.phase = AuthPhase::WaitOtherDeviceConfirmation {
+            link: "tg://login?token=AAA".to_string(),
+        };
+        app.auth.method = Some(LoginMethod::Qr);
+
+        handle_key(&mut app, Key::Down);
+        handle_key(&mut app, Key::Enter);
+        assert_eq!(app.auth.method, Some(LoginMethod::Phone));
+
+        type_text(&mut app, "+15551234567");
+        let effects = handle_key(&mut app, Key::Enter).expect("auth screen claims Enter");
+
+        // setAuthenticationPhoneNumber is illegal from
+        // WaitOtherDeviceConfirmation (TDLib's AuthManager rejects it):
+        // logOut is the only legal escape (module docs).
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::Td(TdRequest::LogOut)));
+        assert!(app.auth.in_flight);
+        // The typed number is preserved so a future WaitPhoneNumber shows
+        // it again rather than an empty field.
+        assert_eq!(app.auth.phone.text, "+15551234567");
     }
 
     #[test]

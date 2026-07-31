@@ -1,6 +1,6 @@
 ---
 source: crates/ui/src/view/auth.rs
-expression: "render_to_string(120, 40, &state)"
+expression: rendered
 ---
                                     Scan this QR code with Telegram on another device                                   
                                                                                                                         
@@ -15,19 +15,19 @@ expression: "render_to_string(120, 40, &state)"
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                               █▀▀▀▀▀█  ▀▄▄█▄▀██ █▀▀▀▀▀█                                                
-                                               █ ███ █ ▀██▄▀ █ ▄ █ ███ █                                                
-                                               █ ▀▀▀ █  ▄▀  ▄▀█▀ █ ▀▀▀ █                                                
-                                               ▀▀▀▀▀▀▀ █▄█ █ █ █ ▀▀▀▀▀▀▀                                                
-                                               ██▀ █▀▀██ ██▀  ▀███  ▄█ ▄                                                
-                                               ▀ █▄▀ ▀█▀▀ ▄▀▄ ▄▄█▄██▄  █                                                
-                                               ▀█ ▀▄▀▀█▄▄ ▄▄▀█ █ █   ▄██                                                
-                                               ▀▄▀▀ ▀▀█▄▄▀▄█ █  ▀▄▀ █ █▀                                                
-                                               ▀  ▀ ▀▀▀█ ▄▄▀▄▀██▀▀▀█ ▄▀█                                                
-                                               █▀▀▀▀▀█ █  ▀▀▀▄▀█ ▀ █▀ ▀▀                                                
-                                               █ ███ █ ▀ ▄ ▀▀  █▀▀██ ▄ ▀                                                
-                                               █ ▀▀▀ █ █ █▄▄ ▀█▄▀ ▀█ ▀▄▀                                                
-                                               ▀▀▀▀▀▀▀ ▀▀ ▀ ▀ ▀▀ ▀▀   ▀▀                                                
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                  Requesting a QR code…                                                 
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -40,5 +40,4 @@ expression: "render_to_string(120, 40, &state)"
                                                                                                                         
                                                                                                                         
                                              Sign in with phone number instead                                          
-                                        Settings → Devices → Link Desktop Device                                        
                                                   ↑↓ select · ⏎ confirm
