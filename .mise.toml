@@ -13,12 +13,6 @@ rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
 pinact = "4.1.0"
 
-[env]
-# Where `mise run install` puts the binary and TDLib's dylib. The packaged
-# layout is bin/ + ../lib, which is what the binary's @executable_path/../lib
-# rpath resolves against (architecture.md §9.2).
-TGT_PREFIX = "{{ env.HOME }}/.local"
-
 # mise's rust backend keeps only a symlink in its own installs dir; the real
 # toolchain lives in ~/.rustup, which mise-action does not cache. On a cache
 # hit mise therefore reports "all tools are installed", skips the install that
@@ -29,8 +23,11 @@ TGT_PREFIX = "{{ env.HOME }}/.local"
 # already present, and installs the toolchain if it is missing entirely.
 [tasks.toolchain]
 description = "Ensure the pinned toolchain has rustfmt and clippy (idempotent)"
+# `sh` is dash on Ubuntu (no `pipefail`) and cmd on Windows; pin bash so one
+# body works on all three. Windows runners get it from Git for Windows.
+shell = "bash -c"
 run = '''
-set -euo pipefail
+set -eu
 channel="${RUSTUP_TOOLCHAIN:-$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)}"
 rustup toolchain install "$channel" --component rustfmt --component clippy --no-self-update
 '''
@@ -78,11 +75,15 @@ run = "cargo run -p tgt-app"
 description = "Build dist/ with the relocatable binary, its dylib, and a tarball"
 run = "./scripts/package.sh"
 
+# Unix-shaped: it lays out bin/ + ../lib for the @rpath/$ORIGIN loader. macOS
+# is the only platform with a release artifact, so this is not made portable.
 [tasks.install]
 description = "Install tgt into $TGT_PREFIX (default ~/.local): bin/tgt + lib/libtdjson"
 depends = ["package"]
+shell = "bash -c"
 run = '''
-set -euo pipefail
+set -eu
+TGT_PREFIX="${TGT_PREFIX:-$HOME/.local}"
 install -d "$TGT_PREFIX/bin" "$TGT_PREFIX/lib"
 install -m 755 dist/tgt/bin/tgt "$TGT_PREFIX/bin/tgt"
 # Both the versioned dylib (what the binary's LC_LOAD_DYLIB actually names)
@@ -95,10 +96,14 @@ case ":$PATH:" in
 esac
 '''
 
+# Unix-shaped: it lays out bin/ + ../lib for the @rpath/$ORIGIN loader. macOS
+# is the only platform with a release artifact, so this is not made portable.
 [tasks.uninstall]
 description = "Remove tgt and its dylib from $TGT_PREFIX"
+shell = "bash -c"
 run = '''
-set -euo pipefail
+set -eu
+TGT_PREFIX="${TGT_PREFIX:-$HOME/.local}"
 rm -f "$TGT_PREFIX/bin/tgt" "$TGT_PREFIX"/lib/libtdjson*.dylib
 echo "removed tgt from $TGT_PREFIX"
 '''
