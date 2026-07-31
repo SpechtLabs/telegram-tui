@@ -1960,6 +1960,16 @@ Notes:
   any published version); its default `v1` feature already selects the
   macOS Keychain store (`apple-native-keyring-store`) on this platform, so the
   plain pin is correct and sufficient.
+- **T49 amendment:** `tracing-batteries`' `OpenTelemetry` battery is unusable
+  here — at rev `f059e936` its `setup` installs its own global subscriber
+  (mutually exclusive with the rolling file layer) and filters only by level
+  (it would export every `tracing::info!`, defeating the §13.2 allowlist).
+  `otel.rs` therefore drives the same underlying stack directly
+  (`opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` /
+  `opentelemetry-appender-tracing` + `reqwest` for TLS, all pinned to the
+  versions batteries itself resolves — see the manifest comment). The
+  batteries git dep stays pinned per spec §13.1; whether to drop it entirely
+  is an open decision for the user.
 - `tracing-batteries` is not on crates.io; pinned to commit
   `f059e936623c2eb0ca67f6ae3301487c9443ffd0` (repo HEAD, 2026-07-21).
   `default-features = false` is load-bearing: the crate enables `sentry` by
