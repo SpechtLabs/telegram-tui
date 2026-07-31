@@ -444,6 +444,7 @@ pub fn conversation_with(
         revealed_spoilers: BTreeSet::new(),
         last_read_inbox: MessageId(0),
         last_read_outbox: MessageId(0),
+        pending_view: None,
         search_hits: Vec::new(),
         selection: None,
     }

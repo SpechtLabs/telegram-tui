@@ -952,6 +952,11 @@ pub struct ConversationState {
     pub revealed_spoilers: BTreeSet<MessageId>,
     pub last_read_inbox: MessageId,
     pub last_read_outbox: MessageId,
+    /// Storm control for the `ViewMessages` request that marks messages read
+    /// (T72). A watermark plus an expiry, not a plain in-flight flag:
+    /// `viewMessages` is fire-and-forget, so nothing comes back to clear a
+    /// flag and a dropped request would otherwise wedge the chat unread.
+    pub pending_view: Option<PendingView>,
     /// In-chat search hits (populated by state/search.rs).
     pub search_hits: Vec<MessageId>,
 }

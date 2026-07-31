@@ -194,6 +194,12 @@ impl App {
                 if self.state.toasts.toasts.len() != toasts_before {
                     self.dirty = true;
                 }
+                // T72: the retry path for a `ViewMessages` TDLib never
+                // answered (see `conversation::handle_tick`). Deliberately
+                // not a `dirty` trigger — whether the badge clears is
+                // TDLib's `updateChatReadInbox` to decide, and that update
+                // sets `dirty` on its own.
+                effects.extend(conversation::handle_tick(&mut self.state));
                 effects
             }
             Action::Resize { width, height } => {
@@ -897,6 +903,9 @@ impl App {
         let mut effects = self.scroll_conversation_move(up);
         if let Some(chat_id) = chat_id {
             effects.extend(media::auto_download_photos(&mut self.state, chat_id));
+            // T72: same reason `conversation::handle_key` does it — a wheel
+            // back down to the newest message is the user looking at it.
+            effects.extend(conversation::mark_visible_read(&mut self.state, chat_id));
         }
         effects
     }
@@ -2377,9 +2386,16 @@ mod routing {
             muted: true,
         }));
 
-        // The open chat: the user is already looking at it.
+        // The open chat: the user is already looking at it — no alert, no
+        // toast. The one effect it does produce is T72's read receipt, which
+        // is the same fact seen from the other side: this message needs no
+        // announcing precisely because it is being read right now.
         let effects = app.update(Action::Td(TdUpdate::NewMessage(message(1, 12))));
-        assert!(effects.is_empty(), "focused chat is silent: {effects:?}");
+        assert_eq!(
+            describe(&effects),
+            ["Td(ViewMessages)"],
+            "focused chat is silent apart from marking the arrival read"
+        );
         assert!(app.state().toasts.toasts.is_empty());
 
         // Another chat: one alert, one toast, titled by the sidebar.

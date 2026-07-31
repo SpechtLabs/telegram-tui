@@ -246,7 +246,7 @@ fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
             only_local: true,
         };
     }
-    vec![
+    let mut effects = vec![
         Effect::Td(TdRequest::OpenChat { chat_id }),
         Effect::Td(TdRequest::GetChatHistory {
             chat_id,
@@ -254,7 +254,11 @@ fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
             limit: 50,
             only_local: true,
         }),
-    ]
+    ];
+    // T72: mirrors `chat_list::open_selected` here too — see its call site
+    // for why an already-loaded window needs this and a cold open does not.
+    effects.extend(conversation::mark_visible_read(app, chat_id));
+    effects
 }
 
 fn run_command(app: &mut AppState, id: CommandId) -> Vec<Effect> {
@@ -457,6 +461,30 @@ mod tests {
             });
     }
 
+    /// An incoming message, for the T72 read-marking test.
+    fn unread_msg(id: i64) -> crate::model::message::MessageView {
+        use crate::model::entity::FormattedText;
+        use crate::model::ids::{MessageId, UserId};
+        use crate::model::message::{MessageCaps, MessageContent, MessageView, SendState, Sender};
+        MessageView {
+            id: MessageId(id),
+            chat_id: ChatId(1),
+            sender: Sender::User(UserId(1)),
+            sender_name: "Alice".to_string(),
+            is_outgoing: false,
+            date: 1_700_000_000 + id,
+            content: MessageContent::Text(FormattedText {
+                text: format!("msg {id}"),
+                entities: Vec::new(),
+            }),
+            reply_to: None,
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            caps: MessageCaps::default(),
+            is_edited: false,
+        }
+    }
+
     fn type_str(app: &mut AppState, s: &str) {
         for c in s.chars() {
             handle_key(app, Key::Char(c));
@@ -637,6 +665,35 @@ mod tests {
         ));
         // Enter closes the palette itself; the focus pop is the router's.
         assert!(app.palette.is_none());
+    }
+
+    /// T72: same read-marking contract as `chat_list::open_selected` — the
+    /// palette is the other way into a chat, and a chat opened from it must
+    /// not stay unread. See that module's
+    /// `opening_a_chat_marks_it_read_without_touching_the_badge`.
+    #[test]
+    fn enter_on_a_chat_with_a_loaded_window_marks_it_read() {
+        let mut app = fixture_state();
+        insert_chat(&mut app, 1, "Alice", 10);
+        conversation::open(&mut app, ChatId(1));
+        app.conversations
+            .get_mut(&ChatId(1))
+            .unwrap()
+            .messages
+            .push_back(unread_msg(7));
+        app.open_chat = None;
+        open(&mut app);
+
+        let effects = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
+
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Td(TdRequest::ViewMessages { chat_id: ChatId(1), message_ids })
+                    if message_ids == &[MessageId(7)]
+            )),
+            "expected the loaded unread message to be marked read: {effects:?}"
+        );
     }
 
     /// T59: same local-first contract as `chat_list::open_selected` — see

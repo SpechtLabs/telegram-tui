@@ -218,6 +218,7 @@ mod tests {
                 revealed_spoilers: BTreeSet::new(),
                 last_read_inbox: tgt_core::model::ids::MessageId(0),
                 last_read_outbox: tgt_core::model::ids::MessageId(0),
+                pending_view: None,
                 search_hits: Vec::new(),
                 selection: None,
             },

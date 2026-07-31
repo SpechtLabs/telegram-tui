@@ -84,6 +84,10 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`position_storm_script`].
 const STORM_SETTLED: &str = "Devon";
 
+/// Badge the T72 chat carries before anything is read (see
+/// [`unread_chat_script`]).
+const UNREAD_ON_OPEN: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -275,6 +279,72 @@ async fn chat_list_matches_tdlib_order_after_position_storm() {
         sidebar,
         vec![STORM_SETTLED, "Cid", "Ada", "Bob"],
         "sidebar rows disagree with visible_rows:\n{rendered}"
+    );
+}
+
+/// T72: opening a chat with unread messages tells TDLib they were seen, and
+/// the badge clears because TDLib says so.
+///
+/// The bug this pins: nothing ever emitted `ViewMessages`, so the unread
+/// count stayed on the sidebar and the chat stayed bold on the user's other
+/// devices no matter how long they read it here.
+///
+/// Both halves matter. The receipt has to reach TDLib (`FakeTd::received()`),
+/// and the badge has to stay at whatever TDLib last said until TDLib says
+/// otherwise — a client that zeroed `unread_count` locally would look fixed
+/// on this screen while every other client kept showing the chat unread.
+#[tokio::test]
+async fn opening_an_unread_chat_marks_it_read_and_lets_tdlib_clear_the_badge() {
+    let mut app = Harness::new(&to_jsonl(&unread_chat_script()));
+    app.open_top_chat().await;
+
+    // Opening it changes nothing about the badge on its own: the window is
+    // still empty here, so there is not even anything to report as seen yet.
+    assert_eq!(
+        app.state().chat_list.chats[&ChatId(1)].unread_count,
+        UNREAD_ON_OPEN,
+        "the badge is TDLib's to clear"
+    );
+
+    app.advance_until("the read receipt to reach TDLib", |_, fake| {
+        fake.received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::ViewMessages { .. }))
+    })
+    .await;
+
+    let viewed: Vec<MessageId> = app
+        .fake
+        .received()
+        .iter()
+        .find_map(|r| match r {
+            TdRequest::ViewMessages {
+                chat_id,
+                message_ids,
+            } if *chat_id == ChatId(1) => Some(message_ids.clone()),
+            _ => None,
+        })
+        .expect("a ViewMessages for the open chat");
+    assert!(
+        viewed.iter().all(|id| id.0 % 2 == 1),
+        "the user's own messages are never marked read: {viewed:?}"
+    );
+    assert_eq!(
+        viewed.last(),
+        Some(&MessageId(49)),
+        "the newest loaded incoming message is the watermark: {viewed:?}"
+    );
+
+    // And now the half that is TDLib's: the update its answer produces is
+    // what takes the badge to zero, in the sidebar and in the window's read
+    // marker alike.
+    app.advance_until("TDLib to report the chat read", |core, _| {
+        core.app().state().chat_list.chats[&ChatId(1)].unread_count == 0
+    })
+    .await;
+    assert_eq!(
+        app.state().conversations[&ChatId(1)].last_read_inbox,
+        MessageId(49)
     );
 }
 
@@ -706,6 +776,49 @@ fn empty_then_page_script() -> Vec<ScriptStep> {
 
 fn on_disk_fixtures() -> [(&'static str, Vec<ScriptStep>); 1] {
     [("read_only.jsonl", read_only_script())]
+}
+
+/// T72: a chat that opens with unread messages. The `ViewMessages` step is
+/// the gate the read-inbox update hangs off — TDLib clears the badge
+/// *because* the client said the messages were seen, so scripting it that way
+/// is what makes the test able to tell the fix from a client that zeroes the
+/// count on its own.
+fn unread_chat_script() -> Vec<ScriptStep> {
+    let mut steps = ready_and_load_chats();
+    steps.extend([
+        ScriptStep::Emit(TdUpdate::NewChat(ChatView {
+            id: ChatId(1),
+            kind: ChatKind::Private,
+            title: "Ada Lovelace".to_string(),
+            positions: vec![position(100)],
+            unread_count: UNREAD_ON_OPEN,
+            unread_mention_count: 0,
+            last_message: None,
+            is_muted: false,
+        })),
+        // The opening page. Half of it is the user's own messages
+        // (`message()` makes even ids outgoing), which must never appear in
+        // the read receipt.
+        ScriptStep::Await {
+            expect: expect("GetChatHistory"),
+            respond: page(1..=50),
+        },
+        ScriptStep::Await {
+            expect: expect("ViewMessages"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        // TDLib's answer to having been told: the watermark moves and the
+        // badge goes to zero. This is the only thing in the run that clears
+        // it. (T59's remote reconcile is deliberately unscripted — it lands
+        // on `FakeTd`'s default `Ok`, which the history completion reads as
+        // an empty page and the paging machine ignores as stale.)
+        ScriptStep::Emit(TdUpdate::ChatReadInbox {
+            chat_id: ChatId(1),
+            last_read_inbox_message_id: MessageId(49),
+            unread_count: 0,
+        }),
+    ]);
+    steps
 }
 
 /// The fixtures are generated, not hand-written: their encoding is whatever

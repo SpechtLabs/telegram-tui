@@ -33,6 +33,53 @@
 //!   that only becomes reachable at a full `WINDOW_MAX_MESSAGES` window, and
 //!   ends the moment the page carrying the anchor lands.
 //!
+//! ## Marking messages read (T72)
+//!
+//! [`mark_visible_read`] is the only thing in the app that emits
+//! `TdRequest::ViewMessages`. Without it TDLib is never told the user saw
+//! anything: the sidebar badge never clears and the chat stays bold on the
+//! user's phone and desktop. The badge itself is *not* zeroed locally —
+//! `chat_list`'s `unread_count` only ever comes from TDLib's
+//! `updateChatReadInbox` (spec §5.1), so a request that never lands leaves
+//! the badge honestly showing unread instead of lying about it.
+//!
+//! Triggers, all of which can fire many times for the same set of messages:
+//! opening a chat (`chat_list`'s Enter, the palette's open), a history page
+//! landing, a `NewMessage` arriving in the open chat, a scroll that re-pins
+//! to the bottom, and [`handle_tick`] as the retry safety net.
+//!
+//! ### Open versus actually looking
+//!
+//! Being *open* is not enough: the request is gated on `Scroll::Bottom`. See
+//! [`mark_visible_read`] for why.
+//!
+//! ### Storm control
+//!
+//! `ViewMessages` is fire-and-forget (`dispatch.rs`'s `Completion`): there is
+//! no completion action, so nothing can clear an "in flight" flag on the way
+//! back. The only evidence the request worked is TDLib's own
+//! `updateChatReadInbox` raising `last_read_inbox` — which is exactly what
+//! stops the ids from being candidates again, so the common case needs no
+//! extra bookkeeping at all. What does need it is the gap between sending and
+//! that update landing, during which every trigger would otherwise re-send
+//! the same ids on every keystroke.
+//!
+//! [`PendingView`] is that bookkeeping, and it lives on `ConversationState`
+//! rather than in a side table like `media.rs`'s `auto_download_requested`:
+//! read state is per-chat by nature, it is a watermark exactly like the
+//! `last_read_inbox` it shadows, and it must die with the window it describes
+//! — a `HashMap<ChatId, _>` on `AppState` would be a second lifetime to keep
+//! in sync for no gain.
+//!
+//! It is a *watermark plus expiry*, not a plain "in flight" flag, because a
+//! flag with no completion to clear it is precisely how a chat would wedge
+//! permanently unread. A dropped or ignored request expires after
+//! `VIEW_REQUEST_RETRY_AFTER_MS` and the next trigger (or tick) re-sends it,
+//! up to [`MAX_VIEW_ATTEMPTS`] for the same watermark; a newer message raises
+//! the watermark and starts a fresh budget. So the failure modes are bounded
+//! in both directions: no storm while a request is outstanding, and no
+//! silence if one goes missing.
+//!
 //! ## Reply excerpts (architecture §7 / T09 findings)
 //!
 //! TDLib leaves `ReplyPreview.excerpt` empty for same-chat replies; filling
@@ -82,6 +129,31 @@ pub const VIEWPORT_FILL_TARGET_MESSAGES: usize = history::PAGE_SIZE as usize;
 /// visible row counts back into core.
 const PAGE_STEP_MESSAGES: usize = 10;
 
+/// Ceiling on how many ids one `ViewMessages` request carries. `viewMessages`
+/// moves a *watermark* (`last_read_inbox_message_id`), so viewing the newest
+/// id implicitly marks everything older read — the list does not have to be
+/// complete to be correct. That makes bounding it free: a
+/// `WINDOW_MAX_MESSAGES` (500) window opened for the first time would
+/// otherwise put five hundred ids in one request to say something the newest
+/// one already says. `history::PAGE_SIZE` worth is the bound because it is
+/// the same "one page of messages" unit everything else here is calibrated in.
+pub const MAX_VIEW_MESSAGES_PER_REQUEST: usize = history::PAGE_SIZE as usize;
+
+/// How long a sent `ViewMessages` is assumed to still be in flight. Long
+/// enough that a normal round trip and its `updateChatReadInbox` land well
+/// inside it (so the retry is never the reason a request goes out twice),
+/// short enough that a user who is looking at a chat whose read receipt got
+/// lost sees the badge clear in seconds rather than never.
+const VIEW_REQUEST_RETRY_AFTER_MS: u64 = 5_000;
+
+/// How many times the same watermark may be sent before this gives up on it —
+/// the first request plus retries. Mirrors `media::MAX_AUTO_DOWNLOAD_ATTEMPTS`
+/// and exists for the same reason: a request TDLib silently ignores must cost
+/// a bounded number of retries, not one every
+/// `VIEW_REQUEST_RETRY_AFTER_MS` for as long as the chat stays open. Any
+/// newer message resets the budget by raising the watermark.
+const MAX_VIEW_ATTEMPTS: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scroll {
     /// Pinned to newest; new messages keep the view at the bottom.
@@ -91,6 +163,19 @@ pub enum Scroll {
         message_id: MessageId,
         line_offset: u16,
     },
+}
+
+/// A `ViewMessages` request that has gone out but whose effect has not been
+/// observed yet. See the module docs' storm-control section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingView {
+    /// Newest id the request asked TDLib to view. `viewMessages` moves a
+    /// watermark, so this one id is what the whole request amounts to.
+    pub up_to: MessageId,
+    /// When the most recent attempt for `up_to` was sent.
+    pub sent_at: Millis,
+    /// Attempts spent on `up_to`, capped by [`MAX_VIEW_ATTEMPTS`].
+    pub attempts: u8,
 }
 
 #[derive(Debug)]
@@ -103,6 +188,10 @@ pub struct ConversationState {
     pub revealed_spoilers: BTreeSet<MessageId>,
     pub last_read_inbox: MessageId,
     pub last_read_outbox: MessageId,
+    /// Storm control for [`mark_visible_read`] (module docs). `None` means
+    /// nothing is outstanding — either nothing was ever sent, or TDLib's
+    /// `updateChatReadInbox` already confirmed what was.
+    pub pending_view: Option<PendingView>,
     /// In-chat search hits (populated by state/search.rs).
     pub search_hits: Vec<MessageId>,
     /// Selection mode, per open chat and transient (architecture §4.6).
@@ -130,10 +219,107 @@ pub fn open(app: &mut AppState, chat_id: ChatId) {
             revealed_spoilers: BTreeSet::new(),
             last_read_inbox: MessageId(0),
             last_read_outbox: MessageId(0),
+            pending_view: None,
             search_hits: Vec::new(),
             selection: None,
         });
     app.open_chat = Some(chat_id);
+}
+
+/// Tells TDLib which messages the user has actually seen in `chat_id`, so it
+/// clears the unread badge and syncs the read state to the user's other
+/// clients. See the module docs for the trigger points and the storm control;
+/// this doc comment covers what "seen" is taken to mean.
+///
+/// ## Only while pinned to the bottom
+///
+/// A chat being open is not evidence the user read anything. The window can
+/// be scrolled arbitrarily far back into history, and everything unread is by
+/// definition *newer* than what is on screen there — below the fold, unseen.
+/// Marking those read would be a claim the user never made, and unlike most
+/// local state it is not private or recoverable: it clears the badge on their
+/// phone and, in a private chat, shows the other side a read receipt for a
+/// message that was never looked at. Getting it wrong in the other direction
+/// costs a badge that clears a moment later, when the user scrolls down.
+///
+/// So the gate is `Scroll::Bottom` — core's only available proxy for "looking
+/// at the newest messages", since the laid-out viewport lives in `tgt-ui` and
+/// never comes back here. It is a faithful proxy in both directions: the
+/// scroll keys re-pin to `Scroll::Bottom` the moment the anchor reaches the
+/// newest loaded message ([`move_anchor`]), and every chat opens pinned there.
+///
+/// The bottom of the *loaded window* is also the bottom of the chat: v1 only
+/// ever pages backwards, so the newest loaded message is always the newest
+/// message that exists.
+pub fn mark_visible_read(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
+    // A background chat keeps receiving messages and history pages
+    // (`append_new_message`'s doc comment); none of that is on screen.
+    if app.open_chat != Some(chat_id) {
+        return Vec::new();
+    }
+    let now = app.now;
+    let Some(convo) = app.conversations.get_mut(&chat_id) else {
+        return Vec::new();
+    };
+    if !matches!(convo.scroll, Scroll::Bottom) {
+        return Vec::new();
+    }
+
+    // Newest first, so the bound keeps the ids that matter: outgoing messages
+    // are never unread (they are the user's own), and anything at or below
+    // the watermark TDLib already counts as read.
+    let mut message_ids: Vec<MessageId> = convo
+        .messages
+        .iter()
+        .rev()
+        .filter(|m| !m.is_outgoing && m.id > convo.last_read_inbox)
+        .take(MAX_VIEW_MESSAGES_PER_REQUEST)
+        .map(|m| m.id)
+        .collect();
+    let Some(&newest) = message_ids.first() else {
+        return Vec::new();
+    };
+
+    if let Some(pending) = convo.pending_view
+        && pending.up_to >= newest
+    {
+        let elapsed = now.0.saturating_sub(pending.sent_at.0);
+        if elapsed < VIEW_REQUEST_RETRY_AFTER_MS || pending.attempts >= MAX_VIEW_ATTEMPTS {
+            return Vec::new();
+        }
+        convo.pending_view = Some(PendingView {
+            up_to: newest,
+            sent_at: now,
+            attempts: pending.attempts + 1,
+        });
+    } else {
+        convo.pending_view = Some(PendingView {
+            up_to: newest,
+            sent_at: now,
+            attempts: 1,
+        });
+    }
+
+    message_ids.reverse(); // ascending, like the window itself
+    vec![Effect::Td(TdRequest::ViewMessages {
+        chat_id,
+        message_ids,
+    })]
+}
+
+/// The retry half of [`mark_visible_read`]'s storm control (module docs).
+/// Every other trigger is an event; this is what makes a `ViewMessages` that
+/// TDLib dropped recoverable for a user who is sitting still with the chat
+/// open, and it is why nothing else has to be wired up as a trigger to
+/// guarantee eventual consistency. Costs nothing when there is nothing to
+/// mark: with no unread messages below the watermark it returns before
+/// touching any state, and while a request is outstanding the pending
+/// watermark short-circuits it.
+pub fn handle_tick(app: &mut AppState) -> Vec<Effect> {
+    let Some(chat_id) = app.open_chat else {
+        return Vec::new();
+    };
+    mark_visible_read(app, chat_id)
 }
 
 pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
@@ -143,7 +329,11 @@ pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
             // T66: the arrival changes what's visible near the anchor
             // (`Scroll::Bottom` especially — a new message is by
             // definition the newest thing loaded).
-            return media::auto_download_photos(app, msg.chat_id);
+            let mut effects = media::auto_download_photos(app, msg.chat_id);
+            // T72: and it arrived unread, in a chat the user may be looking
+            // at right now.
+            effects.extend(mark_visible_read(app, msg.chat_id));
+            return effects;
         }
         TdUpdate::MessagesDeleted {
             chat_id,
@@ -193,6 +383,18 @@ pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
         } => {
             if let Some(convo) = app.conversations.get_mut(chat_id) {
                 convo.last_read_inbox = *last_read_inbox_message_id;
+                // T72: this is the answer `ViewMessages` never gets as a
+                // completion — TDLib has moved the watermark past what was
+                // asked for, so the outstanding request is done. Retiring it
+                // is bookkeeping, not the thing that clears the badge: that
+                // is `chat_list`'s arm of this same update writing TDLib's
+                // own `unread_count`.
+                if convo
+                    .pending_view
+                    .is_some_and(|p| p.up_to <= *last_read_inbox_message_id)
+                {
+                    convo.pending_view = None;
+                }
             }
         }
         TdUpdate::ChatReadOutbox {
@@ -408,6 +610,9 @@ pub fn apply_history_page(
     // storm control makes a redundant call a no-op) is exactly the kind of
     // change to the visible window auto-download exists to react to.
     effects.extend(media::auto_download_photos(app, chat_id));
+    // T72: the unread messages arrive *with* this page — on a first open
+    // there is nothing to mark read until it lands.
+    effects.extend(mark_visible_read(app, chat_id));
     effects
 }
 
@@ -642,6 +847,10 @@ pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
     };
     // T66: every anchor step changes what's near it.
     effects.extend(media::auto_download_photos(app, chat_id));
+    // T72: scrolling back down to the newest message is the user saying they
+    // are looking at it — the one anchor move `mark_visible_read`'s
+    // `Scroll::Bottom` gate cares about (every other one bails immediately).
+    effects.extend(mark_visible_read(app, chat_id));
     Some(effects)
 }
 
@@ -831,6 +1040,31 @@ mod tests {
             telemetry_salt: [0u8; 32],
             now: Millis(0),
         }
+    }
+
+    /// Drops the `ViewMessages` requests [`mark_visible_read`] adds to every
+    /// window change, so the paging and scrolling tests below keep asserting
+    /// on the effect they are actually about. Read marking has its own
+    /// tests — see the "T72" section.
+    fn without_view_messages(effects: Vec<Effect>) -> Vec<Effect> {
+        effects
+            .into_iter()
+            .filter(|e| !matches!(e, Effect::Td(TdRequest::ViewMessages { .. })))
+            .collect()
+    }
+
+    /// The `ViewMessages` requests in `effects`, as `(chat, ids)` pairs.
+    fn view_requests(effects: &[Effect]) -> Vec<(ChatId, Vec<MessageId>)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Td(TdRequest::ViewMessages {
+                    chat_id,
+                    message_ids,
+                }) => Some((*chat_id, message_ids.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Opens the chat and focuses somewhere other than the chat list, so
@@ -1378,7 +1612,8 @@ mod tests {
             only_local: false,
         };
 
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(Vec::new()));
+        let effects =
+            without_view_messages(apply_history_page(&mut app, CHAT, false, &Ok(Vec::new())));
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(
@@ -1452,7 +1687,7 @@ mod tests {
         fixture_opening(&mut app);
 
         let page: Vec<MessageView> = (1..=50).map(msg).collect();
-        let effects = apply_history_page(&mut app, CHAT, true, &Ok(page));
+        let effects = without_view_messages(apply_history_page(&mut app, CHAT, true, &Ok(page)));
 
         assert!(
             matches!(
@@ -1857,7 +2092,7 @@ mod tests {
             .push_back(msg(1));
 
         let effects = handle_key(&mut app, Key::Down).expect("conversation claims Down");
-        assert!(effects.is_empty());
+        assert!(without_view_messages(effects).is_empty());
         assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
     }
 
@@ -1998,7 +2233,7 @@ mod tests {
             line_offset: 0,
         };
 
-        let effects = handle_key(&mut app, Key::PageUp).unwrap();
+        let effects = without_view_messages(handle_key(&mut app, Key::PageUp).unwrap());
 
         assert!(effects.is_empty(), "{effects:?}");
         assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
@@ -2038,5 +2273,262 @@ mod tests {
             .messages
             .push_back(msg(1));
         assert!(handle_key(&mut app, Key::Char('a')).is_none());
+    }
+
+    // --- T72: marking messages read -----------------------------------
+
+    fn own_msg(id: i64) -> MessageView {
+        MessageView {
+            is_outgoing: true,
+            ..msg(id)
+        }
+    }
+
+    /// An open, bottom-pinned chat holding `ids`, with everything at or below
+    /// `last_read_inbox` already read.
+    fn fixture_unread(app: &mut AppState, messages: Vec<MessageView>, last_read_inbox: i64) {
+        fixture_open(app);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.extend(messages);
+        convo.last_read_inbox = MessageId(last_read_inbox);
+    }
+
+    #[test]
+    fn unread_messages_are_marked_read_from_the_watermark_up() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 2);
+
+        let effects = mark_visible_read(&mut app, CHAT);
+
+        assert_eq!(
+            view_requests(&effects),
+            vec![(CHAT, vec![MessageId(3), MessageId(4), MessageId(5)])],
+            "only the messages newer than last_read_inbox, ascending"
+        );
+    }
+
+    #[test]
+    fn outgoing_messages_are_never_marked_read() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, vec![msg(1), own_msg(2), msg(3), own_msg(4)], 0);
+
+        let effects = mark_visible_read(&mut app, CHAT);
+
+        assert_eq!(
+            view_requests(&effects),
+            vec![(CHAT, vec![MessageId(1), MessageId(3)])],
+            "the user's own messages are not theirs to read"
+        );
+    }
+
+    #[test]
+    fn a_chat_with_nothing_unread_asks_for_nothing() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 5);
+
+        assert!(mark_visible_read(&mut app, CHAT).is_empty());
+        assert!(app.conversations[&CHAT].pending_view.is_none());
+    }
+
+    /// Storm control: every trigger fires repeatedly, and `last_read_inbox`
+    /// cannot advance until TDLib answers.
+    #[test]
+    fn the_same_ids_are_not_resent_while_a_request_is_in_flight() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 0);
+
+        assert_eq!(view_requests(&mark_visible_read(&mut app, CHAT)).len(), 1);
+        for _ in 0..10 {
+            assert!(
+                mark_visible_read(&mut app, CHAT).is_empty(),
+                "a repeated trigger must not re-send the same ids"
+            );
+        }
+    }
+
+    /// A message arriving while the earlier request is still outstanding is
+    /// new information, not a repeat: it raises the watermark and goes out.
+    #[test]
+    fn a_newer_arrival_is_marked_even_with_a_request_outstanding() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 0);
+        mark_visible_read(&mut app, CHAT);
+
+        let effects = handle_td(&mut app, &TdUpdate::NewMessage(msg(6)));
+
+        let requests = view_requests(&effects);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.last(), Some(&MessageId(6)));
+    }
+
+    /// The window can be scrolled arbitrarily far back, and everything unread
+    /// is newer than what is on screen there. See `mark_visible_read`'s
+    /// "Only while pinned to the bottom".
+    #[test]
+    fn a_scrolled_back_window_marks_nothing_read() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=50).map(msg).collect(), 0);
+        app.conversations.get_mut(&CHAT).unwrap().scroll = Scroll::At {
+            message_id: MessageId(5),
+            line_offset: 0,
+        };
+
+        assert!(mark_visible_read(&mut app, CHAT).is_empty());
+
+        // Scrolling back down to the newest message is the user saying they
+        // are looking at it — and only the step that arrives there marks
+        // anything read.
+        let mut effects = Vec::new();
+        while !matches!(app.conversations[&CHAT].scroll, Scroll::Bottom) {
+            assert!(
+                view_requests(&effects).is_empty(),
+                "still short of the bottom"
+            );
+            effects = handle_key(&mut app, Key::PageDown).expect("conversation claims PageDown");
+        }
+        assert_eq!(view_requests(&effects).len(), 1);
+    }
+
+    /// A chat the user has visited keeps receiving messages in the
+    /// background (`append_new_message`); none of it is on screen.
+    #[test]
+    fn a_background_chat_is_never_marked_read() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 0);
+        app.open_chat = Some(ChatId(99));
+
+        assert!(mark_visible_read(&mut app, CHAT).is_empty());
+        assert!(handle_td(&mut app, &TdUpdate::NewMessage(msg(6))).is_empty());
+    }
+
+    #[test]
+    fn one_request_carries_at_most_a_page_of_ids() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=200).map(msg).collect(), 0);
+
+        let requests = view_requests(&mark_visible_read(&mut app, CHAT));
+
+        let ids = &requests[0].1;
+        assert_eq!(ids.len(), MAX_VIEW_MESSAGES_PER_REQUEST);
+        assert_eq!(
+            ids.last(),
+            Some(&MessageId(200)),
+            "the bound keeps the newest ids — `viewMessages` moves a watermark"
+        );
+    }
+
+    /// TDLib's own update is the answer `ViewMessages` never gets as a
+    /// completion, and it is what clears the badge. Nothing here zeroes an
+    /// unread count locally.
+    #[test]
+    fn read_inbox_confirmation_retires_the_outstanding_request() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 0);
+        mark_visible_read(&mut app, CHAT);
+        assert!(app.conversations[&CHAT].pending_view.is_some());
+
+        handle_td(
+            &mut app,
+            &TdUpdate::ChatReadInbox {
+                chat_id: CHAT,
+                last_read_inbox_message_id: MessageId(5),
+                unread_count: 0,
+            },
+        );
+
+        let convo = &app.conversations[&CHAT];
+        assert_eq!(convo.last_read_inbox, MessageId(5));
+        assert!(convo.pending_view.is_none());
+        // And with the watermark caught up, there is nothing left to ask for.
+        assert!(mark_visible_read(&mut app, CHAT).is_empty());
+    }
+
+    /// The anti-wedge rule: `ViewMessages` has no completion, so a request
+    /// TDLib drops must expire rather than latch the chat unread forever.
+    #[test]
+    fn a_dropped_request_is_retried_after_the_in_flight_window_expires() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 0);
+        assert_eq!(view_requests(&mark_visible_read(&mut app, CHAT)).len(), 1);
+
+        app.now = Millis(VIEW_REQUEST_RETRY_AFTER_MS - 1);
+        assert!(mark_visible_read(&mut app, CHAT).is_empty());
+
+        app.now = Millis(VIEW_REQUEST_RETRY_AFTER_MS);
+        assert_eq!(
+            view_requests(&mark_visible_read(&mut app, CHAT)),
+            vec![(
+                CHAT,
+                vec![
+                    MessageId(1),
+                    MessageId(2),
+                    MessageId(3),
+                    MessageId(4),
+                    MessageId(5)
+                ]
+            )]
+        );
+    }
+
+    /// ...but a TDLib that ignores the request forever must not be hammered:
+    /// the retries are bounded per watermark.
+    #[test]
+    fn retries_for_one_watermark_are_bounded() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 0);
+
+        let mut sent = 0;
+        for round in 0..10u64 {
+            app.now = Millis(round * VIEW_REQUEST_RETRY_AFTER_MS);
+            sent += view_requests(&mark_visible_read(&mut app, CHAT)).len();
+        }
+        assert_eq!(sent, MAX_VIEW_ATTEMPTS as usize);
+
+        // A newer message is new information and earns a fresh budget.
+        app.conversations
+            .get_mut(&CHAT)
+            .unwrap()
+            .messages
+            .push_back(msg(6));
+        assert_eq!(view_requests(&mark_visible_read(&mut app, CHAT)).len(), 1);
+    }
+
+    /// The tick is the retry trigger for a user sitting still with the chat
+    /// open; it costs nothing when there is nothing to mark.
+    #[test]
+    fn the_tick_retries_and_is_otherwise_silent() {
+        let mut app = fixture_state();
+        assert!(handle_tick(&mut app).is_empty(), "no chat open");
+
+        fixture_unread(&mut app, (1..=5).map(msg).collect(), 5);
+        assert!(handle_tick(&mut app).is_empty(), "nothing unread");
+
+        app.conversations.get_mut(&CHAT).unwrap().last_read_inbox = MessageId(0);
+        assert_eq!(view_requests(&handle_tick(&mut app)).len(), 1);
+        app.now = Millis(VIEW_REQUEST_RETRY_AFTER_MS);
+        assert_eq!(
+            view_requests(&handle_tick(&mut app)).len(),
+            1,
+            "the request TDLib never answered goes out again"
+        );
+    }
+
+    /// The unread messages arrive *with* the opening page: a first open has
+    /// nothing to mark until it lands.
+    #[test]
+    fn a_landing_history_page_marks_the_unread_it_brought() {
+        let mut app = fixture_state();
+        fixture_open(&mut app);
+        app.conversations.get_mut(&CHAT).unwrap().paging = PagingState::Loading {
+            attempt: 1,
+            only_local: false,
+        };
+
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok((1..=3).map(msg).collect()));
+
+        assert_eq!(
+            view_requests(&effects),
+            vec![(CHAT, vec![MessageId(1), MessageId(2), MessageId(3)])]
+        );
     }
 }

@@ -19,7 +19,7 @@
 //! survives filtering. This keeps the cursor close to where the user left
 //! it instead of snapping to the top of the list.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::app::AppState;
 use crate::effect::Effect;
@@ -27,7 +27,7 @@ use crate::model::chat::{ChatListId, ChatOrderKey, ChatPositionEntry, ChatView};
 use crate::model::ids::{ChatId, MessageId};
 use crate::model::key::Key;
 use crate::state::auth::InputField;
-use crate::state::conversation::{ConversationState, Scroll};
+use crate::state::conversation;
 use crate::state::focus::Focus;
 use crate::state::history::PagingState;
 use crate::td::request::TdRequest;
@@ -474,30 +474,22 @@ fn move_selection(app: &mut AppState, delta: i32) {
 /// the completion (`apply_history_page`) can route through the paging
 /// machine (and its empty-response trap, spec §5.2) instead of being
 /// silently dropped as a "stale" completion.
+///
+/// The window bookkeeping itself is `conversation::open`'s (the same call
+/// `palette`'s open path makes), so the `ConversationState` a chat gets is
+/// built in exactly one place regardless of which pane opened it.
 fn open_selected(app: &mut AppState) -> Vec<Effect> {
     let Some(chat_id) = app.chat_list.selected else {
         return Vec::new();
     };
-    app.open_chat = Some(chat_id);
-    let convo = app
-        .conversations
-        .entry(chat_id)
-        .or_insert_with(|| ConversationState {
-            chat_id,
-            messages: VecDeque::new(),
-            paging: PagingState::Idle,
-            scroll: Scroll::Bottom,
-            revealed_spoilers: BTreeSet::new(),
-            last_read_inbox: MessageId(0),
-            last_read_outbox: MessageId(0),
-            search_hits: Vec::new(),
-            selection: None,
-        });
-    convo.paging = PagingState::Loading {
-        attempt: 1,
-        only_local: true,
-    };
-    vec![
+    conversation::open(app, chat_id);
+    if let Some(convo) = app.conversations.get_mut(&chat_id) {
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: true,
+        };
+    }
+    let mut effects = vec![
         Effect::Td(TdRequest::OpenChat { chat_id }),
         Effect::Td(TdRequest::GetChatHistory {
             chat_id,
@@ -505,7 +497,12 @@ fn open_selected(app: &mut AppState) -> Vec<Effect> {
             limit: 50,
             only_local: true,
         }),
-    ]
+    ];
+    // T72: reopening a chat whose window is still loaded has unread messages
+    // to mark right now; a first open has none until its page lands, and
+    // `conversation::apply_history_page` fires this again then.
+    effects.extend(conversation::mark_visible_read(app, chat_id));
+    effects
 }
 
 #[cfg(test)]
@@ -580,6 +577,30 @@ mod tests {
             unread_mention_count: 0,
             last_message: None,
             is_muted: false,
+        }
+    }
+
+    /// An incoming message, for the T72 read-marking test.
+    fn unread_msg(id: i64) -> crate::model::message::MessageView {
+        use crate::model::entity::FormattedText;
+        use crate::model::ids::UserId;
+        use crate::model::message::{MessageCaps, MessageContent, MessageView, SendState, Sender};
+        MessageView {
+            id: MessageId(id),
+            chat_id: ChatId(1),
+            sender: Sender::User(UserId(1)),
+            sender_name: "Alice".to_string(),
+            is_outgoing: false,
+            date: 1_700_000_000 + id,
+            content: MessageContent::Text(FormattedText {
+                text: format!("msg {id}"),
+                entities: Vec::new(),
+            }),
+            reply_to: None,
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            caps: MessageCaps::default(),
+            is_edited: false,
         }
     }
 
@@ -692,6 +713,54 @@ mod tests {
                 only_local: true,
             })
         ));
+    }
+
+    /// T72: reopening a chat whose window is still loaded marks its unread
+    /// messages read — and the badge stays exactly as TDLib last reported it
+    /// until TDLib says otherwise. Nothing here zeroes `unread_count`
+    /// locally: a request that never lands must leave the badge honest.
+    #[test]
+    fn opening_a_chat_marks_it_read_without_touching_the_badge() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 10));
+        app.chat_list
+            .chats
+            .get_mut(&ChatId(1))
+            .unwrap()
+            .unread_count = 2;
+        app.chat_list.selected = Some(ChatId(1));
+        // A window left loaded by an earlier visit, holding both unread
+        // messages.
+        conversation::open(&mut app, ChatId(1));
+        let convo = app.conversations.get_mut(&ChatId(1)).unwrap();
+        convo.messages.extend([unread_msg(7), unread_msg(8)]);
+        app.open_chat = None;
+
+        let effects = handle_key(&mut app, Key::Enter).expect("chat list claims Enter");
+
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Td(TdRequest::ViewMessages { chat_id: ChatId(1), message_ids })
+                    if message_ids == &[MessageId(7), MessageId(8)]
+            )),
+            "expected the loaded unread messages to be marked read: {effects:?}"
+        );
+        assert_eq!(
+            app.chat_list.chats[&ChatId(1)].unread_count,
+            2,
+            "the badge is TDLib's to clear, not ours"
+        );
+
+        handle_td(
+            &mut app,
+            &TdUpdate::ChatReadInbox {
+                chat_id: ChatId(1),
+                last_read_inbox_message_id: MessageId(8),
+                unread_count: 0,
+            },
+        );
+        assert_eq!(app.chat_list.chats[&ChatId(1)].unread_count, 0);
     }
 
     /// T59: opening a chat serves TDLib's on-disk cache first — the request
