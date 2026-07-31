@@ -12,14 +12,16 @@ name: Release
 # ## THE PATH OF THIS FILE IS LOAD-BEARING — do not rename or move it
 #
 # Releases are signed keyless through GitHub OIDC, and the identity baked
-# into the certificate is this file's path:
+# into the certificate is this file's path, ending in `@refs/heads/main` —
+# see the `build` job's `SIGNING_IDENTITY` env var below for the exact
+# string. Not restated here: a comment is the one copy nothing can check,
+# so this points at the checked copy instead of holding one of its own
+# (scripts/check-release-identity.sh verifies that copy against the
+# `SIGNING_IDENTITY` constant in crates/app/src/update.rs).
 #
-#   https://github.com/SpechtLabs/telegram-tui/.github/workflows/release.yaml@refs/heads/main
-#
-# `tgt update --require-signature` pins that string exactly — see
-# SIGNING_IDENTITY in crates/app/src/update.rs. The pin is the whole check:
-# `cosign verify-blob` given only --bundle proves that *somebody* signed the
-# blob, not who.
+# `tgt update --require-signature` pins that same string exactly. The pin
+# is the whole check: `cosign verify-blob` given only --bundle proves that
+# *somebody* signed the blob, not who.
 #
 # Renaming this file therefore breaks signature verification for every client
 # built before the rename, and the failure lands far from the cause — users

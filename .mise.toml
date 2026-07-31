@@ -91,9 +91,13 @@ run = "cargo test --workspace"
 description = "Assert the crate dependency boundaries hold (gate 4)"
 run = "./scripts/check-crate-boundaries.sh"
 
+[tasks.release-identity]
+description = "Assert crates/app/src/update.rs and the release workflow agree on SIGNING_IDENTITY/OIDC_ISSUER (gate 5)"
+run = "./scripts/check-release-identity.sh"
+
 [tasks.check]
 description = "The definition of done: every gate that must pass before merging"
-depends = ["fmt-check", "lint", "test", "boundaries"]
+depends = ["fmt-check", "lint", "test", "boundaries", "release-identity"]
 
 [tasks.snapshots]
 description = "Fail on any pending insta snapshot (take them with `cargo insta accept`)"
