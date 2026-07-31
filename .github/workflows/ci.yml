@@ -1,11 +1,16 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   # Callable so the release pipeline gates on the exact same checks rather
   # than a second copy of them.
+  #
+  # Deliberately no `push` trigger. release.yaml already runs on every push to
+  # main and calls this workflow, so a push trigger here ran the whole
+  # three-platform matrix a second time against the identical commit —
+  # doubling the queue, and the wait, for no extra signal. Pushes to main are
+  # covered by the CI job inside the Release run; pull requests are covered
+  # here directly.
   workflow_call:
 
 permissions:
@@ -16,8 +21,23 @@ permissions:
 # private repos — and a superseded run proves nothing about the current head.
 # Releases are exempt: cancelling one half-way could leave a tag published
 # with no binary attached to it.
+#
+# The literal `ci` in the group is load-bearing, not decoration. Inside a
+# workflow called by another, `github.workflow` resolves to the *caller's*
+# name, so release.yaml's `uses: ./.github/workflows/ci.yml` made this
+# expression evaluate to `Release-<ref>` — the exact group the parent run
+# already holds. The child then waited on a lock only the parent could
+# release, and GitHub killed the run:
+#
+#   Canceling since a deadlock was detected for concurrency group
+#   'Release-refs/heads/main' between a top level workflow and 'CI'
+#
+# Every release since the matrix landed died that way, whatever the tests
+# said. Keeping a segment that the caller cannot collide with is what stops
+# it recurring; it also keeps a called run from fighting the standalone run
+# of the same commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
