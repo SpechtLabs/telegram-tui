@@ -125,6 +125,39 @@ Before softening this: `state::auth::submit_credentials` advances the wizard bef
 
 The restart fires **only when the closed client never reached `Ready`**. That is not an oversight: clearing account-scoped `AppState` needs a core action that does not exist yet (task #64), and restarting without it renders a signed-out user's chats against a fresh client. Do not widen the condition without that reset.
 
+## Verify rather than reason
+
+Every expensive mistake in this repo so far has been a confident claim nobody tried to falsify. Two habits catch almost all of them.
+
+**A green test proves nothing until you have watched it fail.** Break the code deliberately, check that the specific test goes red with the message you expect, then restore. Do it for each half of a carve-out separately, or one half can be dead while the other carries the suite.
+
+Two assertions here could not fail under any input, and one had been passing since the day it was written. `consent_screen_swallows_the_login_keys` asserted on `auth.method` to prove the consent screen swallowed keystrokes; but `dispatch_key` bails out unless `screen == Screen::Main`, and `auth::handle_key` returns `None` unless `screen == Screen::Auth`, so no key reaches the auth screen while consent is up even with consent's claiming removed entirely. The gate is defended in layers and an integration test driving keystrokes cannot tell which layer did the defending. That property now lives in `state::consent`'s own unit test, which drives the router directly.
+
+**Claims about absence need falsifying too.** "Implemented but never called" was reported three times and was wrong twice:
+
+- `file_card_upload_line` was reported as never built. It is called from `view/conversation.rs`, renders per-frame outside the layout cache, and the grep behind the report had used the wrong symbol name. Two agents nearly built a second upload bar on top of the working one.
+- `←` not moving pane focus was filed as a defect. `app.rs` documents it as deliberate, with reasoning: `←` is the caret key in the composer and walks the chip row in selection mode.
+- `ChatListState.scroll_offset` was genuinely dead, and was exactly the field the wheel-scroll fix needed.
+
+The heuristic that separates them: a function that is fully implemented, documented, and already honouring a subtle contract, with zero callers, is implausible on its face. Dead code that careful usually means the search was wrong. And **a comment explaining why something does nothing is a decision, not a defect** — read for the rationale before concluding a mechanism is missing.
+
+This matters here specifically because the codebase does contain genuinely unwired mechanisms, from tasks whose call site belonged to a later task that drifted. The claim is plausible enough to act on without checking, which is what makes the false ones expensive.
+
+## Releasing and installing
+
+The release pipeline had four independent faults, each hidden behind the one before it, and none of them in the build. If a release misbehaves, suspect plumbing before code.
+
+- **A reusable workflow inherits its caller's `github.workflow`.** `release.yaml` calls `ci.yml`, so `ci.yml`'s concurrency expression evaluated to the group its own parent held, and GitHub cancelled every release run as a deadlock. The literal `ci` segment in that group is load-bearing.
+- **`workflow_dispatch` repairs need their own concurrency group.** With `cancel-in-progress: false` GitHub keeps one *pending* run per group, so pushes to main evicted queued repairs — precisely when repairs are wanted, since main is busy with the fix. The group keys on `inputs.tag` for dispatch runs.
+- **The `checksums` job never checks the repository out**, so `gh` has no remote to infer from and needs `GH_REPO`. v0.1.4 shipped eight assets and no `SHA256SUMS` before this was found.
+- **Windows is advisory** (`continue-on-error`). It ships no artifact, and being slowest made it the job a superseding push always cancelled. The failure mode to watch for is subtler than "nobody fixes it": an advisory job makes real failures look like environment noise, so "fails only on Windows" reads as "the test is wrong" and the natural fix launders a genuine bug into a `#[cfg]`. That already happened once, with a startup regression.
+
+**The cosign signing identity is `release.yaml@refs/heads/main`, not the tag.** The workflow checks out the tag, but OIDC asserts the *workflow ref*, which is the branch the run was triggered on. Pinning the tag rejects every legitimate release and fails closed, so it looks like tampering rather than a wrong expectation. `--certificate-identity` and `--certificate-oidc-issuer` must both be pinned: with `--bundle` alone, cosign proves somebody signed the blob, not who. This makes the workflow file's *path* load-bearing; renaming it silently breaks verification.
+
+**One install layout, everywhere**: a private tree at `$XDG_DATA_HOME/tgt/{bin,lib}` with the binary symlinked to `~/.local/bin/tgt`, matching what the Homebrew formula does with `libexec`. `bin/` and `lib/` must stay siblings because the runpath resolves relative to the executable. Scattering them into a shared prefix makes the tree unswappable: there is no atomic multi-rename, and a half-replaced pair fails at dyld load, in a binary that can no longer start to repair itself.
+
+`package.sh` writes `.tgt-install` into the tarball root carrying the version and the target triple, so anything replacing a tree can prove it is replacing a tgt install rather than inferring it. **Require positive evidence before renaming or deleting a directory a user pointed you at.** The tempting inverse test — "does it contain only `bin` and `lib`?" — also describes a fresh `~/.local`, and would have renamed home directories for the users least likely to notice.
+
 ## Gotchas
 
 These bit during implementation and are recorded in `docs/architecture.md`:
@@ -135,6 +168,7 @@ These bit during implementation and are recorded in `docs/architecture.md`:
 - **Layout cache keys** are `(message_id, width, theme_generation, spoilers_revealed)`. Anything that changes without those (reactions, receipts, download progress) must render as per-frame lines outside the cache, not inside cached blocks.
 - **`MessageCaps`** aren't on `message` in current TDLib. They arrive via `GetMessageProperties`, fetched when a message is selected.
 - **`tracing` 0.1.44 field order**: a dotted field immediately after `target:` fails to compile. `emit!` puts a plain field first.
-- **Nothing writes to stdout/stderr while the TUI is active.** The panic hook restores the terminal (alternate screen, raw mode, mouse capture) before printing. The one deliberate exception is the alert escape sequence.
+- **Nothing writes to stdout/stderr while the TUI is active.** The panic hook restores the terminal (alternate screen, raw mode, mouse capture, bracketed paste) before printing. The one deliberate exception is the alert escape sequence. Both exit paths funnel through one `restore_terminal` closure, so a mode added to setup and forgotten in teardown cannot leave the user's shell altered after the process is gone.
+- **crossterm on Windows drives the console API, not ANSI sequences.** `queue` consults the *process's* console rather than the writer it was handed, so `execute!` into a `Vec<u8>` captures nothing there, and `EnableBracketedPaste::execute_winapi` returns `ErrorKind::Unsupported` rather than writing nothing. Propagating that with `?` from `run_tui` made `tgt` refuse to start on a legacy console. Terminal-mode setup swallows `Unsupported` with a warning and propagates everything else, because a genuinely broken handle must not disappear into a silent success.
 - **`tracing-batteries`: the Sentry battery is used, the OpenTelemetry one can't be.** `OpenTelemetry::setup` installs its own global subscriber and filters only by level, which can't coexist with the file log or the allowlist, so `otel.rs` drives the OTLP stack directly. `Sentry::setup` touches no subscriber (it just calls `sentry::init`, which binds a client to a process-global hub), so `crash.rs` uses it as-is. The rule: a battery that takes the global subscriber is unusable here, one that doesn't is fine. `sentry` is also a direct dep, purely to re-enable the `panic`/`backtrace`/`contexts`/`debug-images` features batteries turns off.
 - **Dependency pins are exact (`=`)** and live only in the three `Cargo.toml` files. Several carry non-obvious feature choices (keyring has no `apple-native` feature; `ratatui-image` runs with default features off because `chafa-dyn` needs a system C library). Comments explain each.
