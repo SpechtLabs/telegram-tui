@@ -406,6 +406,16 @@ impl App {
             return Some(self.toggle_palette());
         }
 
+        // `?` help (spec §6.2, global). Reached only when no pane claimed the
+        // key, so typing `?` into the composer or a filter still inserts the
+        // character; from the chat list or selection mode it opens the
+        // overlay. `Esc` closes it through the generic pop in `escape`.
+        if key == self.state.bindings.help && !matches!(self.state.focus.current(), Focus::Help) {
+            self.state.focus.push(Focus::Help);
+            self.dirty = true;
+            return Some(Vec::new());
+        }
+
         // `/` is context-dependent (spec §11). Its chat-list half — the
         // filter — was claimed by `chat_list::handle_key` two steps up; this
         // is the other half: in-chat message search, "bound to `/` while the
@@ -487,7 +497,10 @@ impl App {
             // the whole wiring: `Esc` is unclaimed there and comes back out
             // of `escape`, which pops this level and calls `search::close`.
             Focus::ChatSearch => search::handle_key(&mut self.state, key),
-            // Help arrives in T47; `Modal` was handled before any pane ran.
+            // The help overlay swallows everything it is shown (`Esc` never
+            // gets here — step 3 pops it via `escape` like any level).
+            Focus::Help => Some(Vec::new()),
+            // `Modal` was handled before any pane ran.
             _ => None,
         }
     }
@@ -1540,6 +1553,29 @@ mod tests {
 mod routing {
     use super::tests::{boot_fixture, chat, logged_in, message};
     use super::*;
+
+    #[test]
+    fn help_opens_from_chat_list_swallows_keys_and_esc_closes() {
+        let mut app = super::tests::logged_in();
+        assert!(matches!(app.state().focus.current(), Focus::ChatList));
+        app.update(Action::Key(Key::Char('?')));
+        assert!(matches!(app.state().focus.current(), Focus::Help));
+        // Swallowed: neither reopens help nor reaches the chat list.
+        app.update(Action::Key(Key::Char('?')));
+        app.update(Action::Key(Key::Down));
+        assert!(matches!(app.state().focus.current(), Focus::Help));
+        assert_eq!(app.state().focus.depth(), 2);
+        app.update(Action::Key(Key::Esc));
+        assert!(matches!(app.state().focus.current(), Focus::ChatList));
+    }
+
+    #[test]
+    fn question_mark_types_into_the_composer_instead_of_opening_help() {
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Char('?')));
+        assert!(!matches!(app.state().focus.current(), Focus::Help));
+        assert_eq!(app.state().composer.input.text, "?");
+    }
     use crate::model::entity::FormattedText;
     use crate::model::ids::MessageId;
     use crate::model::message::MessageCaps;

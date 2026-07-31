@@ -23,7 +23,7 @@ use tgt_core::state::focus::Focus;
 use crate::render::cache::LayoutCache;
 use crate::theme::Theme;
 use crate::view::{
-    chat_list, chips, composer, conversation, header, hint_bar, modal, palette, toast,
+    chat_list, chips, composer, conversation, header, help, hint_bar, modal, palette, toast,
 };
 
 const SIDEBAR_WIDTH: u16 = 30;
@@ -75,6 +75,9 @@ fn draw_overlays(state: &AppState, theme: &Theme, f: &mut Frame) {
     }
     if matches!(state.focus.current(), Focus::Palette) {
         palette::draw(state, theme, f);
+    }
+    if matches!(state.focus.current(), Focus::Help) {
+        help::draw(state, theme, f);
     }
     if !state.toasts.toasts.is_empty() {
         toast::draw(state, theme, f);
