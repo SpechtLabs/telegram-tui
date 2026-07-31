@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.4](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.3...v0.1.4) (2026-07-31)
+
+
+### Features
+
+* **app:** abort with an actionable error when the config can't be written ([3bd8e1a](https://github.com/SpechtLabs/telegram-tui/commit/3bd8e1afa40d12deb26d841c80b93bd44196cf5f))
+* **app:** replace a TDLib client that has closed, pre-authorization ([9587db8](https://github.com/SpechtLabs/telegram-tui/commit/9587db8c4116212db858c4ccbeade77517b27687))
+* **app:** Sentry crash reporting by default, OTLP opt-in ([a388953](https://github.com/SpechtLabs/telegram-tui/commit/a3889530f01dbf0083e4c7eef325af8a476939b7))
+* **auth:** default to QR sign-in with a phone-number escape hatch ([082ec9c](https://github.com/SpechtLabs/telegram-tui/commit/082ec9c9c4e8c34b55d2465e7bdfa920e318bab1))
+* compile on Linux and Windows ([d63e913](https://github.com/SpechtLabs/telegram-tui/commit/d63e913dc0aad75ca1c9deb12096d17179c208ab))
+
+
+### Bug Fixes
+
+* **app:** a build with no Sentry DSN says so on the consent screen ([a9fad66](https://github.com/SpechtLabs/telegram-tui/commit/a9fad660911a384c8c34583a1608c42e40a27f6e))
+* **app:** enable bracketed paste so multi-line pastes stay one event ([78a8268](https://github.com/SpechtLabs/telegram-tui/commit/78a82685beb48f721b4e16ed6fde05f179d7768e))
+* **core:** mark messages read so the unread badge clears and syncs ([58e21b3](https://github.com/SpechtLabs/telegram-tui/commit/58e21b31ff8f4b5e0b5db986b154683ba7f50bf5))
+* **core:** scroll the chat list viewport instead of moving the selection ([564e864](https://github.com/SpechtLabs/telegram-tui/commit/564e864051c218002a322567f7241cd9a9f9fe0a))
+* **core:** surface failed message actions instead of dropping their completions ([6ae9948](https://github.com/SpechtLabs/telegram-tui/commit/6ae9948eb7abccb5f921a2d7f79579a03527d9bd))
+* **core:** tell TDLib when a chat is no longer open ([b3c8434](https://github.com/SpechtLabs/telegram-tui/commit/b3c8434c92b02bd0bd32e10ac84d11f6cd9b0a84))
+* **ui:** distinguish "still loading" from "genuinely empty" in the sidebar ([d004bf5](https://github.com/SpechtLabs/telegram-tui/commit/d004bf551ae1a504bdc90924531cde4703197943))
+* **ui:** give the sidebar a vertical rhythm so folder tabs read as navigation ([272e780](https://github.com/SpechtLabs/telegram-tui/commit/272e780ee6a177cbcaca795a60e5ce0ecd3a4345))
+* **ui:** make the chat list window follow scroll_offset instead of selection ([926bd4a](https://github.com/SpechtLabs/telegram-tui/commit/926bd4a0b4ef15e7c57b973b4f23014dd7a89b90))
+
 ## [0.1.3](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.2...v0.1.3) (2026-07-31)
 
 
