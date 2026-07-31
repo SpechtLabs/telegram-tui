@@ -153,6 +153,7 @@ pub(crate) mod tests {
                 // SAFETY: forwarded to the caller of this unsafe fn.
                 unsafe { std::env::set_var($unix_var, path) };
             }
+            #[allow(dead_code)]
             #[cfg(windows)]
             pub(crate) unsafe fn $set(path: &std::path::Path) {
                 // SAFETY: forwarded to the caller of this unsafe fn.
@@ -167,6 +168,7 @@ pub(crate) mod tests {
                 // SAFETY: forwarded to the caller of this unsafe fn.
                 unsafe { std::env::remove_var($unix_var) };
             }
+            #[allow(dead_code)]
             #[cfg(windows)]
             pub(crate) unsafe fn $unset() {
                 // SAFETY: forwarded to the caller of this unsafe fn.
