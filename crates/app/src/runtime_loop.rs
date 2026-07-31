@@ -65,6 +65,8 @@ enum Input {
     Term(Event),
     Td(TdUpdate),
     Tick(Millis),
+    /// The draw gate reopened while a frame was pending. Applies nothing.
+    DrawDue,
 }
 
 /// The main loop minus the terminal. See the module docs.
@@ -156,7 +158,19 @@ impl Core {
 
     /// Waits for the next input from any source, applies it, and dispatches
     /// whatever effects it produced.
+    // Dead in the bin target, which always passes a draw deadline: this is
+    // the entry point the integration tests use (they `#[path]`-include this
+    // module and have no gate to answer to).
+    #[allow(dead_code)]
     pub async fn step(&mut self) -> Step {
+        self.step_until(None).await
+    }
+
+    /// [`step`](Self::step), but also woken by `draw_deadline`. The loop
+    /// passes the instant the draw gate reopens whenever it is holding a
+    /// frame back, so a change that lands mid-gate is painted as soon as the
+    /// gate allows rather than waiting for the next input to arrive.
+    pub async fn step_until(&mut self, draw_deadline: Option<Instant>) -> Step {
         let clock_start = self.clock_start;
         let input = {
             // Destructured so each `select!` future borrows exactly one
@@ -171,6 +185,15 @@ impl Core {
             } = self;
 
             tokio::select! {
+                // Fires only while a frame is being held back by the gate;
+                // `Input::DrawDue` applies nothing and exists purely to
+                // return control to the loop so it can draw.
+                () = async {
+                    match draw_deadline {
+                        Some(at) => time::sleep_until(time::Instant::from_std(at)).await,
+                        None => std::future::pending().await,
+                    }
+                } => Input::DrawDue,
                 // The dispatcher only ever sends `true`, so any change is
                 // the quit signal; a closed channel means the dispatcher is
                 // gone, which is also the end of the loop.
@@ -215,6 +238,8 @@ impl Core {
                 }
             }
             Input::Td(update) => self.apply_td(update),
+            // Nothing to apply: the loop draws on the way back around.
+            Input::DrawDue => {}
             Input::Tick(now) => self.apply(Action::Tick { now }),
         }
 
@@ -387,7 +412,7 @@ pub async fn run(
         theme,
     };
 
-    let mut last_draw: Option<Instant> = None;
+    let mut gate = DrawGate::default();
     // `App::new` starts dirty so the first screen renders before any action
     // arrives.
     draw_if_due(
@@ -396,22 +421,64 @@ pub async fn run(
         resolve_theme,
         measure_cell,
         terminal,
-        &mut last_draw,
+        &mut gate,
     )?;
 
-    while core.step().await == Step::Continue {
+    while core.step_until(gate.next_deadline()).await == Step::Continue {
         draw_if_due(
             &mut core,
             &mut live_theme,
             resolve_theme,
             measure_cell,
             terminal,
-            &mut last_draw,
+            &mut gate,
         )?;
     }
 
     event_reader_running.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+/// Coalesces draws to at most one per [`DRAW_GATE`] without ever losing one.
+///
+/// The dirty flag is consumed on read, so it is accumulated here instead of
+/// being tested together with the gate; a change that arrives while the gate
+/// is shut stays pending and is drawn the moment it reopens. `next_deadline`
+/// is what lets the loop wake itself for that, rather than waiting for an
+/// unrelated input to come along.
+#[derive(Debug, Default)]
+pub struct DrawGate {
+    last_draw: Option<Instant>,
+    pending: bool,
+}
+
+impl DrawGate {
+    fn note_dirty(&mut self, dirty: bool) {
+        self.pending |= dirty;
+    }
+
+    fn should_draw(&self, now: Instant) -> bool {
+        self.pending && self.gate_open(now)
+    }
+
+    fn gate_open(&self, now: Instant) -> bool {
+        self.last_draw
+            .is_none_or(|at| now.duration_since(at) >= DRAW_GATE)
+    }
+
+    fn mark_drawn(&mut self, now: Instant) {
+        self.last_draw = Some(now);
+        self.pending = false;
+    }
+
+    /// When the loop must wake to paint a frame it is holding back, if any.
+    fn next_deadline(&self) -> Option<Instant> {
+        match (self.pending, self.last_draw) {
+            (true, Some(at)) => Some(at + DRAW_GATE),
+            (true, None) => Some(Instant::now()),
+            (false, _) => None,
+        }
+    }
 }
 
 fn draw_if_due(
@@ -420,15 +487,16 @@ fn draw_if_due(
     resolve_theme: ThemeResolver,
     measure_cell: CellMeasure,
     terminal: &mut DefaultTerminal,
-    last_draw: &mut Option<Instant>,
+    gate: &mut DrawGate,
 ) -> io::Result<()> {
-    let gate_ready = last_draw.is_none_or(|at| at.elapsed() >= DRAW_GATE);
-    // `take_dirty` runs first to match the shape in architecture.md §3
-    // exactly — it always clears the flag. The 16 ms gate is far shorter
-    // than any human input cadence, so a change landing while it's still
-    // closed simply waits for the next dirtying action rather than for the
-    // gate alone; this app's inputs never come close to that rate.
-    if core.take_dirty() && gate_ready {
+    // `take_dirty` ALWAYS clears the flag, so it has to be accumulated
+    // rather than tested alongside the gate: `take_dirty() && gate_ready`
+    // silently discards the change whenever the gate is shut. Human input
+    // never arrives fast enough to notice, but TDLib update bursts do — a
+    // chat opening and its first history page landing inside the same 16 ms
+    // left the pane reading "no messages yet" until the next keypress.
+    gate.note_dirty(core.take_dirty());
+    if gate.should_draw(Instant::now()) {
         // Destructured so the draw closure borrows `app` (for its state)
         // and `render`/`last_hits` as the disjoint fields they are, rather
         // than needing both a `&core.app()` and a `&mut core.render_mut()`
@@ -491,7 +559,7 @@ fn draw_if_due(
             repaint(terminal)?;
             terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, render))?;
         }
-        *last_draw = Some(Instant::now());
+        gate.mark_drawn(Instant::now());
     }
     Ok(())
 }
@@ -551,6 +619,58 @@ fn spawn_terminal_event_reader() -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
     });
 
     (rx, running)
+}
+
+#[cfg(test)]
+mod draw_gate_tests {
+    use super::{DRAW_GATE, DrawGate};
+    use std::time::Instant;
+
+    /// The regression: a change landing while the gate is shut used to be
+    /// consumed and thrown away, leaving a chat reading "no messages yet"
+    /// until an unrelated keypress repainted it.
+    #[test]
+    fn a_change_arriving_mid_gate_is_still_drawn_once_the_gate_reopens() {
+        let mut gate = DrawGate::default();
+        let start = Instant::now();
+
+        gate.note_dirty(true);
+        assert!(gate.should_draw(start), "first frame draws immediately");
+        gate.mark_drawn(start);
+
+        // Mid-gate burst: dirty, but not yet drawable.
+        gate.note_dirty(true);
+        assert!(!gate.should_draw(start + DRAW_GATE / 2));
+        // ...and it survives to be drawn when the gate reopens.
+        assert!(gate.should_draw(start + DRAW_GATE));
+    }
+
+    #[test]
+    fn a_clean_frame_never_draws_and_asks_for_no_wakeup() {
+        let mut gate = DrawGate::default();
+        gate.note_dirty(false);
+        assert!(!gate.should_draw(Instant::now()));
+        assert!(gate.next_deadline().is_none());
+    }
+
+    #[test]
+    fn a_held_frame_asks_to_be_woken_when_the_gate_reopens() {
+        let mut gate = DrawGate::default();
+        let start = Instant::now();
+        gate.mark_drawn(start);
+        gate.note_dirty(true);
+        assert_eq!(gate.next_deadline(), Some(start + DRAW_GATE));
+    }
+
+    #[test]
+    fn drawing_clears_the_pending_frame() {
+        let mut gate = DrawGate::default();
+        let start = Instant::now();
+        gate.note_dirty(true);
+        gate.mark_drawn(start);
+        assert!(!gate.should_draw(start + DRAW_GATE * 2));
+        assert!(gate.next_deadline().is_none());
+    }
 }
 
 #[cfg(test)]
