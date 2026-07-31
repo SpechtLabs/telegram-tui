@@ -84,6 +84,17 @@ impl Default for Config {
     }
 }
 
+/// The user-configured destination `mode = "custom"` resolves to (spec
+/// §13.5). Shaped like `otel::CustomEndpoint` on purpose — `main.rs` maps
+/// one directly into the other — but kept as this module's own type so
+/// `config.rs` never has to depend on `otel.rs` (see `Config::custom_destination`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomDestination {
+    pub endpoint: String,
+    pub protocol: Option<String>,
+    pub headers: Vec<(String, String)>,
+}
+
 /// The subset of `Config` that `tgt_core::app::Boot` is built from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BootFields {
@@ -125,6 +136,34 @@ impl Config {
             }
             ConfigPatch::ConsentAcknowledged { enabled } => self.consent_acknowledged = *enabled,
         }
+    }
+
+    /// The destination this config resolves to under `mode = "custom"`
+    /// (spec §13.5). `None` when the mode isn't `custom` at all, or when
+    /// custom mode has no endpoint configured — an unset custom destination
+    /// is inert the same way an unset vendor one is. This is the single
+    /// place that reads the custom-endpoint fields, shared by `main.rs`'s
+    /// exporter startup (which maps it into `otel::CustomEndpoint`) and
+    /// `telemetry_cli::show`, so the two can never disagree about what
+    /// custom mode would send to.
+    ///
+    /// Deliberately not `otel::CustomEndpoint` itself: several integration
+    /// tests under `tests/` pull in `config.rs` via `#[path]` without
+    /// `otel.rs` (it drags in the whole OTLP stack), so this module must
+    /// stay free of that dependency.
+    pub fn custom_destination(&self) -> Option<CustomDestination> {
+        if self.telemetry_mode != TelemetryMode::Custom {
+            return None;
+        }
+        let endpoint = self.telemetry_endpoint.clone()?;
+        if endpoint.trim().is_empty() {
+            return None;
+        }
+        Some(CustomDestination {
+            endpoint,
+            protocol: self.telemetry_protocol.clone(),
+            headers: self.telemetry_headers.clone(),
+        })
     }
 
     /// Atomically writes the current config to disk as a freshly rendered,
@@ -679,6 +718,42 @@ mod tests {
         assert_eq!(parse_key("ctrl+p", Key::Esc), Key::Ctrl('p'));
         assert_eq!(parse_key("?", Key::Esc), Key::Char('?'));
         assert_eq!(parse_key("not-a-key", Key::Esc), Key::Esc);
+    }
+
+    #[test]
+    fn custom_mode_endpoint_replaces_vendor() {
+        let mut cfg = Config {
+            telemetry_mode: TelemetryMode::Custom,
+            telemetry_endpoint: Some("https://collector.example/".to_string()),
+            telemetry_protocol: Some("http/json".to_string()),
+            telemetry_headers: vec![("x-scope-orgid".to_string(), "42".to_string())],
+            ..Config::default()
+        };
+
+        let dest = cfg
+            .custom_destination()
+            .expect("custom mode with an endpoint resolves to a destination");
+        assert_eq!(dest.endpoint, "https://collector.example/");
+        assert_eq!(dest.protocol.as_deref(), Some("http/json"));
+        assert_eq!(
+            dest.headers,
+            vec![("x-scope-orgid".to_string(), "42".to_string())]
+        );
+
+        // Vendor mode never resolves a custom destination, even with the
+        // same fields populated: custom fully replaces vendor, and the two
+        // are never combined (spec §13.5).
+        cfg.telemetry_mode = TelemetryMode::Vendor;
+        assert!(
+            cfg.custom_destination().is_none(),
+            "vendor mode must not see a custom destination"
+        );
+
+        // Custom mode with no endpoint configured is inert, same as an
+        // unset vendor endpoint.
+        cfg.telemetry_mode = TelemetryMode::Custom;
+        cfg.telemetry_endpoint = None;
+        assert!(cfg.custom_destination().is_none());
     }
 
     #[test]

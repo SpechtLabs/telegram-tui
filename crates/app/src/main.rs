@@ -40,15 +40,33 @@ use td_runtime::TdlibRuntime;
 fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
 
-    if matches!(cli.command, Some(Command::Telemetry { .. })) {
-        // T51 fills this in; for now it must exist and exit cleanly so the
-        // subcommand shape is stable for every task that follows. The TUI
-        // never starts on this path, so stdout is fair game.
-        println!("not implemented until T51");
-        return Ok(());
+    if let Some(Command::Telemetry { action }) = &cli.command {
+        // Neither subcommand starts the TUI, so stdout is fair game (spec
+        // §13.3's "nothing but the file logger while the TUI is active"
+        // does not apply here).
+        let mut config = config::load()?;
+        config.telemetry_mode = effective_telemetry_mode(&cli, config.telemetry_mode);
+        return match action {
+            cli::TelemetryAction::Show => telemetry_cli::show(&config),
+            cli::TelemetryAction::ResetId => telemetry_cli::reset_id(),
+        };
     }
 
     run_tui(cli)
+}
+
+/// The effective telemetry mode for this run, applying the one precedence
+/// step left after `config::load()` (spec §13.5): `DO_NOT_TRACK` and
+/// `TELEGRAM_TUI_TELEMETRY` are already folded into `config_mode` by that
+/// call's env overrides, so the only thing left to apply here is
+/// `--no-telemetry`, which forces the session to `Off` without rewriting
+/// the config file.
+fn effective_telemetry_mode(cli: &Cli, config_mode: TelemetryMode) -> TelemetryMode {
+    if cli.no_telemetry {
+        TelemetryMode::Off
+    } else {
+        config_mode
+    }
 }
 
 fn run_tui(cli: Cli) -> eyre::Result<()> {
@@ -82,11 +100,7 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // whether or not telemetry is on, so that turning it on later does not
     // change the hashes of chats already seen.
     let identity = otel::load_or_create_identity()?;
-    let telemetry_mode = if cli.no_telemetry {
-        TelemetryMode::Off
-    } else {
-        config.telemetry_mode
-    };
+    let telemetry_mode = effective_telemetry_mode(&cli, config.telemetry_mode);
     // Read from disk before the consent screen (below, via `App::new`) can
     // possibly run this session — an unacknowledged first run therefore
     // never constructs an exporter, whatever the user is about to choose.
@@ -164,15 +178,17 @@ fn install_exporter(
         width_bucket: tgt_core::telemetry::schema::buckets::width(cols),
     };
 
-    // Under `mode = "custom"` these replace the vendor destination outright;
-    // `otel::init` never combines the two (spec §13.5).
+    // Under `mode = "custom"` this replaces the vendor destination outright;
+    // `otel::init` never combines the two (spec §13.5). `custom_destination`
+    // already returns `None` unless `config.telemetry_mode` is `Custom`, so
+    // passing it here regardless of `mode` (which may differ from
+    // `config.telemetry_mode` under `--no-telemetry`) is safe either way.
     let custom = config
-        .telemetry_endpoint
-        .clone()
-        .map(|endpoint| otel::CustomEndpoint {
-            endpoint,
-            protocol: config.telemetry_protocol.clone(),
-            headers: config.telemetry_headers.clone(),
+        .custom_destination()
+        .map(|dest| otel::CustomEndpoint {
+            endpoint: dest.endpoint,
+            protocol: dest.protocol,
+            headers: dest.headers,
         });
 
     match otel::init(mode, &session, custom) {
@@ -229,11 +245,7 @@ fn boot_from(
         theme_name: fields.theme_name,
         bindings: fields.bindings,
         layout_breakpoint_cols: fields.layout_breakpoint_cols,
-        telemetry_mode: if cli.no_telemetry {
-            TelemetryMode::Off
-        } else {
-            fields.telemetry_mode
-        },
+        telemetry_mode: effective_telemetry_mode(cli, fields.telemetry_mode),
         // Generated once per install and persisted `0600` next to the
         // install id; never transmitted (spec §13.4).
         telemetry_salt,
@@ -246,5 +258,39 @@ fn boot_from(
         has_credentials: fields.has_credentials,
         width: size.width,
         height: size.height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_telemetry_flag_beats_config() {
+        let cli = Cli::try_parse_from(["tgt", "--no-telemetry"]).unwrap();
+        assert_eq!(
+            effective_telemetry_mode(&cli, TelemetryMode::Vendor),
+            TelemetryMode::Off
+        );
+        assert_eq!(
+            effective_telemetry_mode(&cli, TelemetryMode::Custom),
+            TelemetryMode::Off
+        );
+        // Off stays Off either way, but this confirms the flag doesn't need
+        // config to already say Off to take effect.
+        assert_eq!(
+            effective_telemetry_mode(&cli, TelemetryMode::Off),
+            TelemetryMode::Off
+        );
+
+        let cli = Cli::try_parse_from(["tgt"]).unwrap();
+        assert_eq!(
+            effective_telemetry_mode(&cli, TelemetryMode::Vendor),
+            TelemetryMode::Vendor
+        );
+        assert_eq!(
+            effective_telemetry_mode(&cli, TelemetryMode::Custom),
+            TelemetryMode::Custom
+        );
     }
 }

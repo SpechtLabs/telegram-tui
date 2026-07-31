@@ -436,6 +436,38 @@ pub fn new_session_id() -> String {
     random_hex(8)
 }
 
+/// `tgt telemetry reset-id` (spec §13.5): regenerates both the install id
+/// and the HMAC salt unconditionally, overwriting whatever was on disk, and
+/// returns `(old_install_id, new_install_id)`. The salt is deliberately not
+/// returned — nothing outside this module ever sees it, on a reset any more
+/// than on a normal load (spec §13.4).
+///
+/// `pub(crate)` rather than private: T51's CLI is the only caller outside
+/// this module, and it needs no more than this single entry point — the
+/// file paths, hex encoding, and permission bits it builds on stay private
+/// to `otel.rs`.
+pub(crate) fn reset_identity() -> eyre::Result<(String, String)> {
+    let dir = config_dir()?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    let id_path = dir.join(INSTALL_ID_FILE);
+    let old_id = std::fs::read_to_string(&id_path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| is_hex_id(text))
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let new_id = random_hex(16);
+    write_private(&id_path, new_id.as_bytes())?;
+
+    let salt_path = dir.join(SALT_FILE);
+    let mut salt = [0u8; 32];
+    rand::fill(&mut salt);
+    write_private(&salt_path, &salt)?;
+
+    Ok((old_id, new_id))
+}
+
 fn config_dir() -> eyre::Result<PathBuf> {
     let strategy = etcetera::choose_base_strategy()
         .map_err(|err| eyre::eyre!("could not determine the config directory: {err}"))?;
