@@ -1681,7 +1681,6 @@ pub struct Theme {
     pub danger: Color,
     pub selection: Color,
     pub rail_own: Color,
-    pub rail_other: Color,
     /// Rules, separators, panel edges. Always dimmer than `text_muted`.
     pub border: Color,
     /// Curated palette for deterministic per-sender accents.
