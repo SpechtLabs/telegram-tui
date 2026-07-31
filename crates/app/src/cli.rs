@@ -26,6 +26,18 @@ pub enum Command {
         #[command(subcommand)]
         action: TelemetryAction,
     },
+    /// Replace this install with the latest published release.
+    Update {
+        /// Refuse to install unless the release's signature verifies against
+        /// this project's release workflow.
+        ///
+        /// Off by default because it needs `cosign` on your PATH, and a
+        /// check that usually cannot run is not a check. Without it, the
+        /// update reports exactly what it did verify — never implying a
+        /// signature was checked when none was.
+        #[arg(long)]
+        require_signature: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -39,6 +51,25 @@ pub enum TelemetryAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_update_and_its_signature_flag() {
+        let cli = Cli::try_parse_from(["tgt", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                require_signature: false
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tgt", "update", "--require-signature"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                require_signature: true
+            })
+        ));
+    }
 
     #[test]
     fn parses_telemetry_show_subcommand() {

@@ -74,6 +74,8 @@ mise run install          # builds, then installs to ~/.local/bin/tgt
 
 Both routes lay the tree out the same way: a private `bin/` + `lib/` pair with the binary symlinked onto your PATH. The binary loads TDLib from a dylib beside it, so those two have to stay siblings — which is why they go somewhere of their own rather than into a shared prefix. `TGT_INSTALL_ROOT` and `TGT_BIN_DIR` override either half.
 
+Once installed, `tgt update` replaces it with the latest release: it refuses if the install isn't a private tree it owns (Homebrew, or a legacy shared prefix), keeps the old one until the new binary has proved it starts, and reports exactly what it verified. `tgt update --require-signature` refuses unless the release's cosign signature verifies against this project's release workflow — that needs `cosign` installed, which is why it's opt-in rather than the default.
+
 On Linux you also need libc++ at runtime (`libc++1` and `libc++abi1` on Debian/Ubuntu); the installer checks and tells you.
 
 Building needs [mise](https://mise.jdx.dev) and nothing else. TDLib arrives through `tdlib-rs`'s `download-tdlib` feature during the build: no Homebrew, no system TDLib, no cmake and gperf and a C++ toolchain. The first build fetches it and takes a while; later builds don't.

@@ -8,6 +8,30 @@ name: Release
 #
 # Versioning is pre-1.0 (see .release-please-config.json): breaking changes
 # bump the minor, everything else bumps the patch.
+#
+# ## THE PATH OF THIS FILE IS LOAD-BEARING — do not rename or move it
+#
+# Releases are signed keyless through GitHub OIDC, and the identity baked
+# into the certificate is this file's path:
+#
+#   https://github.com/SpechtLabs/telegram-tui/.github/workflows/release.yaml@refs/heads/main
+#
+# `tgt update --require-signature` pins that string exactly — see
+# SIGNING_IDENTITY in crates/app/src/update.rs. The pin is the whole check:
+# `cosign verify-blob` given only --bundle proves that *somebody* signed the
+# blob, not who.
+#
+# Renaming this file therefore breaks signature verification for every client
+# built before the rename, and the failure lands far from the cause — users
+# get "signature verification failed" on a perfectly good release, which
+# reads as tampering. If it must move, change that constant in the same
+# commit and expect older clients to stop verifying newer releases.
+#
+# Note the identity ends in `@refs/heads/main`, not the tag. The build job
+# checks out the tag, but OIDC asserts the ref the *run* was triggered on,
+# and release-please triggers it by pushing to main. Deriving the identity
+# from the tag looks obviously right and is rejected by every real release —
+# confirmed by decoding a published bundle's certificate.
 
 on:
   push:

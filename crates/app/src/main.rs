@@ -16,6 +16,7 @@ mod panic;
 mod runtime_loop;
 mod td_runtime;
 mod telemetry_cli;
+mod update;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +52,11 @@ fn main() -> eyre::Result<()> {
 }
 
 fn dispatch_cli(cli: Cli) -> eyre::Result<()> {
+    // Like `telemetry show`, this never starts the TUI, so stdout is free.
+    if let Some(Command::Update { require_signature }) = &cli.command {
+        return update::run(*require_signature);
+    }
+
     if let Some(Command::Telemetry { action }) = &cli.command {
         // Neither subcommand starts the TUI, so stdout is fair game (spec
         // §13.3's "nothing but the file logger while the TUI is active"

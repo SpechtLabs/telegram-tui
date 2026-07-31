@@ -107,3 +107,24 @@ Building from a checkout, these are the tasks rather than raw cargo invocations.
 | `mise run uninstall` | Remove the binary and dylib from `$TGT_PREFIX` |
 | `mise run check` | The merge gate: fmt, clippy, tests, crate boundaries |
 | `mise tasks` | The full list |
+
+## `tgt update`
+
+Replaces this install with the latest published release. Like the telemetry subcommands it never starts the TUI.
+
+```shell
+tgt update
+tgt update --require-signature
+```
+
+It refuses rather than guessing. A Homebrew install is left to `brew upgrade`, because brew tracks its files in a manifest an in-place overwrite would desynchronise. Anything that isn't a private `bin/` + `lib/` tree it can identify — a legacy shared-prefix install, or a `cargo` target directory — is refused with the reinstall command, since replacing a directory it cannot identify would mean renaming and deleting whatever is there.
+
+The swap itself is the installer's, shipped inside the tarball and run from the newly extracted copy: stage, rename, run the new `bin/tgt --version` while the old tree still exists, and put the old one back if it can't start. There is one implementation of that procedure and both the installer and the updater use it.
+
+::: warning What "verified" means here
+The output states exactly which checks ran. A `SHA256SUMS` match is corruption detection only — the sums file comes from the same host over the same connection as the tarball, so anyone able to serve you a modified tarball can serve you a matching digest.
+
+The cosign signature is the check that means something, and only with the signing identity pinned: given just a bundle, cosign confirms *somebody* signed the blob, not who. It runs when `cosign` is on your PATH; `--require-signature` makes its absence an error instead of a note. There is no unpinned fallback reported as verified, and a release that published neither check is reported as unverified rather than quietly installed.
+:::
+
+`tgt update` needs `sh` and `tar`, and `cosign` only for `--require-signature`.

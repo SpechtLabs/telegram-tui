@@ -2549,7 +2549,72 @@ must work in dev, and the packaged binary must run after `mv dist /tmp/else`.
   `tokio::time::timeout(Duration::from_secs(2), ...)` — quitting is never
   hostage to a retrying exporter.
 
-### 9.4 Test topology (spec §15)
+### 9.4 Distribution and self-update
+
+One on-disk layout, produced by every install route: a **private** tree with
+the binary symlinked onto `PATH`.
+
+```
+$XDG_DATA_HOME/tgt/{bin,lib}   the tree (curl installer, `mise run install`)
+$HOME/.local/bin/tgt           a symlink into it
+<Cellar>/tgt/<v>/libexec/…     the same shape under Homebrew
+```
+
+`bin/tgt` reaches libtdjson through a runpath relative to itself (§9.2), so
+the two must stay siblings. Keeping them in a directory that is *exclusively
+ours* is what makes `tgt update` possible at all: the tree is replaced by a
+single `rename`, which moves the pair or neither. A shared prefix — the old
+`$TGT_PREFIX/{bin,lib}` layout, `~/.local` — cannot be updated atomically,
+because there is no multi-rename and a half-replaced pair fails at dyld load,
+which is unrecoverable from inside a client that no longer starts.
+
+**The swap has exactly one implementation**, `swap_tree` in
+`scripts/install.sh`: guard the root, stage, rename, probe the new binary
+with `--version` while the old tree still exists, roll back if it cannot
+start, symlink. The curl path calls it after downloading; `crates/app/src/update.rs`
+calls it through `--swap-from` after downloading, verifying and extracting.
+Two implementations would drift, and the drift would only surface when a
+rollback was needed. Sharing it means every `curl | sh` install exercises the
+path the updater depends on.
+
+The boundary is verify-versus-swap, not Rust-versus-shell, and that is what
+makes `--require-signature` possible: handing the whole job to the script
+would mean verifying a signature on bytes the script then discards and
+re-downloads.
+
+**Runtime dependencies:** `tgt update` needs `sh` and `tar` on `PATH`, and
+optionally `cosign`. Both of the first two are universal on macOS and Linux
+and no Windows artifact is published, so there is no platform gap — but they
+are real dependencies rather than an implementation detail.
+
+**Replacing a tree requires positive evidence it is ours** — the
+`.tgt-install` marker `package.sh` writes (version *and* target triple), or
+`bin/tgt` beside `lib/` in a directory named `tgt` for installs predating it.
+Anything else refuses. The test is for evidence rather than for the absence of
+counter-evidence, because the procedure renames and eventually deletes what it
+finds: a fresh `~/.local` holds only `bin` and `lib` too, so shape alone would
+have renamed the home directory of exactly the users least able to notice.
+
+**Verification says what it checked and never more.** A SHA-256 match against
+`SHA256SUMS` proves the download was not corrupted; it proves nothing about
+tampering, since the sums file arrives from the same host over the same TLS
+session. Only the cosign signature says something TLS does not, and only with
+both `--certificate-identity` and `--certificate-oidc-issuer` pinned — given
+just `--bundle`, cosign confirms *somebody* signed the blob rather than who.
+`cosign` is used when present and required by `--require-signature`; there is
+deliberately no unpinned fallback reported as "verified". A release with
+neither (v0.1.4 published no `SHA256SUMS`) is reported as unverified rather
+than silently accepted.
+
+The pinned identity ends in `@refs/heads/main`, **not** the tag: the release
+job checks out the tag, but OIDC asserts the ref the run was *triggered* on,
+and release-please triggers it by pushing to main. Deriving it from the tag
+looks obviously right and is rejected by every real release. The identity is
+this repository's release workflow path, so renaming that file breaks
+verification for every client built before the rename — both ends carry a
+warning (`SIGNING_IDENTITY` in `update.rs`, a header note in `release.yaml`).
+
+### 9.5 Test topology (spec §15)
 
 | Layer | Where | Backend |
 |---|---|---|
