@@ -33,7 +33,7 @@ Open Telegram on your phone, go to Settings → Devices → Link Desktop Device,
 
 Underneath the QR, <kbd>↑</kbd>/<kbd>↓</kbd> highlights "Sign in with phone number instead," and <kbd>Enter</kbd> swaps it in for a phone number field. Type the number in international form (leading `+`, country code, no spaces) and press <kbd>Enter</kbd>; Telegram sends a login code, usually to your existing Telegram apps rather than by SMS. Type it, <kbd>Enter</kbd> again.
 
-Switching to phone is instant while the code is still loading. Once it's actually on screen, though, submitting a phone number restarts sign-in behind the scenes — Telegram won't let a client hold a QR login open and swap credentials mid-flight — so there's a short pause before the phone field comes back, and you press <kbd>Enter</kbd> again once it does to actually send the number.
+Switching to phone works cleanly while the code is still loading. Once it's actually on screen, though, you can't switch in this version — submitting a phone number at that point leaves sign-in stuck with no way forward. If you've got that far and want phone instead, quit with <kbd>ctrl</kbd>+<kbd>c</kbd> and start `tgt` again before the QR code has time to render.
 
 Editing keys in these fields are the ones you'd guess: <kbd>←</kbd>/<kbd>→</kbd> for the caret, <kbd>Home</kbd>/<kbd>End</kbd>, <kbd>Backspace</kbd>, <kbd>Delete</kbd>. Everything else is ignored, including <kbd>Esc</kbd> (there's no way back a screen from auth, only <kbd>ctrl</kbd>+<kbd>c</kbd> to quit).
 
