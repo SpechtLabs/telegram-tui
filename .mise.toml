@@ -13,6 +13,17 @@ rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
 pinact = "4.1.0"
 
+[env]
+# Sentry crash reporting is compiled in from this variable (`option_env!`), so a
+# build without it is inert. Committed rather than kept in a secret because a
+# DSN is a public client key: it permits submitting events and nothing else, no
+# read access, and it is meant to ship inside client binaries. Keeping it here
+# means a contributor's build reports too — and `environment` is split on
+# `debug_assertions`, so their debug runs land somewhere other than the
+# production issue stream. CI passes the same value from a repository secret,
+# which simply overrides this.
+TGT_SENTRY_DSN = "https://af72d07f6ba84fa2d7e3a932f2246fa5@o4510777486016512.ingest.de.sentry.io/4511831345463376"
+
 # Documentation website (docs/): VuePress builds under bun, and the same
 # markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
 # and `mise run docs-build` locally are exactly what CI does.
