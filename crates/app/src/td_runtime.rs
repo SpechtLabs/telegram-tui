@@ -30,7 +30,7 @@
 //! `#[allow]` over every item.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,7 +79,15 @@ pub struct TdlibRuntime {
     /// Handed out by `updates()`; `None` after the first call, which is what
     /// makes the second call panic as the trait documents.
     updates_rx: Mutex<Option<mpsc::Receiver<TdUpdate>>>,
+    /// A clone of the sender half the receive thread also holds. `execute()`
+    /// has no other way to reach the updates channel, and it needs one to
+    /// seed `MediaState` from a message it just mapped (history pages, send
+    /// results, edits) — see [`Self::seed_file`].
+    updates_tx: mpsc::Sender<TdUpdate>,
     names: Arc<NameCache>,
+    /// File ids already reported to `MediaState` this session, shared with
+    /// the receive thread. See [`SeededFiles`].
+    seeded_files: Arc<SeededFiles>,
     receiving: Arc<AtomicBool>,
 }
 
@@ -101,12 +109,14 @@ impl TdlibRuntime {
         let client_id = tdlib_rs::create_client();
         let (updates_tx, updates_rx) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
         let names = Arc::new(NameCache::default());
+        let seeded_files = Arc::new(SeededFiles::default());
         let receiving = Arc::new(AtomicBool::new(true));
 
         spawn_receive_thread(
             client_id,
-            updates_tx,
+            updates_tx.clone(),
             Arc::clone(&names),
+            Arc::clone(&seeded_files),
             Arc::clone(&receiving),
         );
 
@@ -116,7 +126,9 @@ impl TdlibRuntime {
         TdlibRuntime {
             client_id,
             updates_rx: Mutex::new(Some(updates_rx)),
+            updates_tx,
             names,
+            seeded_files,
             receiving,
         }
     }
@@ -342,6 +354,9 @@ impl TdlibRuntime {
                 )
                 .await
                 .map_err(map_td_error)?;
+                // As authoritative as a live `updateFile`: never let a later
+                // message payload's copy of this file re-seed over it.
+                self.seeded_files.mark(FileId(file.id));
                 Ok(TdResponse::File(map_file(file)))
             }
             TdRequest::CancelDownloadFile { file_id } => {
@@ -432,8 +447,17 @@ impl TdlibRuntime {
         }
     }
 
+    /// Maps one tdlib message and, if it carries a file, seeds `MediaState`
+    /// with that file's *current* local state — see module docs at
+    /// [`content_file_seed`] for why: `MessageContent` itself keeps only the
+    /// file id, so without this a photo downloaded in a previous session
+    /// shows "download" again until re-fetched.
     fn map_message(&self, message: td_types::Message) -> MessageView {
-        map_message_with(&self.names, message)
+        let (view, seed) = map_message_with(&self.names, message);
+        if let Some(seed) = seed {
+            self.seed_file(seed);
+        }
+        view
     }
 
     fn map_messages(&self, messages: Vec<Option<td_types::Message>>) -> Vec<MessageView> {
@@ -442,6 +466,13 @@ impl TdlibRuntime {
             .flatten()
             .map(|m| self.map_message(m))
             .collect()
+    }
+
+    /// Forwards a synthetic `TdUpdate::File` derived from a message payload,
+    /// once per file id per runtime lifetime and without blocking the
+    /// caller. See [`seed_and_forward`].
+    fn seed_file(&self, seed: FileSnapshot) {
+        seed_and_forward(&self.updates_tx, &self.seeded_files, seed);
     }
 }
 
@@ -480,6 +511,7 @@ fn spawn_receive_thread(
     client_id: i32,
     updates_tx: mpsc::Sender<TdUpdate>,
     names: Arc<NameCache>,
+    seeded_files: Arc<SeededFiles>,
     receiving: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
@@ -494,10 +526,28 @@ fn spawn_receive_thread(
                 if update_client_id != client_id {
                     continue;
                 }
-                let Some(update) = map_update(&names, update) else {
+                // Peeked before `map_update` can consume `update`: a
+                // message-bearing update's seed comes from the exact same
+                // payload the mapped `TdUpdate` is built from.
+                let pending_seed = update_file_seed(&update);
+                let Some(mapped) = map_update(&names, update) else {
                     continue;
                 };
-                if updates_tx.blocking_send(update).is_err() {
+                if let TdUpdate::File(seen) = &mapped {
+                    // A live `updateFile` is authoritative. Record it so a
+                    // message payload carrying a (possibly stale) copy of
+                    // the same file — arriving later here, or via the async
+                    // `execute()` request/response path — never re-seeds
+                    // over it; `MediaState::upsert_file` is a plain last-
+                    // write-wins insert, so this ordering guard is the only
+                    // thing standing between a fresh download and a stale
+                    // one clobbering it.
+                    seeded_files.mark(seen.id);
+                }
+                if let Some(seed) = pending_seed {
+                    seed_and_forward(&updates_tx, &seeded_files, seed);
+                }
+                if updates_tx.blocking_send(mapped).is_err() {
                     // The run loop dropped the receiver: nobody is listening.
                     break;
                 }
@@ -593,6 +643,57 @@ impl NameCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File seed tracking
+// ---------------------------------------------------------------------------
+
+/// File ids the runtime has already told `MediaState` about this session,
+/// via either a live `updateFile` push or a synthetic seed derived from a
+/// message payload (see [`content_file_seed`]). Shared between the receive
+/// thread and `execute()`'s request/response path so both funnel through the
+/// same once-per-id gate.
+///
+/// `MediaState::upsert_file` (`state/media.rs`) is a plain insert — last
+/// write wins, no notion of "more informed" — so this is the only thing
+/// standing between a live `updateFile` and a later, possibly-stale, message
+/// payload clobbering it. A message's embedded file object can only ever be
+/// as fresh as the moment TDLib built that message, never fresher than a
+/// push that has already gone out; once a file id is marked, no message
+/// payload gets to seed it again.
+#[derive(Default)]
+struct SeededFiles {
+    inner: Mutex<HashSet<FileId>>,
+}
+
+impl SeededFiles {
+    /// Marks `id` as known. Returns whether this is the first time — i.e.
+    /// whether the caller should actually forward the seed it has in hand.
+    fn mark(&self, id: FileId) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id)
+    }
+}
+
+/// Pushes a synthetic `TdUpdate::File`, gated by [`SeededFiles`] so the same
+/// id is never forwarded twice (this is also what makes a 50-message page
+/// referencing one file push exactly one seed, not fifty).
+///
+/// Uses `try_send`, never `blocking_send`: a seed is a nice-to-have — the
+/// message still renders, just with a "download" affordance for one extra
+/// frame — so it must never stall the receive thread or an `execute()`
+/// request/response task waiting on a full updates channel. A dropped seed
+/// is tolerated on purpose; the next live `updateFile` corrects it.
+fn seed_and_forward(tx: &mpsc::Sender<TdUpdate>, seeded: &SeededFiles, seed: FileSnapshot) {
+    if !seeded.mark(seed.id) {
+        return;
+    }
+    if tx.try_send(TdUpdate::File(seed)).is_err() {
+        tracing::trace!("dropped a file seed: updates channel is full or closed");
+    }
+}
+
 fn user_display_name(user: &td_types::User) -> String {
     let full = format!("{} {}", user.first_name, user.last_name);
     let full = full.trim();
@@ -609,6 +710,21 @@ fn user_display_name(user: &td_types::User) -> String {
 // ---------------------------------------------------------------------------
 // Update mapping
 // ---------------------------------------------------------------------------
+
+/// The file, if any, that a raw update's message payload would seed into
+/// `MediaState` — computed on a reference so the caller can peek it before
+/// `map_update` consumes `update` to build the primary `TdUpdate`. Only the
+/// three update kinds that carry a full message (as opposed to just an id or
+/// a delta) have one; `updateFile` itself is already the authoritative
+/// source and does not need seeding from itself.
+fn update_file_seed(update: &td_enums::Update) -> Option<FileSnapshot> {
+    match update {
+        td_enums::Update::NewMessage(u) => content_file_seed(&u.message.content),
+        td_enums::Update::MessageSendSucceeded(u) => content_file_seed(&u.message.content),
+        td_enums::Update::MessageContent(u) => content_file_seed(&u.new_content),
+        _ => None,
+    }
+}
 
 /// Raw TDLib update → the pre-digested projection core consumes. `None` means
 /// "irrelevant to this client": dropped here so that neither the action
@@ -671,12 +787,12 @@ fn map_update(names: &NameCache, update: td_enums::Update) -> Option<TdUpdate> {
         }),
 
         td_enums::Update::NewMessage(u) => {
-            Some(TdUpdate::NewMessage(map_message_with(names, u.message)))
+            Some(TdUpdate::NewMessage(map_message_with(names, u.message).0))
         }
         td_enums::Update::MessageSendSucceeded(u) => Some(TdUpdate::MessageSendSucceeded {
             chat_id: ChatId(u.message.chat_id),
             old_message_id: MessageId(u.old_message_id),
-            message: map_message_with(names, u.message),
+            message: map_message_with(names, u.message).0,
         }),
         td_enums::Update::MessageSendFailed(u) => Some(TdUpdate::MessageSendFailed {
             chat_id: ChatId(u.message.chat_id),
@@ -886,7 +1002,15 @@ fn is_muted(settings: &td_types::ChatNotificationSettings) -> bool {
 // Message mapping
 // ---------------------------------------------------------------------------
 
-fn map_message_with(names: &NameCache, message: td_types::Message) -> MessageView {
+/// Maps a tdlib message, and alongside it the seed snapshot for whatever
+/// file its content carries (`None` for fileless content). The seed is
+/// derived from `message.content` *before* `map_content` consumes it, since
+/// `MessageContent` itself only keeps the file id — see
+/// [`content_file_seed`] for why that seed matters.
+fn map_message_with(
+    names: &NameCache,
+    message: td_types::Message,
+) -> (MessageView, Option<FileSnapshot>) {
     let sender = map_sender(&message.sender_id);
     // Channel posts and anonymous admins sign with a free-text signature that
     // is more informative than the chat title.
@@ -895,8 +1019,9 @@ fn map_message_with(names: &NameCache, message: td_types::Message) -> MessageVie
     } else {
         message.author_signature.clone()
     };
+    let file_seed = content_file_seed(&message.content);
 
-    MessageView {
+    let view = MessageView {
         id: MessageId(message.id),
         chat_id: ChatId(message.chat_id),
         sender,
@@ -913,7 +1038,8 @@ fn map_message_with(names: &NameCache, message: td_types::Message) -> MessageVie
         caps: map_caps(&message),
         is_edited: message.edit_date != 0,
         content: map_content(message.content),
-    }
+    };
+    (view, file_seed)
 }
 
 fn map_sender(sender: &td_enums::MessageSender) -> Sender {
@@ -1053,31 +1179,68 @@ fn map_message_preview(names: &NameCache, message: &td_types::Message) -> Messag
 // Content mapping
 // ---------------------------------------------------------------------------
 
+/// TDLib ships every photo size variant; the largest is the one worth
+/// downloading for a terminal image protocol, and therefore the one whose
+/// file id `map_content` surfaces as `MessageContent::Photo`'s `file_id`.
+/// Shared with [`content_file`] so both agree on exactly the same size.
+fn largest_photo_size(photo: &td_types::Photo) -> Option<&td_types::PhotoSize> {
+    photo
+        .sizes
+        .iter()
+        .max_by_key(|s| i64::from(s.width) * i64::from(s.height))
+}
+
+/// The raw tdlib `File` backing a message's content — specifically, the same
+/// file whose id ends up in the `MessageContent` `map_content` builds from
+/// the same value. `None` for content with no file (text, sticker,
+/// unsupported, ...). Kept in lock-step with `map_content`'s arms on
+/// purpose: this is what lets a caller learn a file's *current* local state
+/// (`local.path`, `is_downloading_completed`) even though `MessageContent`
+/// itself keeps only the id.
+fn content_file(content: &td_enums::MessageContent) -> Option<td_types::File> {
+    match content {
+        td_enums::MessageContent::MessagePhoto(c) => {
+            largest_photo_size(&c.photo).map(|size| size.photo.clone())
+        }
+        td_enums::MessageContent::MessageVideo(c) => Some(c.video.video.clone()),
+        td_enums::MessageContent::MessageAnimation(c) => Some(c.animation.animation.clone()),
+        td_enums::MessageContent::MessageVideoNote(c) => Some(c.video_note.video.clone()),
+        td_enums::MessageContent::MessageAudio(c) => Some(c.audio.audio.clone()),
+        td_enums::MessageContent::MessageVoiceNote(c) => Some(c.voice_note.voice.clone()),
+        td_enums::MessageContent::MessageDocument(c) => Some(c.document.document.clone()),
+        _ => None,
+    }
+}
+
+/// The bug this exists to fix: `use_file_database = true` means a file
+/// downloaded in a previous session is still on disk, and TDLib still says
+/// so (`local.path`, `local.is_downloading_completed`) on every message
+/// payload that references it — but `map_content` only keeps the file id, so
+/// without this, `MediaState` starts every session knowing nothing about it
+/// and the message shows "download" until re-fetched. Applying [`map_file`]
+/// to [`content_file`]'s result turns that payload's file object into the
+/// same `FileSnapshot` a live `updateFile` push would carry, so callers can
+/// seed `MediaState` with it directly.
+fn content_file_seed(content: &td_enums::MessageContent) -> Option<FileSnapshot> {
+    content_file(content).map(map_file)
+}
+
 fn map_content(content: td_enums::MessageContent) -> MessageContent {
     match content {
         td_enums::MessageContent::MessageText(c) => {
             MessageContent::Text(map_formatted_text(c.text))
         }
-        td_enums::MessageContent::MessagePhoto(c) => {
-            // TDLib ships every size variant; the largest is the one worth
-            // downloading for a terminal image protocol.
-            let largest = c
-                .photo
-                .sizes
-                .iter()
-                .max_by_key(|s| i64::from(s.width) * i64::from(s.height));
-            match largest {
-                Some(size) => MessageContent::Photo {
-                    file_id: FileId(size.photo.id),
-                    width: non_negative(size.width),
-                    height: non_negative(size.height),
-                    caption: map_formatted_text(c.caption),
-                },
-                None => MessageContent::Unsupported {
-                    description: "Photo".to_string(),
-                },
-            }
-        }
+        td_enums::MessageContent::MessagePhoto(c) => match largest_photo_size(&c.photo) {
+            Some(size) => MessageContent::Photo {
+                file_id: FileId(size.photo.id),
+                width: non_negative(size.width),
+                height: non_negative(size.height),
+                caption: map_formatted_text(c.caption),
+            },
+            None => MessageContent::Unsupported {
+                description: "Photo".to_string(),
+            },
+        },
         td_enums::MessageContent::MessageVideo(c) => MessageContent::Video {
             file_id: FileId(c.video.video.id),
             file_name: c.video.file_name,
@@ -1929,6 +2092,146 @@ mod tests {
                 local_path: Some(PathBuf::from("/tmp/x.jpg")),
             }
         );
+    }
+
+    /// A minimal `td_types::File` in a given download state, for the seeding
+    /// tests below. `id` and `path` are the only bits those tests care about.
+    fn sample_td_file(id: i32, completed: bool, path: &str) -> td_types::File {
+        td_types::File {
+            id,
+            size: 2048,
+            expected_size: 2048,
+            local: td_types::LocalFile {
+                path: if completed {
+                    path.to_string()
+                } else {
+                    String::new()
+                },
+                can_be_downloaded: true,
+                can_be_deleted: completed,
+                is_downloading_active: !completed,
+                is_downloading_completed: completed,
+                download_offset: 0,
+                downloaded_prefix_size: 0,
+                downloaded_size: if completed { 2048 } else { 0 },
+            },
+            remote: td_types::RemoteFile {
+                id: String::new(),
+                unique_id: String::new(),
+                is_uploading_active: false,
+                is_uploading_completed: true,
+                uploaded_size: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_completed_photo_seeds_its_local_path() {
+        let content = td_enums::MessageContent::MessagePhoto(td_types::MessagePhoto {
+            photo: td_types::Photo {
+                sizes: vec![td_types::PhotoSize {
+                    photo: sample_td_file(9, true, "/tmp/x.jpg"),
+                    width: 800,
+                    height: 600,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let seed = content_file_seed(&content).expect("photo carries a file");
+        assert_eq!(seed.id, FileId(9));
+        assert!(seed.is_completed);
+        assert_eq!(seed.local_path, Some(PathBuf::from("/tmp/x.jpg")));
+    }
+
+    #[test]
+    fn an_undownloaded_photo_seeds_no_path() {
+        let content = td_enums::MessageContent::MessagePhoto(td_types::MessagePhoto {
+            photo: td_types::Photo {
+                sizes: vec![td_types::PhotoSize {
+                    photo: sample_td_file(9, false, "/tmp/x.jpg"),
+                    width: 800,
+                    height: 600,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let seed = content_file_seed(&content).expect("photo carries a file");
+        assert!(!seed.is_completed);
+        assert_eq!(seed.local_path, None);
+    }
+
+    #[test]
+    fn a_completed_document_also_seeds_a_path() {
+        // Not just photos: an already-downloaded PDF should say "open", not
+        // "download", after a restart too.
+        let content = td_enums::MessageContent::MessageDocument(td_types::MessageDocument {
+            document: td_types::Document {
+                file_name: "report.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                minithumbnail: None,
+                thumbnail: None,
+                document: sample_td_file(42, true, "/tmp/report.pdf"),
+            },
+            caption: td_types::FormattedText::default(),
+        });
+
+        let seed = content_file_seed(&content).expect("document carries a file");
+        assert_eq!(seed.id, FileId(42));
+        assert!(seed.is_completed);
+        assert_eq!(seed.local_path, Some(PathBuf::from("/tmp/report.pdf")));
+    }
+
+    #[test]
+    fn fileless_content_seeds_nothing() {
+        let content = td_enums::MessageContent::MessageText(td_types::MessageText {
+            text: td_types::FormattedText::default(),
+            link_preview: None,
+            link_preview_options: None,
+        });
+        assert!(content_file_seed(&content).is_none());
+    }
+
+    #[test]
+    fn seeding_the_same_file_twice_forwards_once() {
+        // Exercises the exact path `map_messages` funnels every message in a
+        // page through: a 50-message page referencing one file must not push
+        // 50 identical `TdUpdate::File`s.
+        let (tx, mut rx) = mpsc::channel(8);
+        let seeded = SeededFiles::default();
+        let snapshot = map_file(sample_td_file(9, true, "/tmp/x.jpg"));
+
+        seed_and_forward(&tx, &seeded, snapshot.clone());
+        seed_and_forward(&tx, &seeded, snapshot.clone());
+        drop(tx);
+
+        let mut received = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            received.push(update);
+        }
+        assert_eq!(received.len(), 1);
+        assert!(matches!(&received[0], TdUpdate::File(f) if f.id == FileId(9)));
+    }
+
+    #[test]
+    fn a_file_already_marked_live_is_never_reseeded() {
+        // Simulates a live `updateFile` having already been forwarded for a
+        // file id: a later message payload's (possibly stale) copy of the
+        // same file must not clobber it.
+        let (tx, mut rx) = mpsc::channel(8);
+        let seeded = SeededFiles::default();
+        seeded.mark(FileId(9));
+
+        let stale = map_file(sample_td_file(9, false, "/tmp/x.jpg"));
+        seed_and_forward(&tx, &seeded, stale);
+        drop(tx);
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
