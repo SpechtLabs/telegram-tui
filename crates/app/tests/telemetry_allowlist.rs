@@ -710,6 +710,7 @@ fn boot(consent_needed: bool) -> Boot {
         bindings: KeyBindings::default(),
         layout_breakpoint_cols: 100,
         telemetry_mode: TelemetryMode::On,
+        crash_reports_available: false,
         // Non-zero, so a `chat.hash` that accidentally shipped the raw id
         // could not be mistaken for a hash of it.
         telemetry_salt: [0x5au8; 32],

@@ -26,6 +26,16 @@
 //! `Enable` stays preselected because reporting is on unless the user opts
 //! out. Showing the screen anyway is the point: a default that reports is
 //! only defensible if it is disclosed before the first send.
+//!
+//! # Builds that cannot report
+//!
+//! The Sentry DSN arrives at build time, so every build made from source has
+//! none and can send no crash report at all. `AppState::crash_reports_available`
+//! carries that fact here and two lines of copy change with it. The screen is
+//! still shown, because the user's answer is still recorded and still governs
+//! the OTLP path — but it says the reports go nowhere rather than offering to
+//! turn on an endpoint that does not exist. Overclaiming in that direction is
+//! the same failure as underclaiming what a report contains.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -86,11 +96,23 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     ])
     .areas(inner);
 
+    // A build with no crash-reporting endpoint compiled in cannot send a
+    // report however this screen is answered, and saying otherwise would be
+    // the mirror image of the dishonesty the rest of this copy avoids: an
+    // overclaim in the direction of "we collect more than we do". Every
+    // build made from source lands here, so it is the common case, not an
+    // edge one.
     f.render_widget(
-        Paragraph::new(
+        Paragraph::new(if state.crash_reports_available {
             "telegram-tui sends anonymous crash reports so bugs get fixed without \
-             you having to file them. This is on unless you turn it off.",
-        )
+             you having to file them. This is on unless you turn it off."
+        } else {
+            // Two lines at this panel width, like the branch above:
+            // `intro_area` is two rows and a third would be cut off, taking
+            // the "sends none" with it and inverting the meaning.
+            "telegram-tui can send anonymous crash reports, but this build has no \
+             reporting endpoint compiled in, so it sends none."
+        })
         .wrap(Wrap { trim: true })
         .style(Style::new().fg(theme.text)),
         intro_area,
@@ -131,10 +153,13 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     );
 
     f.render_widget(
-        Paragraph::new(
+        Paragraph::new(if state.crash_reports_available {
             "Sent to: the telegram-tui project's crash reporting. Usage data goes \
-             nowhere else unless you configure your own collector.",
-        )
+             nowhere else unless you configure your own collector."
+        } else {
+            "Sent to: nowhere. Usage data goes nowhere either, unless you configure \
+             your own collector."
+        })
         .wrap(Wrap { trim: true })
         .style(Style::new().fg(theme.text_muted)),
         destination_area,
@@ -241,7 +266,16 @@ mod tests {
     use super::*;
 
     fn fixture_state(selected: ConsentChoice) -> AppState {
+        state_with(selected, true)
+    }
+
+    /// `available` is `AppState::crash_reports_available`: whether the build
+    /// has a crash-reporting endpoint compiled in. Both answers are rendered
+    /// by the tests below, because the `false` one is what every build from
+    /// source produces and is therefore the copy most people will read.
+    fn state_with(selected: ConsentChoice, available: bool) -> AppState {
         AppState {
+            crash_reports_available: available,
             screen: Screen::Consent,
             focus: FocusStack::new(Focus::ChatList),
             connection: ConnectionPhase::WaitingForNetwork,
@@ -348,6 +382,44 @@ mod tests {
         let state = fixture_state(ConsentChoice::Enable);
         let rendered = render_to_string(120, 34, &state);
         assert!(rendered.contains("▶ Enable"), "buffer:\n{rendered}");
+    }
+
+    /// The DSN arrives at build time, so a build from source can send no
+    /// crash report whatever the user answers. Telling them it will is an
+    /// overclaim in the opposite direction from the one the rest of this
+    /// copy guards against, and just as false.
+    #[test]
+    fn a_build_that_cannot_report_does_not_claim_it_will() {
+        let state = state_with(ConsentChoice::Enable, false);
+        let rendered = render_to_string(120, 34, &state);
+
+        // Fragments that survive the wrap: the paragraph breaks after "no",
+        // so anything spanning that break would fail for the wrong reason.
+        assert!(
+            rendered.contains("reporting endpoint compiled in, so it sends none."),
+            "the screen must say the build cannot report:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Sent to: nowhere"),
+            "and must not name a destination it has none of:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("on unless you turn it off"),
+            "nothing is on, so that sentence would be false here:\n{rendered}"
+        );
+
+        // The screen is still shown and still answerable: the choice governs
+        // the OTLP path too, and the acknowledgement still has to be
+        // recorded so a later build with a DSN does not re-prompt.
+        assert!(rendered.contains("▶ Enable"), "buffer:\n{rendered}");
+        assert!(rendered.contains("Disable"), "buffer:\n{rendered}");
+        assert!(rendered.contains("Never collected"), "buffer:\n{rendered}");
+    }
+
+    #[test]
+    fn consent_screen_without_a_dsn_100x30() {
+        let state = state_with(ConsentChoice::Enable, false);
+        insta::assert_snapshot!(render_to_string(100, 30, &state));
     }
 
     #[test]

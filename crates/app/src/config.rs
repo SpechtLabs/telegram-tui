@@ -173,7 +173,6 @@ impl Config {
     pub fn apply_patch(&mut self, patch: &ConfigPatch) {
         match patch {
             ConfigPatch::Theme(name) => self.theme = name.clone(),
-            ConfigPatch::TelemetryMode(mode) => self.telemetry_mode = *mode,
             ConfigPatch::Credentials { api_id, api_hash } => {
                 self.api_id = Some(*api_id);
                 self.api_hash = Some(api_hash.clone());
@@ -1182,7 +1181,6 @@ mod tests {
             api_hash: "s3cr3t".to_string(),
         });
         cfg.apply_patch(&ConfigPatch::ConsentAcknowledged { enabled: true });
-        cfg.apply_patch(&ConfigPatch::TelemetryMode(TelemetryMode::Off));
         cfg.save().expect("save should succeed");
 
         let reloaded = load().expect("reload should succeed");
@@ -1190,7 +1188,7 @@ mod tests {
         assert_eq!(reloaded.api_id, Some(42));
         assert_eq!(reloaded.api_hash.as_deref(), Some("s3cr3t"));
         assert!(reloaded.consent_acknowledged);
-        assert_eq!(reloaded.telemetry_mode, TelemetryMode::Off);
+        assert_eq!(reloaded.telemetry_mode, TelemetryMode::On);
 
         clear_related_env();
     }

@@ -619,16 +619,23 @@ pub enum Effect {
 }
 
 /// The only config mutations `update()` may request.
+///
+/// No `TelemetryMode` variant, deliberately (T73). `ConsentAcknowledged`
+/// carries the choice *and* the acknowledgement in one patch, so a Disable
+/// persists instead of recording as "never answered" and re-prompting for
+/// ever — which is what the earlier split produced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigPatch {
     Theme(String),
-    TelemetryMode(TelemetryMode),
     Credentials { api_id: i32, api_hash: String },
     ConsentAcknowledged { enabled: bool },
 }
 
+/// A master switch, not a destination: which egresses a session has is
+/// decided in `tgt-app` from `[telemetry]` and from what was baked in at
+/// build time (T73).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelemetryMode { Vendor, Custom, Off }
+pub enum TelemetryMode { On, Off }
 ```
 
 ### 4.5 Focus — `core/src/state/focus.rs`

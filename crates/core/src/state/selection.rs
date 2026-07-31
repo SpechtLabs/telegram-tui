@@ -667,6 +667,7 @@ mod tests {
             theme_generation: 0,
             bindings: crate::model::key::KeyBindings::default(),
             telemetry_mode: TelemetryMode::Off,
+            crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
         }

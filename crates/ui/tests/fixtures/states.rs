@@ -83,6 +83,10 @@ pub fn base_main_state() -> AppState {
         theme_generation: 0,
         bindings: KeyBindings::default(),
         telemetry_mode: TelemetryMode::Off,
+        // A build with a crash-reporting endpoint compiled in, which is what
+        // a release is. The other branch of that copy — every build from
+        // source — has its own snapshot in `view/consent.rs`.
+        crash_reports_available: true,
         telemetry_salt: [0u8; 32],
         now: NOW,
     }

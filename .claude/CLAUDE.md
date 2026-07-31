@@ -104,7 +104,9 @@ Full-app integration tests in `crates/app/tests/` drive the *real* `runtime_loop
 
 **Crash reports (on unless opted out) have no allowlist and that test does not cover them.** A report is built from the failure's own stack trace and message, so the message can carry limited content such as a file path. `send_default_pii: false` plus a `before_send` that nulls `server_name` keep IP, username and hostname off; breadcrumbs come from `crash::record_action` and are allowlist-shaped; `install.id` is deliberately not attached. When writing docs or comments here, scope every absolute claim to the path where it's true, and mark "in practice" claims as such — spec §13.9 and `docs/understanding/telemetry-allowlist.md`'s "What the proof doesn't cover" are the reference wording.
 
-`[telemetry].enabled = false`, `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK` and a consent-screen Disable all switch off **both**, via `TelemetryMode::Off`.
+`[telemetry].enabled = false`, `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK` and a consent-screen Disable all switch off **both**, via `TelemetryMode::Off`. `ConfigPatch::ConsentAcknowledged` carries the choice and the acknowledgement together — don't split it back into two patches, and don't add a `ConfigPatch::TelemetryMode`: the split is what let a Disable record as "never answered" and re-prompt for ever.
+
+The Sentry DSN comes from `option_env!("TGT_SENTRY_DSN")`, which only the release workflow sets, so **your build reports nothing** and the consent screen's copy branches on `AppState::crash_reports_available` to say so. Both branches are snapshotted; if you change that copy, check the one you aren't looking at.
 
 The same discipline covers terminal alerts: `notify::alert` takes no content parameters at all, so no sender name or message text can ride an `OSC 777` into a multiplexer log.
 

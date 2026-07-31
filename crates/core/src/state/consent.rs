@@ -96,6 +96,7 @@ mod tests {
             bindings: KeyBindings::default(),
             layout_breakpoint_cols: 100,
             telemetry_mode: TelemetryMode::On,
+            crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             consent_needed: true,
             has_credentials: false,

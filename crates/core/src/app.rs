@@ -64,6 +64,9 @@ pub struct AppState {
     pub theme_generation: u64,
     pub bindings: KeyBindings,
     pub telemetry_mode: TelemetryMode,
+    /// Whether this build has a crash-reporting endpoint compiled in. Read
+    /// only by the consent screen's copy; see [`Boot::crash_reports_available`].
+    pub crash_reports_available: bool,
     /// HMAC salt for hashed-id telemetry attributes. Generated in tgt-app.
     pub telemetry_salt: [u8; 32],
     /// Last observed tick time; the only "clock" update logic may consult.
@@ -78,6 +81,12 @@ pub struct Boot {
     pub layout_breakpoint_cols: u16,
     pub telemetry_mode: TelemetryMode,
     pub telemetry_salt: [u8; 32],
+    /// Whether this *build* can send crash reports at all — `tgt-app` reads
+    /// it from `crash::build_has_dsn()`, which is false in every build made
+    /// from source. Consent copy is the only consumer: a screen that offers
+    /// to enable something the binary has no endpoint for would be making a
+    /// promise it cannot keep, in either direction.
+    pub crash_reports_available: bool,
     pub consent_needed: bool,
     pub has_credentials: bool,
     pub width: u16,
@@ -145,6 +154,7 @@ impl App {
             theme_generation: 0,
             bindings: boot.bindings,
             telemetry_mode: boot.telemetry_mode,
+            crash_reports_available: boot.crash_reports_available,
             telemetry_salt: boot.telemetry_salt,
             now: Millis::default(),
         };
@@ -1379,6 +1389,7 @@ mod tests {
             bindings: KeyBindings::default(),
             layout_breakpoint_cols: 100,
             telemetry_mode: TelemetryMode::Off,
+            crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             consent_needed: false,
             has_credentials: false,

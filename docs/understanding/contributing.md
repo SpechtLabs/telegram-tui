@@ -20,6 +20,18 @@ The last one is worth explaining. It greps `cargo tree` and fails if `tgt-core` 
 
 Toolchain comes from mise: Rust 1.97.1 and cargo-insta 1.48.0, both pinned exactly. `rust-toolchain.toml` pins the compiler independently so plain `cargo` picks the right one outside a mise shell. Editing `.mise.toml` needs a `mise trust` before the tasks run again.
 
+## Your build sends no crash reports
+
+The Sentry DSN is read with `option_env!("TGT_SENTRY_DSN")` at compile time, and only the release workflow sets it. So anything you build — `cargo build`, `mise run install`, a fork's CI — never calls `sentry::init` at all: no panic hook, no uploader, no network attempt. Forks don't report into this project's Sentry, which is the point, and the first-run consent screen says so instead of offering to enable something the binary can't do.
+
+The catch is that it applies to maintainers too. If you daily-drive a binary you built yourself and want its crashes to reach the project, export the DSN before building:
+
+```shell
+TGT_SENTRY_DSN="https://…@….ingest.de.sentry.io/…" mise run install
+```
+
+Leave it unset and the inert path is what you're testing, which is worth doing deliberately once in a while since it's what nearly every user of a source build gets.
+
 ## Snapshots
 
 Rendering is pinned by [insta](https://insta.rs) snapshots in three places: `crates/ui/src/render/snapshots/`, `crates/ui/src/view/snapshots/`, and `crates/ui/tests/snapshots/` for full-frame regressions.

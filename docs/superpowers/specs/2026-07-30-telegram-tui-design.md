@@ -616,7 +616,12 @@ uncorrelatable across installs, and irreversible.
 `install.id` is a pseudonymous identifier, so it is disclosed rather than buried.
 
 Crash reporting is on unless the user turns it off, so the disclosure has to come
-before the first send rather than after. A dedicated first-run screen, shown
+before the first send rather than after. Both answers are recorded, not just
+`Enable`: `ConfigPatch::ConsentAcknowledged` carries the choice *and* the
+acknowledgement in one patch, so a Disable persists as `enabled = false` and the
+screen does not come back. There is deliberately no separate
+`ConfigPatch::TelemetryMode` — two patches would leave a window in which the
+config said "answered" while still holding the previous switch. A dedicated first-run screen, shown
 **before login and before any data is sent**, states in plain language what is
 collected, what is not, where it goes, and that an error message can carry
 limited content, with Enable (preselected) and Disable. Acknowledgement is
@@ -654,7 +659,16 @@ and every CI build is such a build, and `crash.rs` has a test that says so.
 
 A DSN is not a secret — it is a write-only ingest key, and every Sentry client
 ever shipped contains one — but it stays out of the repository and arrives from
-the release workflow's environment.
+the release workflow's environment. Forks therefore never report into this
+project, which is intended; the cost is that a maintainer's own build reports
+nothing either unless they export the variable before building.
+
+Because that is the common case rather than an edge one, the consent screen
+reads it. `Boot.crash_reports_available` carries `crash::build_has_dsn()` into
+`AppState`, and a build with no DSN says the reports go nowhere instead of
+offering to enable an endpoint it does not have. Overclaiming in that direction
+is the same failure as understating what a report carries, and §13.5's screen is
+answerable to both.
 
 There is no build-time OTLP endpoint. The former `TGT_INGEST_ENDPOINT` vendor
 proxy is gone: the project no longer runs an OTLP destination, so that path

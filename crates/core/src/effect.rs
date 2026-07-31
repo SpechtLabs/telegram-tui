@@ -26,12 +26,28 @@ pub enum Effect {
 }
 
 /// The only config mutations `update()` may request.
+///
+/// There is deliberately no `TelemetryMode` variant. The consent screen is
+/// the only thing that changes the telemetry switch, and it does so through
+/// `ConsentAcknowledged`, which carries the choice *and* the acknowledgement
+/// in one patch — two patches would leave a window in which the config on
+/// disk said "answered" while still holding the previous switch. A variant
+/// nothing constructs also reads, to anyone auditing this file, like the
+/// mechanism by which the opt-out persists; it isn't, and one already
+/// concluded from its absence in production that declining was broken.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigPatch {
     Theme(String),
-    TelemetryMode(TelemetryMode),
-    Credentials { api_id: i32, api_hash: String },
-    ConsentAcknowledged { enabled: bool },
+    Credentials {
+        api_id: i32,
+        api_hash: String,
+    },
+    /// The user answered the first-run screen. `enabled` is the answer;
+    /// acknowledgement is unconditional, so a Disable persists instead of
+    /// re-prompting forever.
+    ConsentAcknowledged {
+        enabled: bool,
+    },
 }
 
 /// Whether this session may report anything at all.

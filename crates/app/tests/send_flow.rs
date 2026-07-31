@@ -254,6 +254,7 @@ fn boot() -> Boot {
         bindings: KeyBindings::default(),
         layout_breakpoint_cols: 100,
         telemetry_mode: TelemetryMode::Off,
+        crash_reports_available: false,
         telemetry_salt: [0u8; 32],
         consent_needed: false,
         has_credentials: true,

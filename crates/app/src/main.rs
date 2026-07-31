@@ -424,6 +424,10 @@ fn boot_from(
         // Generated once per install and persisted `0600` next to the
         // install id; never transmitted (spec §13.4).
         telemetry_salt,
+        // False in every build made from source, which is most of them, and
+        // the consent screen says so rather than offering to enable an
+        // endpoint that is not there (spec §13.5, §13.6).
+        crash_reports_available: crash::build_has_dsn(),
         // The first-run screen (spec §13.5): shown whenever the config does
         // not yet record an acknowledged choice. It is the only writer of
         // `consent_acknowledged` (via `ConfigPatch::ConsentAcknowledged`),
@@ -460,6 +464,53 @@ mod tests {
             effective_telemetry_mode(&cli, TelemetryMode::On),
             TelemetryMode::On
         );
+    }
+
+    /// Declining has to stop the screen coming back. `consent_needed` is
+    /// computed here, from `consent_acknowledged` alone, so this is the
+    /// place the re-prompt property actually lives — `config`'s own test
+    /// proves the flag survives a reload, and this proves the flag is what
+    /// the next boot reads.
+    ///
+    /// The bug this pins: `ConsentAcknowledged { enabled }` used to be
+    /// applied as `consent_acknowledged = enabled`, which recorded a Disable
+    /// as "never answered". The screen then reappeared on every launch, for
+    /// ever, and the user's decline was never written down.
+    #[test]
+    fn declining_consent_is_remembered_and_does_not_re_prompt() {
+        let cli = Cli::try_parse_from(["tgt"]).unwrap();
+        let size = ratatui::layout::Size {
+            width: 120,
+            height: 40,
+        };
+
+        let mut config = Config::default();
+        assert!(
+            boot_from(&config, &cli, size, [0u8; 32]).consent_needed,
+            "a fresh install must show the screen"
+        );
+
+        config.apply_patch(&tgt_core::effect::ConfigPatch::ConsentAcknowledged { enabled: false });
+
+        let boot = boot_from(&config, &cli, size, [0u8; 32]);
+        assert!(
+            !boot.consent_needed,
+            "declining must be recorded as an answer, not as silence"
+        );
+        assert_eq!(
+            boot.telemetry_mode,
+            TelemetryMode::Off,
+            "and the answer itself has to be the one that was given"
+        );
+        assert!(!config.crash_reports_enabled());
+        assert!(config.custom_destination().is_none());
+
+        // Accepting is the same shape, with the other answer.
+        let mut accepted = Config::default();
+        accepted.apply_patch(&tgt_core::effect::ConfigPatch::ConsentAcknowledged { enabled: true });
+        let boot = boot_from(&accepted, &cli, size, [0u8; 32]);
+        assert!(!boot.consent_needed);
+        assert_eq!(boot.telemetry_mode, TelemetryMode::On);
     }
 
     /// `--no-telemetry` has to reach *both* egresses, and it reaches them

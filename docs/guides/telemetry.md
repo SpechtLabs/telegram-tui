@@ -27,7 +27,7 @@ The breadcrumbs are the same allowlisted events described below, so they carry n
 
 That leaves the error message, which is the honest caveat. It's written by whatever code failed rather than chosen from a list, so it can carry limited content — a file path you tried to send, a TDLib error string. Nothing in this client formats a chat title or a message body into an error, so in practice that's what you get. But "in practice" is a weaker claim than the allowlist's, and this page won't pretend otherwise.
 
-If you built from source, none of this applies to your binary: the Sentry DSN is baked in at compile time from `TGT_SENTRY_DSN`, and without it the client never initialises Sentry at all. No panic hook, no uploader, nothing to send to.
+If you built from source, none of this applies to your binary: the Sentry DSN is baked in at compile time from `TGT_SENTRY_DSN`, and without it the client never initialises Sentry at all. No panic hook, no uploader, nothing to send to. The first-run screen changes its wording to match, rather than offering to turn on something that isn't there, and `tgt telemetry show` says the same. If you maintain a build like that and want its crashes to reach the project, export the variable before building — see [contributing](../understanding/contributing.md).
 
 ## What the OTLP path sends
 
