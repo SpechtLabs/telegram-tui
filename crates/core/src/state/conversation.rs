@@ -261,6 +261,19 @@ pub fn mark_visible_read(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
         return Vec::new();
     };
+    // THE decision of this module, and the one most likely to be "simplified"
+    // away: a chat is marked read only while the user is looking at the
+    // NEWEST messages, never merely because it is open. Do not relax this to
+    // "the chat is open" — it reads plausible, every test about opening a
+    // chat still passes (a chat opens pinned to the bottom), and it is
+    // wrong: a window scrolled back into history has everything unread
+    // *below* the fold, and reporting those read is not a local mistake that
+    // the next frame corrects. It clears the badge on the user's phone and
+    // shows the other side a read receipt for a message nobody looked at.
+    // See this function's "Only while pinned to the bottom" for why
+    // `Scroll::Bottom` is the honest proxy, and
+    // `a_scrolled_back_window_marks_nothing_read` (plus the two arrival tests
+    // beside it) for what holds it in place.
     if !matches!(convo.scroll, Scroll::Bottom) {
         return Vec::new();
     }
@@ -2387,6 +2400,64 @@ mod tests {
             effects = handle_key(&mut app, Key::PageDown).expect("conversation claims PageDown");
         }
         assert_eq!(view_requests(&effects).len(), 1);
+
+        // Storm control applies to this trigger like every other: bouncing
+        // off the bottom and back must not re-send ids already in flight.
+        handle_key(&mut app, Key::Up).expect("conversation claims Up");
+        let effects = handle_key(&mut app, Key::Down).expect("conversation claims Down");
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+        assert!(
+            view_requests(&effects).is_empty(),
+            "returning to the bottom again re-sends nothing: {effects:?}"
+        );
+    }
+
+    /// The scrolled-back rule holds for the *arrival* triggers too, not just
+    /// a direct call: a message landing below the fold is exactly the one the
+    /// user has not seen. The chat is open and the message is unread, so
+    /// every condition but the anchor is met — which is what makes this the
+    /// case a "mark it read, the chat is open" regression would slip past.
+    #[test]
+    fn a_message_arriving_below_the_fold_is_not_marked_read() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (1..=50).map(msg).collect(), 0);
+        app.conversations.get_mut(&CHAT).unwrap().scroll = Scroll::At {
+            message_id: MessageId(5),
+            line_offset: 0,
+        };
+
+        let effects = handle_td(&mut app, &TdUpdate::NewMessage(msg(51)));
+
+        assert!(
+            view_requests(&effects).is_empty(),
+            "a message the user is not looking at is not read: {effects:?}"
+        );
+        assert!(app.conversations[&CHAT].pending_view.is_none());
+    }
+
+    /// Same rule for a history page: scrolling up pages older messages in
+    /// while the unread ones sit below the fold, untouched.
+    #[test]
+    fn a_history_page_landing_below_the_fold_marks_nothing_read() {
+        let mut app = fixture_state();
+        fixture_unread(&mut app, (20..=50).map(msg).collect(), 0);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.scroll = Scroll::At {
+            message_id: MessageId(21),
+            line_offset: 0,
+        };
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: false,
+        };
+
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok((1..=19).map(msg).collect()));
+
+        assert!(
+            view_requests(&effects).is_empty(),
+            "paging older history is not reading newer messages: {effects:?}"
+        );
+        assert!(app.conversations[&CHAT].pending_view.is_none());
     }
 
     /// A chat the user has visited keeps receiving messages in the
