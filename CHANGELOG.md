@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.6](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.5...v0.1.6) (2026-07-31)
+
+
+### Features
+
+* forget the signed-out account when the TDLib client restarts ([deb3292](https://github.com/SpechtLabs/telegram-tui/commit/deb3292f18426172b4c5f37bcb90abfcef2f1332))
+* **update:** add --force, and refuse to walk a version backwards ([ccb5a6b](https://github.com/SpechtLabs/telegram-tui/commit/ccb5a6b4588db016ce37166711934a31f4ab6f2a))
+
+
+### Bug Fixes
+
+* **core:** surface failed logout and failed external-open as toasts ([5c24aff](https://github.com/SpechtLabs/telegram-tui/commit/5c24aff838128f51692f91769a3d66fa27767058))
+* **release:** a repair completes a release instead of rebuilding it ([9542c26](https://github.com/SpechtLabs/telegram-tui/commit/9542c269580e4c207f1f044f1a3741e8a659e021))
+* **update:** keep advice readable, and stop an update stealing the PATH link ([58cc556](https://github.com/SpechtLabs/telegram-tui/commit/58cc5569bde0d908892efa27f5d70415bad76572))
+* **update:** resolve the real tree when tgt is run through a symlink ([9362054](https://github.com/SpechtLabs/telegram-tui/commit/9362054719a4eb15fe893c8b111bee6c5becdf7f))
+
 ## [0.1.5](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.4...v0.1.5) (2026-07-31)
 
 
