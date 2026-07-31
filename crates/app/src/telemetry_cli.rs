@@ -29,7 +29,17 @@ const VENDOR_ENDPOINT: Option<&str> = option_env!("TGT_INGEST_ENDPOINT");
 /// session attaches once, the event attribute names with their allowed
 /// value sets, and where this session's data would go.
 pub fn show(config: &Config) -> eyre::Result<()> {
-    show_to(config, &mut std::io::stdout().lock())
+    match show_to(config, &mut std::io::stdout().lock()) {
+        // `tgt telemetry show | head` closes our stdout early; that is the
+        // reader's prerogative, not an error worth a nonzero exit.
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// [`show`], writing to an arbitrary sink instead of stdout — what the
