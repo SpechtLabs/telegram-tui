@@ -26,6 +26,7 @@ use tgt_core::effect::Effect;
 use tgt_core::model::time::Millis;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, TdUpdate};
+use tgt_ui::render::cache::LayoutCache;
 use tgt_ui::theme::Theme;
 
 use crate::config::Config;
@@ -75,6 +76,13 @@ pub struct Core {
     /// exclusively via `Action::Tick { now }`, anchored to loop start.
     clock_start: Instant,
     effects: Vec<Effect>,
+    /// T21's `LayoutCache` (architecture.md §4.9), threaded through `view`
+    /// on every draw. Cleared wholesale on a terminal resize — the column
+    /// width lives in `LayoutKey`, so a stale width's cached lines are wrong
+    /// at the new width. Theme changes don't need a clear here:
+    /// `theme_generation` is part of `LayoutKey` too, so a theme swap just
+    /// misses forward without evicting anything explicitly.
+    cache: LayoutCache,
 }
 
 impl Core {
@@ -104,6 +112,7 @@ impl Core {
             tick,
             clock_start: Instant::now(),
             effects: Vec::new(),
+            cache: LayoutCache::new(),
         }
     }
 
@@ -151,6 +160,12 @@ impl Core {
             Input::Quit => return Step::Quit,
             Input::Action(action) => self.apply(action),
             Input::Term(event) => {
+                // A resize invalidates every cached layout: they're wrapped
+                // at the old column width. `LayoutKey::theme_generation`
+                // handles theme swaps on its own, so only width needs this.
+                if let Event::Resize(_, _) = event {
+                    self.cache.clear();
+                }
                 if let Some(action) = tgt_ui::input::map_event(event) {
                     self.apply(action);
                 }
@@ -227,7 +242,12 @@ fn draw_if_due(
     // closed simply waits for the next dirtying action rather than for the
     // gate alone; this app's inputs never come close to that rate.
     if core.take_dirty() && gate_ready {
-        terminal.draw(|f| tgt_ui::view(core.app().state(), theme, f))?;
+        // Destructured so the draw closure borrows `app` (for its state)
+        // and `cache` as the disjoint fields they are, rather than needing
+        // both a `&core.app()` and a `&mut core.cache_mut()` live at once.
+        let Core { app, cache, .. } = core;
+        let state = app.state();
+        terminal.draw(|f| tgt_ui::view(state, theme, f, cache))?;
         *last_draw = Some(Instant::now());
     }
     Ok(())

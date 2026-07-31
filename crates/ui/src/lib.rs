@@ -8,12 +8,15 @@ pub mod view;
 use ratatui::Frame;
 use tgt_core::app::{AppState, Screen};
 
+use crate::render::cache::LayoutCache;
 use crate::theme::Theme;
 
-// TODO(T21/T23): `LayoutCache` doesn't exist until T21 lands `render::cache`;
-// architecture.md §4.9's staging note calls for this exact arity until then.
-// T21/T23 add `cache: &mut LayoutCache` together with the real type.
-pub fn view(state: &AppState, theme: &Theme, f: &mut Frame) {
+// `cache` is unused here: no view under `Screen` reads from it yet. T23
+// wires the conversation view's `get_or_insert_with` calls through it; this
+// arity exists now so every caller (runtime_loop, tests) already threads the
+// cache and doesn't need a signature-breaking follow-up change at T23.
+pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
+    let _ = cache;
     match state.screen {
         // The auth wizard owns the whole frame; it is a screen, not a pane.
         Screen::Auth => view::auth::draw(state, theme, f),
@@ -112,8 +115,11 @@ mod tests {
         state.auth.phase = AuthPhase::WaitTdlibParameters;
         let theme = Theme::default_dark();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut cache = LayoutCache::new();
 
-        terminal.draw(|f| view(&state, &theme, f)).unwrap();
+        terminal
+            .draw(|f| view(&state, &theme, f, &mut cache))
+            .unwrap();
 
         let rendered = render_to_string(&terminal);
         assert!(
@@ -131,8 +137,11 @@ mod tests {
         let state = fixture_state();
         let theme = Theme::default_dark();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut cache = LayoutCache::new();
 
-        terminal.draw(|f| view(&state, &theme, f)).unwrap();
+        terminal
+            .draw(|f| view(&state, &theme, f, &mut cache))
+            .unwrap();
 
         let rendered = render_to_string(&terminal);
         assert!(
