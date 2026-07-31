@@ -119,52 +119,96 @@ run = "./scripts/package.sh"
 # is exactly the tree package.sh proves relocatable. Windows ships no artifact
 # and has no rpath, so this is not made portable to it.
 [tasks.install]
-description = "Install tgt into $TGT_PREFIX (default ~/.local): bin/tgt + lib/libtdjson"
+description = "Install tgt: a private tree under XDG_DATA_HOME, symlinked onto PATH"
 depends = ["package"]
 shell = "bash -c"
 run = '''
 set -eu
-TGT_PREFIX="${TGT_PREFIX:-$HOME/.local}"
-install -d "$TGT_PREFIX/bin" "$TGT_PREFIX/lib"
-install -m 755 dist/tgt/bin/tgt "$TGT_PREFIX/bin/tgt"
-# Everything package.sh put in lib/: the versioned library (what the binary's
-# LC_LOAD_DYLIB / DT_NEEDED actually names), the unversioned alias, and on
-# Linux the bundled C++ runtime TDLib needs. `-a` keeps the alias a symlink.
-# See architecture.md §9.2.
-cp -a dist/tgt/lib/. "$TGT_PREFIX/lib/"
-echo "installed $("$TGT_PREFIX/bin/tgt" --version) to $TGT_PREFIX/bin/tgt"
+# The same layout scripts/install.sh and the Homebrew formula produce, and
+# deliberately so: one layout, not three. bin/tgt reaches libtdjson through a
+# runpath relative to itself, so the two must stay siblings — and keeping the
+# tree private (rather than scattered into a shared $PREFIX/bin + $PREFIX/lib)
+# is what lets `tgt update` replace it with a single atomic rename. A shared
+# prefix cannot be updated atomically at all.
+ROOT="${TGT_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/tgt}"
+BIN_DIR="${TGT_BIN_DIR:-$HOME/.local/bin}"
+mkdir -p "$(dirname "$ROOT")" "$BIN_DIR"
+
+staged="$ROOT.new-$$"
+rm -rf "$staged"
+cp -a dist/tgt "$staged"
+
+previous=""
+if [ -e "$ROOT" ]; then
+  previous="$ROOT.old-$$"
+  mv "$ROOT" "$previous"
+fi
+mv "$staged" "$ROOT"
+
+# Keep the old tree until the new one proves it starts; `--version` exits
+# before touching terminal modes, so it is safe to invoke.
+if ! "$ROOT/bin/tgt" --version >/dev/null 2>&1; then
+  rm -rf "$ROOT"
+  if [ -n "$previous" ]; then
+    mv "$previous" "$ROOT"
+    echo "error: the newly built tgt could not start; previous install restored" >&2
+  else
+    echo "error: the newly built tgt could not start" >&2
+  fi
+  exit 1
+fi
+[ -n "$previous" ] && rm -rf "$previous"
+
+ln -sfn "$ROOT/bin/tgt" "$BIN_DIR/tgt"
+echo "installed $("$ROOT/bin/tgt" --version)"
+echo "  $BIN_DIR/tgt -> $ROOT/bin/tgt"
 case ":$PATH:" in
-  *":$TGT_PREFIX/bin:"*) ;;
-  *) echo "note: $TGT_PREFIX/bin is not on your PATH" >&2 ;;
+  *":$BIN_DIR:"*) ;;
+  *) echo "note: $BIN_DIR is not on your PATH" >&2 ;;
 esac
 '''
 
 [tasks.uninstall]
-description = "Remove tgt and the libraries it was installed with from $TGT_PREFIX"
+description = "Remove the tgt tree and its symlink"
 shell = "bash -c"
 run = '''
 set -eu
-TGT_PREFIX="${TGT_PREFIX:-$HOME/.local}"
-# Exactly the set `install` copies in: TDLib under either platform's naming,
-# plus the C++ runtime bundled beside it on Linux.
-rm -f "$TGT_PREFIX/bin/tgt" \
-      "$TGT_PREFIX"/lib/libtdjson* \
-      "$TGT_PREFIX"/lib/libc++.so.1 \
-      "$TGT_PREFIX"/lib/libc++abi.so.1 \
-      "$TGT_PREFIX"/lib/libunwind.so.1
-echo "removed tgt from $TGT_PREFIX"
+ROOT="${TGT_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/tgt}"
+BIN_DIR="${TGT_BIN_DIR:-$HOME/.local/bin}"
+rm -rf "$ROOT"
+rm -f "$BIN_DIR/tgt"
+echo "removed $ROOT and $BIN_DIR/tgt"
+# Versions before the private-tree layout scattered files into
+# $TGT_PREFIX/{bin,lib} (default ~/.local). Clean those too, naming exactly
+# what the old task copied in rather than globbing a shared lib directory.
+LEGACY="${TGT_PREFIX:-$HOME/.local}"
+rm -f "$LEGACY/bin/tgt" \
+      "$LEGACY"/lib/libtdjson* \
+      "$LEGACY"/lib/libc++.so.1 \
+      "$LEGACY"/lib/libc++abi.so.1 \
+      "$LEGACY"/lib/libunwind.so.1
 '''
 
 [tasks.docs-lint]
 description = "Lint the documentation markdown (the docs workflow's first job)"
 run = "markdownlint-cli2 'docs/**/*.md'"
 
+[tasks.docs-install-script]
+description = "Copy scripts/install.sh into the docs site so it is served at /install.sh"
+# One source of truth. scripts/install.sh is canonical and this copies it in;
+# docs/.vuepress/public/ is gitignored for this file so nobody edits the copy
+# and watches it drift. `base` is "/", so it lands at
+# https://tgt.specht-labs.de/install.sh — the URL the README advertises.
+run = "cp scripts/install.sh docs/.vuepress/public/install.sh"
+
 [tasks.docs-dev]
 description = "Serve the documentation website locally with hot reload"
+depends = ["docs-install-script"]
 run = "cd docs && bun install && bun run dev"
 
 [tasks.docs-build]
 description = "Build the documentation website (the docs workflow's second job)"
+depends = ["docs-install-script"]
 run = "cd docs && bun install --frozen-lockfile && bun run build"
 
 [tasks.update-gha]

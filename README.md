@@ -56,7 +56,15 @@ instead, and hardening them properly is unfinished work.
 
 ## Install
 
-Grab a tarball from the [releases page](https://github.com/SpechtLabs/telegram-tui/releases), or build from source:
+```shell
+curl -sSL https://tgt.specht-labs.de/install.sh | sh
+```
+
+macOS and Linux, on Apple Silicon and x86_64. It downloads the release for your platform, installs the tree to `~/.local/share/tgt`, and symlinks `~/.local/bin/tgt`. It says what it verified — releases carry a cosign bundle and, from 0.1.5 on, a `SHA256SUMS` — and it keeps your previous install until the new one has proved it starts.
+
+If piping a script into a shell makes you uncomfortable, that's a reasonable instinct: read it first at [tgt.specht-labs.de/install.sh](https://tgt.specht-labs.de/install.sh), or take a tarball from the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) and unpack it yourself.
+
+Or build from source:
 
 ```shell
 git clone https://github.com/SpechtLabs/telegram-tui.git
@@ -64,7 +72,9 @@ cd telegram-tui
 mise run install          # builds, then installs to ~/.local/bin/tgt
 ```
 
-Set `TGT_PREFIX` to install somewhere else. The binary loads TDLib from a dylib next to it (`$TGT_PREFIX/lib`), so keep the two together or unpack the release tarball as a unit.
+Both routes lay the tree out the same way: a private `bin/` + `lib/` pair with the binary symlinked onto your PATH. The binary loads TDLib from a dylib beside it, so those two have to stay siblings — which is why they go somewhere of their own rather than into a shared prefix. `TGT_INSTALL_ROOT` and `TGT_BIN_DIR` override either half.
+
+On Linux you also need libc++ at runtime (`libc++1` and `libc++abi1` on Debian/Ubuntu); the installer checks and tells you.
 
 Building needs [mise](https://mise.jdx.dev) and nothing else. TDLib arrives through `tdlib-rs`'s `download-tdlib` feature during the build: no Homebrew, no system TDLib, no cmake and gperf and a C++ toolchain. The first build fetches it and takes a while; later builds don't.
 

@@ -3,9 +3,44 @@ title: Installation
 createTime: 2026/07/31 10:00:00
 ---
 
-Two ways in: unpack a release tarball, or build from source with [mise](https://mise.jdx.dev). The tarball only exists for Apple Silicon macOS, so everywhere else it's the source route.
+Three ways in: the install script, a release tarball unpacked by hand, or a build from source with [mise](https://mise.jdx.dev). Releases exist for macOS and Linux on both Apple Silicon and x86_64; Windows compiles and is tested in CI but ships no artifact.
 
-## From a release tarball (macOS, Apple Silicon)
+## The install script
+
+::: terminal Install the latest release
+
+```shell
+$ curl -sSL https://tgt.specht-labs.de/install.sh | sh
+tgt installer
+  platform:  aarch64-apple-darwin
+  tree:      /Users/you/.local/share/tgt
+  symlink:   /Users/you/.local/bin/tgt
+
+  release:   v0.1.5
+
+downloading tgt-0.1.5-aarch64-apple-darwin.tar.gz…
+  checksum: ok (corruption check only — see the docs on signatures)
+extracting…
+
+installed tgt 0.1.5
+  /Users/you/.local/bin/tgt -> /Users/you/.local/share/tgt/bin/tgt
+```
+
+:::
+
+It detects your OS and architecture, refuses clearly on anything without a published build, and keeps your previous install until the new binary has proved it can start — a failed upgrade puts the working one back rather than leaving you with neither.
+
+`TGT_INSTALL_ROOT` and `TGT_BIN_DIR` override where the tree and the symlink go.
+
+::: warning What the script verifies, and what that is worth
+It checks the tarball against `SHA256SUMS` when the release published one, and says so when it didn't — v0.1.4 shipped without it. Take that check for what it is: the sums file comes from the same host over the same connection as the tarball, so it catches a corrupted download and nothing more. Anyone able to serve you a modified tarball can serve you a matching sums file.
+
+The signature that means more is the cosign bundle beside every release. The script doesn't verify it, because almost nobody has cosign installed and a check that usually can't run is not a check. If you want that guarantee, verify by hand before installing, or use `tgt update --require-signature` once you're on 0.1.5 or later.
+:::
+
+Piping a script into a shell is worth being uneasy about. [Read it first](https://tgt.specht-labs.de/install.sh) — it's the same file the repo ships at `scripts/install.sh`, copied into the site at build time so the two cannot drift.
+
+## From a release tarball
 
 Releases are on the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) as `tgt-<version>-aarch64-apple-darwin.tar.gz`, with a `SHA256SUMS` file and a keyless cosign bundle (`.cosign.bundle`) alongside it.
 
@@ -44,11 +79,13 @@ installed tgt 0.x.y to /Users/you/.local/bin/tgt
 
 :::
 
-`mise run install` runs `mise run package` first (release build, `dist/` layout, tarball, and a relocation check), then copies `bin/tgt` and the dylib into `$TGT_PREFIX`, which defaults to `~/.local`. Set `TGT_PREFIX` to put it elsewhere:
+`mise run install` runs `mise run package` first (release build, `dist/` layout, tarball, and a relocation check), then installs the same tree the script does: `~/.local/share/tgt` with a symlink at `~/.local/bin/tgt`. Same overrides:
 
 ```shell
-TGT_PREFIX=/opt/tgt mise run install
+TGT_INSTALL_ROOT=/opt/tgt TGT_BIN_DIR=/opt/bin mise run install
 ```
+
+Earlier versions scattered the binary and the dylib into `$TGT_PREFIX/{bin,lib}` (default `~/.local`), sharing those directories with everything else installed there. `mise run uninstall` cleans up both layouts, so an upgrade from one of those leaves nothing behind.
 
 The first build downloads TDLib and takes a while. Later builds don't.
 
