@@ -1,0 +1,22 @@
+---
+source: crates/ui/tests/snapshots.rs
+expression: "render(100, 30, &state)"
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                     ┌─── Delete message? ────┐                                     
+                                     │                        │                                     
+                                     │      Delete for me     │                                     
+                                     │                        │                                     
+                                     │ ⏎ confirm · esc cancel │                                     
+                                     └────────────────────────┘
