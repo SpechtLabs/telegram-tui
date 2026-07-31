@@ -352,11 +352,11 @@ pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
 ///
 /// `Esc` is claimed here only while `active_list == Archive`, to back out of
 /// the archive pseudo-mode into `Main` before the generic one-level-pop rule
-/// (architecture §4.5) would otherwise apply. NOTE for T45: `App::dispatch_key`
-/// currently intercepts `Key::Esc` at step 3, *above* `route_pane_key` (step
-/// 4), so this arm is unreachable until the router special-cases
-/// `Focus::ChatList` with `active_list == Archive` ahead of its generic Esc
-/// handling — see this task's final report.
+/// (architecture §4.5) would otherwise apply. `App::dispatch_key` intercepts
+/// `Key::Esc` above `route_pane_key`, so this arm is not reached through the
+/// ordinary pane walk: `App::escape` asks for it by name (T45), calling this
+/// handler with `Esc` whenever the chat list is focused and taking a `Some`
+/// as "the archive claimed it".
 fn handle_key_chat_list(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
     match key {
         Key::Up => {

@@ -7,8 +7,8 @@
 //! same structural guarantee `Effect::Alert` gives at the `core` boundary
 //! (it carries no payload at all) holds here too.
 //!
-//! `dispatch.rs` still logs and drops `Effect::Alert`; T45 wires the call
-//! to `alert` into that dispatch arm.
+//! `dispatch.rs`'s `Effect::Alert` arm is the only caller; see that module's
+//! docs for why its write to stdout is safe while the TUI is up.
 
 use std::io::{self, Write};
 
@@ -19,7 +19,6 @@ const OSC777_ALERT: &[u8] = b"\x1b]777;notify;tgt;New message\x1b\\";
 const BEL: &[u8] = b"\x07";
 
 /// Emits a terminal alert: OSC 777 where supported, `BEL` otherwise.
-#[allow(dead_code)] // T45 wires this into dispatch.rs's Effect::Alert arm.
 pub fn alert(out: &mut impl Write, supports_osc777: bool) -> io::Result<()> {
     if supports_osc777 {
         out.write_all(OSC777_ALERT)
@@ -32,7 +31,6 @@ pub fn alert(out: &mut impl Write, supports_osc777: bool) -> io::Result<()> {
 /// `TERM_PROGRAM`, matching the terminals known to render it (WezTerm,
 /// kitty, Ghostty). Anything else — including an unset `TERM_PROGRAM`,
 /// e.g. inside plain tmux without passthrough — falls back to `BEL`.
-#[allow(dead_code)] // T45 wires this into dispatch.rs's Effect::Alert arm.
 pub fn supports_osc777() -> bool {
     supports_osc777_for(std::env::var("TERM_PROGRAM").ok().as_deref())
 }

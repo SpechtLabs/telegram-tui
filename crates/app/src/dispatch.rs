@@ -4,7 +4,25 @@
 //! reaches the pure `update()`.
 //!
 //! Wired so far: `Quit`, `Telemetry`, `Td`, `SaveConfig`, `CopyToClipboard`,
-//! `OpenExternal`. `Alert` (T44) is still logged and dropped.
+//! `OpenExternal`, `Alert`.
+//!
+//! # `Effect::Alert` — the one deliberate write to the terminal
+//!
+//! Nothing in this process may write to stdout while the TUI holds the
+//! alternate screen: a stray byte lands in a cell the renderer believes it
+//! owns. The terminal alert (spec §6.4) is the exception, and it is only an
+//! exception in the sense that it is *meant* for the terminal emulator
+//! rather than for the screen — `OSC 777` (or `BEL`) is a message to the
+//! multiplexer, consumed before it can paint anything. [`Inner::alert`] is
+//! therefore the single sanctioned escape-sequence write in the crate. It
+//! goes through `io::stdout()`, the same global handle
+//! `CrosstermBackend` was built on in `main.rs`, so the two writers share
+//! one lock and one buffer and cannot interleave mid-sequence; the flush is
+//! explicit because the sequence carries no newline to trigger one.
+//!
+//! What may be written is fixed at compile time in `notify.rs` — `alert`
+//! takes no content parameters at all, so no chat title or message text can
+//! reach the wire even by accident (spec §6.4's PII rule).
 //!
 //! # Sending a file — the other impure boundary
 //!
@@ -40,6 +58,7 @@
 //! the request is marked pending and fired by the `SaveConfig` handler once
 //! `ConfigPatch::Credentials` has been persisted.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,6 +114,10 @@ struct Inner {
     /// TDLib asked for its parameters before credentials existed. Cleared by
     /// whoever fires the deferred request (see module docs).
     params_pending: AtomicBool,
+    /// Probed once, at construction: the heuristic reads `TERM_PROGRAM`,
+    /// which cannot change under a running process, and an alert is not the
+    /// place to be re-reading the environment.
+    supports_osc777: bool,
 }
 
 impl Dispatcher {
@@ -113,6 +136,7 @@ impl Dispatcher {
             config,
             td_boot,
             params_pending: AtomicBool::new(false),
+            supports_osc777: crate::notify::supports_osc777(),
         });
         (Dispatcher { inner, quit_tx }, quit_rx)
     }
@@ -145,12 +169,10 @@ impl Dispatcher {
                 let inner = Arc::clone(&self.inner);
                 tokio::spawn(async move { inner.open_external(path).await });
             }
-            other => {
-                tracing::debug!(
-                    effect = effect_kind(&other),
-                    "effect not yet wired; dropped"
-                );
-            }
+            // Not spawned: this is a handful of bytes into an already-open
+            // handle, and a notification the user hears a frame later than
+            // the toast it belongs to would be the odder outcome.
+            Effect::Alert => self.inner.alert(),
         }
     }
 
@@ -165,6 +187,19 @@ impl Dispatcher {
 }
 
 impl Inner {
+    /// Emits the terminal alert — see the module docs for why this write is
+    /// allowed to reach stdout while the TUI is up. A terminal that refuses
+    /// the bytes costs the user one missed bell, never a failed action, so
+    /// the error is logged and dropped.
+    fn alert(&self) {
+        let mut out = io::stdout().lock();
+        let written =
+            crate::notify::alert(&mut out, self.supports_osc777).and_then(|()| out.flush());
+        if let Err(err) = written {
+            tracing::debug!(error = %err, "terminal alert not written");
+        }
+    }
+
     async fn send_tdlib_parameters(&self) {
         let Some(params) = self.build_params() else {
             self.params_pending.store(true, Ordering::SeqCst);
@@ -649,17 +684,11 @@ fn messages_of(response: TdResponse) -> Vec<MessageView> {
     }
 }
 
-fn effect_kind(effect: &Effect) -> &'static str {
-    match effect {
-        Effect::Td(req) => req.kind(),
-        Effect::Telemetry(_) => "Telemetry",
-        Effect::Alert => "Alert",
-        Effect::CopyToClipboard { .. } => "CopyToClipboard",
-        Effect::OpenExternal { .. } => "OpenExternal",
-        Effect::SaveConfig(_) => "SaveConfig",
-        Effect::Quit => "Quit",
-    }
-}
+// `effect_kind` lived here to name the effect the catch-all arm dropped.
+// With `Alert` wired, `dispatch` is total over `Effect` and nothing is
+// dropped any more, so the helper went with the arm — and the match is left
+// exhaustive on purpose: a new variant should be a compile error here, not a
+// debug line nobody reads.
 
 #[cfg(test)]
 mod tests {

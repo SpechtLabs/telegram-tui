@@ -19,6 +19,8 @@ mod config;
 mod dispatch;
 #[path = "../src/media_kind.rs"]
 mod media_kind;
+#[path = "../src/notify.rs"]
+mod notify;
 #[path = "../src/runtime_loop.rs"]
 mod runtime_loop;
 

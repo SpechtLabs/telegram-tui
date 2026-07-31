@@ -17,11 +17,11 @@ use crate::state::conversation::{self, ConversationState};
 use crate::state::focus::{Focus, FocusStack};
 use crate::state::media::{self, MediaState};
 use crate::state::modal::{self, ModalState};
-use crate::state::palette::PaletteState;
+use crate::state::palette::{self, PaletteState};
 use crate::state::presence::{self, PresenceState};
-use crate::state::search::ChatSearchState;
+use crate::state::search::{self, ChatSearchState};
 use crate::state::selection;
-use crate::state::toasts::ToastState;
+use crate::state::toasts::{self, ToastState};
 use crate::td::request::TdRequest;
 use crate::td::update::{AuthPhase, ConnectionPhase, TdUpdate};
 use crate::telemetry::{TelemetryEvent, hashing, schema};
@@ -183,6 +183,13 @@ impl App {
                 if self.state.presence.typing.len() != typing_before {
                     self.dirty = true;
                 }
+                // Toast expiry (spec §6.4's 4 s TTL). Same rule as the two
+                // sweeps above: a tick that expires nothing is not a frame.
+                let toasts_before = self.state.toasts.toasts.len();
+                effects.extend(toasts::handle_tick(&mut self.state, now));
+                if self.state.toasts.toasts.len() != toasts_before {
+                    self.dirty = true;
+                }
                 effects
             }
             Action::Resize { width, height } => {
@@ -281,6 +288,13 @@ impl App {
                 self.dirty = true;
                 media::handle_td_result(&mut self.state, file_id, &outcome)
             }
+            // `searchChatMessages` answered. Render-worthy either way: `Ok`
+            // stores the hits and drags the anchor to the first one, `Err`
+            // at least clears the query box's in-flight spinner (T42).
+            Action::TdResult(TdResult::SearchDone { chat_id, outcome }) => {
+                self.dirty = true;
+                search::handle_td_result(&mut self.state, chat_id, &outcome)
+            }
             // The remaining completions land with the tasks that own their
             // state. T32 wired the dispatcher end of all of them, so
             // `EditDone`/`DeleteDone`/`ForwardDone`/`ReactionDone` and the
@@ -302,8 +316,9 @@ impl App {
     }
 
     /// One walk down the table. `None` means nothing claimed the key: it
-    /// reached the bottom unconsumed, which is exactly what the global
-    /// bindings (`ctrl+p` palette, T41; `?` help, T44) will hang off.
+    /// reached the bottom unconsumed. The global layer at that bottom owns
+    /// `ctrl+p` (the palette) and the conversation half of `/`; `?` (help)
+    /// still falls through until T47 builds the overlay behind it.
     ///
     /// The quit binding is checked ahead of all of it, deliberately. A pane
     /// claims every key it is shown for — the auth wizard is a full-screen
@@ -372,10 +387,81 @@ impl App {
             return Some(Vec::new());
         }
 
-        // 7. Global. `ctrl+p` and `?` are unclaimed until T41/T44 build the
-        //    overlays behind them; they fall through here rather than being
-        //    swallowed, so adding those layers is additive.
+        // 7. Global. Reached only by keys no pane above claimed, which is
+        //    why the palette opens from any of them — and why a modal, the
+        //    one layer that swallows everything, is the single context it
+        //    cannot be opened from (spec §6.2).
+        if key == self.state.bindings.palette {
+            self.dirty = true;
+            return Some(self.toggle_palette());
+        }
+
+        // `/` is context-dependent (spec §11). Its chat-list half — the
+        // filter — was claimed by `chat_list::handle_key` two steps up; this
+        // is the other half: in-chat message search, "bound to `/` while the
+        // message list is focused". Selection mode IS that focus (there is
+        // no separate message-list level, see `route_chat_list_key`), and it
+        // leaves `/` unclaimed because no action chip answers to it.
+        //
+        // Deliberately NOT the composer, though the composer is the
+        // conversation side's resting focus: `/` there is a literal
+        // character. It opens `/send <path>` (spec §10) from exactly the
+        // empty input a search binding would have to claim, and every
+        // message containing a slash — a URL, a path, a date — is typed
+        // through it. A text field that let `/` escape it would be the worse
+        // trade, the same call `move_pane_focus` makes for `←`.
+        if key == Key::Char('/')
+            && matches!(self.state.focus.current(), Focus::Selection)
+            && self.open_chat_search()
+        {
+            self.dirty = true;
+            return Some(Vec::new());
+        }
+
         None
+    }
+
+    /// `ctrl+p`. Opening pushes `Focus::Palette` and lets T41 populate the
+    /// overlay; pressing it again with the palette up is the way back out,
+    /// so the binding that opens the palette is also the one that closes it
+    /// rather than a key that stacks a second one on the first.
+    ///
+    /// The one telemetry event this task mints from a projection rather than
+    /// from a request: opening the palette produces no `Effect` to key off
+    /// (nothing is asked of TDLib), and `palette.open` is still an
+    /// allowlisted user action — the same shape as `route_td`'s login event.
+    fn toggle_palette(&mut self) -> Vec<Effect> {
+        if matches!(self.state.focus.current(), Focus::Palette) {
+            self.state.focus.pop();
+            palette::close(&mut self.state);
+            return Vec::new();
+        }
+        self.state.focus.push(Focus::Palette);
+        palette::open(&mut self.state);
+        vec![Effect::Telemetry(TelemetryEvent::ok(
+            schema::actions::PALETTE_OPEN,
+        ))]
+    }
+
+    /// Enters in-chat search from selection mode. Returns whether it opened —
+    /// there is nothing to search with no chat open.
+    ///
+    /// Selection mode is left behind rather than kept underneath: search
+    /// moves the scroll anchor to each hit (T42), and a highlighted message
+    /// the user can no longer see would be fighting it for the viewport. So
+    /// the selection level is exited (T26's `exit` half, exactly as the
+    /// generic `Esc` path and the Reply chip run it) and `Focus::ChatSearch`
+    /// takes its place above the composer. `Esc` out of search therefore
+    /// lands on the composer, not back on a stale selection.
+    fn open_chat_search(&mut self) -> bool {
+        if self.state.open_chat.is_none() {
+            return false;
+        }
+        selection::exit(&mut self.state);
+        self.state.focus.pop();
+        self.state.focus.push(Focus::ChatSearch);
+        search::open(&mut self.state);
+        true
     }
 
     /// Dispatches to whichever pane is on top of the focus stack, and runs
@@ -386,10 +472,37 @@ impl App {
             Focus::Selection => self.route_selection_key(key),
             Focus::Composer => self.route_composer_key(key),
             Focus::ChatList | Focus::ChatFilter => self.route_chat_list_key(key),
-            // Palette, in-chat search and help arrive in M7; `Modal` was
-            // handled before any pane ran.
+            Focus::Palette => self.route_palette_key(key),
+            // T42 keeps its own focus check inside `handle_key`, so this is
+            // the whole wiring: `Esc` is unclaimed there and comes back out
+            // of `escape`, which pops this level and calls `search::close`.
+            Focus::ChatSearch => search::handle_key(&mut self.state, key),
+            // Help arrives in T47; `Modal` was handled before any pane ran.
             _ => None,
         }
+    }
+
+    /// The palette. T41's contract splits the close between the two of us:
+    /// `handle_key` never touches the focus stack, and `Enter` drops
+    /// `app.palette` itself — so `Some` → `None` across the call is the
+    /// signal to pop the level `toggle_palette` pushed. `Esc` never gets
+    /// here (it is unclaimed there, and intercepted above); it closes the
+    /// palette through `escape` instead.
+    ///
+    /// Invoking a chat entry moves focus the same way `⏎` on a sidebar row
+    /// does — the palette is a second door into the same conversation, and
+    /// landing on it with the chat list still focused would be a different
+    /// outcome for the same intent.
+    fn route_palette_key(&mut self, key: Key) -> Option<Vec<Effect>> {
+        let open_before = self.state.open_chat;
+        let effects = palette::handle_key(&mut self.state, key)?;
+        if self.state.palette.is_none() {
+            self.state.focus.pop();
+            if self.state.open_chat != open_before && self.state.open_chat.is_some() {
+                self.state.focus.replace_base(Focus::Composer);
+            }
+        }
+        Some(effects)
     }
 
     /// Selection mode. Two chips — Reply and Edit — are pure composer-context
@@ -493,7 +606,36 @@ impl App {
 
     /// `Esc` pops exactly one level and never the base (architecture §4.5).
     /// Returns whether it was claimed.
+    ///
+    /// Two things sit above that rule, in this order:
+    ///
+    /// 1. **A toast, if any is showing** (spec §6.4: toasts are "dismissible
+    ///    with `esc`"). They are not on the focus stack at all, so the two
+    ///    rules had to be ordered by hand: `Esc` peels the newest toast
+    ///    first and consumes the key. A toast is the most transient thing on
+    ///    screen — it leaves on its own after 4 s — so dismissing one costs
+    ///    the user a keypress at worst, while the reverse order would make
+    ///    `esc` unable to clear a toast at all whenever any overlay is up.
+    ///    A modal is the exception, and it never reaches here: it swallows
+    ///    every key it is shown, `Esc` included (`dispatch_key` step 1).
+    /// 2. **Backing out of the archive** (T43): with the chat list focused
+    ///    and `active_list == Archive`, `chat_list::handle_key` claims `Esc`
+    ///    to return to `Main`. That handler sits *below* this one in the
+    ///    table, so the archive case is asked here explicitly — otherwise
+    ///    the generic rule below would run first and `Esc` would leave the
+    ///    conversation instead of the archive.
     fn escape(&mut self) -> bool {
+        if toasts::dismiss_newest(&mut self.state) {
+            self.dirty = true;
+            return true;
+        }
+        if matches!(self.state.focus.current(), Focus::ChatList)
+            && chat_list::handle_key(&mut self.state, Key::Esc).is_some()
+        {
+            self.dirty = true;
+            return true;
+        }
+
         match self.state.focus.current().clone() {
             // Leaving selection mode drops the selection: T26 splits the
             // lifecycle into `enter`/`exit` precisely so the router can run
@@ -509,6 +651,18 @@ impl App {
             Focus::ChatFilter => {
                 self.state.chat_list.filter = None;
                 self.state.focus.pop();
+            }
+            // The two M7 overlays. Both leave `Esc` unclaimed on purpose so
+            // that the pop and the state teardown stay in one place: T41's
+            // `close` drops the query and its results, T42's also clears the
+            // open chat's hits, which is what turns the highlight off.
+            Focus::Palette => {
+                self.state.focus.pop();
+                palette::close(&mut self.state);
+            }
+            Focus::ChatSearch => {
+                self.state.focus.pop();
+                search::close(&mut self.state);
             }
             _ => {
                 if self.state.focus.pop() {
@@ -618,6 +772,11 @@ impl App {
             }
             TdRequest::ToggleReaction { chat_id, .. } => (schema::actions::MESSAGE_REACT, *chat_id),
             TdRequest::OpenChat { chat_id } => (schema::actions::CHAT_OPEN, *chat_id),
+            // The query text is never part of the event — only that a search
+            // ran, and in what kind of chat (§4.8's allowlist).
+            TdRequest::SearchChatMessages { chat_id, .. } => {
+                (schema::actions::SEARCH_RUN, *chat_id)
+            }
             _ => return None,
         };
         Some(self.chat_event(action, chat_id))
@@ -681,9 +840,25 @@ impl App {
                 effects.extend(conversation::handle_td(&mut self.state, update));
                 effects
             }
+            // The conversation window takes the message; the toast queue
+            // then decides whether it is worth telling the user about
+            // (spec §6.4). Second, not first: `on_new_message` reads
+            // `open_chat` and the sidebar's mute flag, both of which the
+            // handlers above own — asking after they have run means the
+            // suppression rules see the same state the user does.
+            //
+            // `Effect::Alert` is what `tgt-app` turns into the terminal
+            // escape sequence. It carries no payload; the toast that goes
+            // with it holds the title and preview, and never leaves the
+            // cell grid.
+            TdUpdate::NewMessage(msg) => {
+                self.dirty = true;
+                let mut effects = conversation::handle_td(&mut self.state, update);
+                effects.extend(toasts::on_new_message(&mut self.state, msg));
+                effects
+            }
             // Conversation-window only.
-            TdUpdate::NewMessage(_)
-            | TdUpdate::MessagesDeleted { .. }
+            TdUpdate::MessagesDeleted { .. }
             | TdUpdate::MessageContentChanged { .. }
             | TdUpdate::ChatReadOutbox { .. } => {
                 self.dirty = true;
@@ -1353,11 +1528,12 @@ mod tests {
 /// app::routing`) selects exactly these.
 #[cfg(test)]
 mod routing {
-    use super::tests::{chat, logged_in, message};
+    use super::tests::{boot_fixture, chat, logged_in, message};
     use super::*;
     use crate::model::entity::FormattedText;
     use crate::model::ids::MessageId;
     use crate::model::message::MessageCaps;
+    use crate::state::chat_list::visible_rows;
     use crate::state::conversation::Scroll;
     use crate::state::focus::ModalKind;
 
@@ -1551,39 +1727,90 @@ mod routing {
         assert_eq!(*app.state().focus.current(), Focus::ChatFilter);
     }
 
+    /// `ctrl+p` from every pane, because no pane above the global layer
+    /// claims it — and from none of the contexts that sit above that layer:
+    /// a modal (which swallows every key) and the auth screen.
     #[test]
-    fn global_palette_key_reaches_through_panes_but_not_modals() {
-        // The palette overlay itself lands in T41. What holds today is the
-        // routing property it will be built on: no pane consumes `ctrl+p`, so
-        // it falls all the way through to the global layer at the bottom of
-        // the table — and a modal consumes it before it can get there.
-        let mut app = chat_open();
-        let palette = app.state().bindings.palette;
+    fn ctrl_p_opens_palette_from_any_pane() {
+        let palette = boot_fixture().bindings.palette;
 
-        assert!(
-            app.dispatch_key(palette).is_none(),
-            "the composer must not consume the palette key"
-        );
+        // The composer, with a chat open: the key does not reach the input.
+        let mut app = chat_open();
+        let effects = app.update(Action::Key(palette));
+        assert_eq!(describe(&effects), ["Telemetry(palette.open)"]);
+        assert_eq!(*app.state().focus.current(), Focus::Palette);
+        assert!(app.state().palette.is_some());
         assert_eq!(app.state().composer.input.text, "");
 
+        // Pressing it again is the way back out, not a second palette.
+        assert!(app.update(Action::Key(palette)).is_empty());
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert!(app.state().palette.is_none());
+
+        // The chat list.
         app.update(Action::Key(Key::Tab));
-        assert!(
-            app.dispatch_key(palette).is_none(),
-            "the chat list must not consume the palette key"
-        );
+        app.update(Action::Key(palette));
+        assert_eq!(*app.state().focus.current(), Focus::Palette);
+        app.update(Action::Key(Key::Esc));
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
 
+        // Selection mode. The palette stacks on top of it and `Esc` gives it
+        // back, selection intact — one level, as always.
         let mut app = selection_with_delete_chip();
-        assert!(
-            app.dispatch_key(palette).is_none(),
-            "selection mode must not consume the palette key"
-        );
+        app.update(Action::Key(palette));
+        assert_eq!(*app.state().focus.current(), Focus::Palette);
+        app.update(Action::Key(Key::Esc));
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+        assert_eq!(selected_message(&app), Some(NEWEST));
 
+        // A modal is the one context it cannot be opened from: the key is
+        // claimed and swallowed with the modal left standing.
         app.update(Action::Key(Key::Char('x')));
-        assert!(
-            app.dispatch_key(palette).is_some(),
-            "a modal swallows every key shown to it"
-        );
+        assert!(app.update(Action::Key(palette)).is_empty());
         assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
+        assert!(app.state().palette.is_none());
+
+        // Nor from the auth screen, which claims every key it is shown.
+        let mut app = App::new(Boot {
+            has_credentials: true,
+            ..boot_fixture()
+        });
+        assert!(app.update(Action::Key(palette)).is_empty());
+        assert!(app.state().palette.is_none());
+    }
+
+    /// `⏎` on a palette entry: T41 closes `app.palette` itself, and that is
+    /// the router's signal to pop the focus level it pushed. Opening a chat
+    /// this way lands on the conversation side, exactly like `⏎` on a
+    /// sidebar row.
+    #[test]
+    fn palette_enter_pops_focus() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(app.state().bindings.palette));
+        assert_eq!(app.state().focus.depth(), 2);
+
+        let effects = app.update(Action::Key(Key::Enter));
+        assert_eq!(
+            describe(&effects),
+            ["Td(OpenChat)", "Td(GetChatHistory)", "Telemetry(chat.open)"]
+        );
+        assert!(app.state().palette.is_none());
+        assert_eq!(app.state().open_chat, Some(CHAT));
+        assert_eq!(app.state().focus.depth(), 1);
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+
+        // A command entry closes the palette just as surely, and leaves the
+        // focus where it was found.
+        let mut app = chat_open();
+        app.update(Action::Key(app.state().bindings.palette));
+        for c in "Quit".chars() {
+            app.update(Action::Key(Key::Char(c)));
+        }
+        let effects = app.update(Action::Key(Key::Enter));
+        assert_eq!(describe(&effects), ["Quit"]);
+        assert!(app.state().palette.is_none());
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
     }
 
     #[test]
@@ -1781,6 +2008,225 @@ mod routing {
         }));
 
         assert!(app.state().media.uploads.is_empty());
+    }
+
+    /// `/` is two different keys depending on where it lands (spec §11):
+    /// the sidebar's filter, or in-chat message search from the message
+    /// list. In the composer it is neither — it is a slash.
+    #[test]
+    fn slash_in_message_list_opens_search_but_in_chat_list_opens_filter() {
+        // Chat list: the filter level, T15's.
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Tab));
+        app.update(Action::Key(Key::Char('/')));
+        assert_eq!(*app.state().focus.current(), Focus::ChatFilter);
+        assert!(app.state().chat_search.is_none());
+
+        // Composer: a literal character, because `/send <path>` starts with
+        // exactly this key on exactly this empty input.
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Char('/')));
+        assert_eq!(app.state().composer.input.text, "/");
+        assert!(app.state().chat_search.is_none());
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+
+        // Message list (selection mode): in-chat search. The selection is
+        // left behind rather than kept under the overlay.
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Up));
+        assert_eq!(selected_message(&app), Some(NEWEST));
+
+        app.update(Action::Key(Key::Char('/')));
+        assert_eq!(*app.state().focus.current(), Focus::ChatSearch);
+        assert!(app.state().chat_search.is_some());
+        assert!(selected_message(&app).is_none());
+
+        // The query box takes the typing, and `⏎` fires the search.
+        for c in "pr".chars() {
+            app.update(Action::Key(Key::Char(c)));
+        }
+        assert_eq!(app.state().chat_search.as_ref().unwrap().input.text, "pr");
+        assert_eq!(
+            describe(&app.update(Action::Key(Key::Enter))),
+            ["Td(SearchChatMessages)", "Telemetry(search.run)"]
+        );
+
+        // `Esc` pops search and takes its hits with it (T42's `close`).
+        app.update(Action::TdResult(TdResult::SearchDone {
+            chat_id: CHAT,
+            outcome: Ok(vec![MessageId(10)]),
+        }));
+        assert!(!app.state().conversations[&CHAT].search_hits.is_empty());
+
+        app.update(Action::Key(Key::Esc));
+        assert!(app.state().chat_search.is_none());
+        assert!(app.state().conversations[&CHAT].search_hits.is_empty());
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert_eq!(app.state().focus.depth(), 1);
+    }
+
+    /// The `searchChatMessages` answer reaches T42's state, which stores the
+    /// hits and drags the anchor to the first one.
+    #[test]
+    fn search_done_routes_to_search_state() {
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Up));
+        app.update(Action::Key(Key::Char('/')));
+        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Enter));
+        assert!(app.state().chat_search.as_ref().unwrap().in_flight);
+        app.take_dirty();
+
+        let effects = app.update(Action::TdResult(TdResult::SearchDone {
+            chat_id: CHAT,
+            outcome: Ok(vec![MessageId(11), MessageId(10)]),
+        }));
+        assert!(effects.is_empty());
+        assert!(app.take_dirty());
+
+        assert!(!app.state().chat_search.as_ref().unwrap().in_flight);
+        assert_eq!(
+            app.state().conversations[&CHAT].search_hits,
+            vec![MessageId(11), MessageId(10)]
+        );
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(11),
+                line_offset: 0,
+            }
+        );
+
+        // `n` steps to the next hit through the same focus level.
+        app.update(Action::Key(Key::Char('n')));
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(10),
+                line_offset: 0,
+            }
+        );
+    }
+
+    /// Spec §6.4: a message arriving somewhere the user is not looking
+    /// raises a toast and one terminal alert; the focused chat and a muted
+    /// one raise neither.
+    #[test]
+    fn new_message_in_unfocused_chat_emits_alert_and_toast() {
+        let mut app = chat_open();
+        app.update(Action::Td(chat(2, "Bob", 20)));
+        app.update(Action::Td(chat(3, "Muted Group", 5)));
+        app.update(Action::Td(TdUpdate::ChatNotificationSettings {
+            chat_id: ChatId(3),
+            muted: true,
+        }));
+
+        // The open chat: the user is already looking at it.
+        let effects = app.update(Action::Td(TdUpdate::NewMessage(message(1, 12))));
+        assert!(effects.is_empty(), "focused chat is silent: {effects:?}");
+        assert!(app.state().toasts.toasts.is_empty());
+
+        // Another chat: one alert, one toast, titled by the sidebar.
+        let effects = app.update(Action::Td(TdUpdate::NewMessage(message(2, 13))));
+        assert_eq!(describe(&effects), ["Alert"]);
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+        assert_eq!(app.state().toasts.toasts[0].title, "Bob");
+        assert_eq!(app.state().toasts.toasts[0].body, "message 13");
+
+        // A muted chat: the badge still moves, the toast never appears.
+        let effects = app.update(Action::Td(TdUpdate::NewMessage(message(3, 14))));
+        assert!(effects.is_empty(), "muted chat is silent: {effects:?}");
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+
+        // Suppression is about the alert, not about the message: the silent
+        // one still reached the window it belongs to.
+        assert!(
+            app.state().conversations[&CHAT]
+                .messages
+                .iter()
+                .any(|m| m.id == MessageId(12))
+        );
+
+        // And the toast leaves on its own once its TTL is up.
+        app.update(Action::Tick {
+            now: Millis(crate::state::toasts::TOAST_TTL_MS + 1),
+        });
+        assert!(app.state().toasts.toasts.is_empty());
+        assert!(app.take_dirty());
+    }
+
+    /// `Esc` peels the newest toast before it touches the focus stack, and
+    /// only the newest: one press, one toast.
+    #[test]
+    fn esc_dismisses_toast_before_popping_focus() {
+        let mut app = chat_open();
+        app.update(Action::Td(chat(2, "Bob", 20)));
+        app.update(Action::Td(chat(3, "Cid", 15)));
+        app.update(Action::Td(TdUpdate::NewMessage(message(2, 13))));
+        app.update(Action::Td(TdUpdate::NewMessage(message(3, 14))));
+        assert_eq!(app.state().toasts.toasts.len(), 2);
+
+        // Selection mode is up, so there is a level to pop as well — and it
+        // survives both dismissals.
+        app.update(Action::Key(Key::Up));
+        assert_eq!(app.state().focus.depth(), 2);
+
+        app.update(Action::Key(Key::Esc));
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+        assert_eq!(app.state().toasts.toasts[0].title, "Bob");
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+
+        app.update(Action::Key(Key::Esc));
+        assert!(app.state().toasts.toasts.is_empty());
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+
+        // With the stack clear, `Esc` goes back to being the focus key.
+        app.update(Action::Key(Key::Esc));
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+    }
+
+    /// T43's archive pseudo-mode: `Esc` on the chat list backs out of the
+    /// archive into `Main` before the generic pop rule applies.
+    #[test]
+    fn archive_esc_returns_to_main_list() {
+        use crate::model::chat::{ChatListId, ChatPositionEntry};
+
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Td(chat(2, "Old thread", 20)));
+        // Move chat 2 out of Main and into the archive, TDLib's way.
+        for position in [
+            ChatPositionEntry {
+                list: ChatListId::Main,
+                order: 0,
+                is_pinned: false,
+            },
+            ChatPositionEntry {
+                list: ChatListId::Archive,
+                order: 7,
+                is_pinned: false,
+            },
+        ] {
+            app.update(Action::Td(TdUpdate::ChatPosition {
+                chat_id: ChatId(2),
+                position,
+            }));
+        }
+
+        app.update(Action::Key(Key::Char('a')));
+        assert_eq!(app.state().chat_list.active_list, ChatListId::Archive);
+        assert_eq!(visible_rows(&app.state().chat_list), vec![ChatId(2)]);
+
+        app.update(Action::Key(Key::Esc));
+        assert_eq!(app.state().chat_list.active_list, ChatListId::Main);
+        assert_eq!(visible_rows(&app.state().chat_list), vec![ChatId(1)]);
+        // One level: the chat list is still the focus, still at the base.
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert_eq!(app.state().focus.depth(), 1);
+
+        // Outside the archive the same key is the ordinary chat-list `Esc`
+        // again — nothing to back out of, so it is unclaimed at the base.
+        assert!(app.dispatch_key(Key::Esc).is_none());
     }
 
     #[test]
