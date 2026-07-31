@@ -335,11 +335,44 @@ fn resource(session: &SessionContext) -> Resource {
     if let Some(term) = &session.term_program {
         attributes.push(KeyValue::new(keys::TERM_PROGRAM, term.clone()));
     }
+    if let Some(os) = os_version() {
+        attributes.push(KeyValue::new(keys::OS_VERSION, os));
+    }
 
     Resource::builder_empty()
         .with_service_name(APP_DIR)
         .with_attributes(attributes)
         .build()
+}
+
+/// The macOS product version — `"15.3.1"` — which is what OTel semantic
+/// conventions mean by `os.version`, and what `keys::OS_VERSION` has been
+/// reserving a slot for since T03. Spec §2 makes macOS the only supported
+/// platform, so `sw_vers` is the authoritative source; `std::env::consts::OS`
+/// would only ever answer `"macos"`, which is an OS *name*, not a version.
+///
+/// It is a subprocess, so it is called from [`resource`] and nowhere else:
+/// a session with telemetry off never spawns it, and a session with
+/// telemetry on spawns it once, before raw mode. The absolute path avoids
+/// `$PATH`.
+///
+/// The output is checked to be a dotted number before it is used. The point
+/// of an allowlist is that every exported value has a known shape as well as
+/// a known key, so a machine whose `sw_vers` answers something unexpected
+/// contributes no attribute at all rather than an unbounded string.
+fn os_version() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    let plausible = !version.is_empty()
+        && version.len() <= 16
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+    plausible.then_some(version)
 }
 
 /// OTLP/HTTP wants the signal path on the endpoint; a configured endpoint
@@ -806,5 +839,47 @@ mod tests {
     #[test]
     fn session_ids_differ_between_runs() {
         assert_ne!(new_session_id(), new_session_id());
+    }
+
+    /// The record-level allowlist is `emit!`'s to keep (its fields are the
+    /// schema's, spelled out in the macro). The resource is this module's,
+    /// and it is assembled from a `SessionContext` plus two values read here
+    /// — so it is the half that can drift. `tests/telemetry_allowlist.rs`
+    /// proves the same property over the wire for a whole session; this is
+    /// the unit-level version that says which key is wrong when it breaks.
+    #[test]
+    fn resource_carries_only_allowlisted_keys_plus_service_name() {
+        use tgt_core::telemetry::schema::ALLOWED_KEYS;
+
+        let resource = resource(&SessionContext {
+            install_id: "0123456789abcdef".to_string(),
+            session_id: "fedcba98".to_string(),
+            term_program: Some("iTerm.app".to_string()),
+            graphics_protocol: "iterm2",
+            width_bucket: "120-160",
+        });
+
+        for (key, _) in resource.iter() {
+            let key = key.as_str();
+            assert!(
+                // `service.name` is the one deliberate exception: OTLP has
+                // no way to route a signal without it (spec §13.4's list is
+                // about what the *app* says, not about the envelope).
+                key == "service.name" || ALLOWED_KEYS.contains(&key),
+                "the resource carries {key:?}, which is not in the allowlist"
+            );
+        }
+
+        // Spec §2 makes macOS the only supported platform, so `sw_vers` is
+        // always there and the attribute is never the absent branch.
+        let os = resource
+            .get(&opentelemetry::Key::from_static_str(keys::OS_VERSION))
+            .expect("os.version is attached");
+        assert!(
+            os.as_str()
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
+            "os.version should be a dotted number, got {os:?}"
+        );
     }
 }

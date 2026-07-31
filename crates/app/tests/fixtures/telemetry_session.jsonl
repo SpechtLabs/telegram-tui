@@ -1,0 +1,22 @@
+{"Emit":{"Auth":"WaitTdlibParameters"}}
+{"Await":{"expect":{"Kind":"SetTdlibParameters"},"respond":{"Ok":"Ok"}}}
+{"Emit":{"Auth":"WaitPhoneNumber"}}
+{"Await":{"expect":{"Kind":"SetAuthenticationPhoneNumber"},"respond":{"Ok":"Ok"}}}
+{"Emit":{"Auth":{"WaitCode":{"delivery_hint":"SMS to +4***78","length":5}}}}
+{"Await":{"expect":{"Kind":"CheckAuthenticationCode"},"respond":{"Ok":"Ok"}}}
+{"Emit":{"Auth":"Ready"}}
+{"Emit":{"Connection":"Ready"}}
+{"Await":{"expect":{"Kind":"LoadChats"},"respond":{"Ok":"Ok"}}}
+{"Emit":{"NewChat":{"id":4242424242,"kind":"Private","title":"Ada Lovelace","positions":[{"list":"Main","order":300,"is_pinned":false}],"unread_count":0,"unread_mention_count":0,"last_message":null,"is_muted":false}}}
+{"Emit":{"NewChat":{"id":-1001234567890,"kind":"Supergroup","title":"Berlin Standup","positions":[{"list":"Main","order":200,"is_pinned":false}],"unread_count":0,"unread_mention_count":0,"last_message":null,"is_muted":false}}}
+{"Await":{"expect":{"Kind":"GetChatHistory"},"respond":{"Ok":{"Messages":{"messages":[{"id":101,"chat_id":4242424242,"sender":{"User":42},"sender_name":"Ada","is_outgoing":false,"date":1700006060,"content":{"Text":{"text":"quarterly budget review","entities":[]}},"reply_to":null,"send_state":"Sent","reactions":[],"caps":{"can_be_edited":false,"can_be_deleted_for_all_users":false,"can_be_deleted_only_for_self":false,"can_be_forwarded":false,"can_be_saved":false},"is_edited":false},{"id":102,"chat_id":4242424242,"sender":{"User":42},"sender_name":"Ada","is_outgoing":false,"date":1700006120,"content":{"Text":{"text":"ship it on friday","entities":[]}},"reply_to":null,"send_state":"Sent","reactions":[],"caps":{"can_be_edited":false,"can_be_deleted_for_all_users":false,"can_be_deleted_only_for_self":false,"can_be_forwarded":false,"can_be_saved":false},"is_edited":false},{"id":103,"chat_id":4242424242,"sender":{"User":42},"sender_name":"Ada","is_outgoing":false,"date":1700006180,"content":{"Document":{"file_id":77,"file_name":"secret-plans.pdf","size":3500000,"caption":{"text":"","entities":[]}}},"reply_to":null,"send_state":"Sent","reactions":[],"caps":{"can_be_edited":false,"can_be_deleted_for_all_users":false,"can_be_deleted_only_for_self":false,"can_be_forwarded":false,"can_be_saved":false},"is_edited":false}]}}}}}
+{"Await":{"expect":{"Kind":"GetMessageProperties"},"respond":{"Ok":{"MessageProperties":{"can_be_edited":true,"can_be_deleted_for_all_users":true,"can_be_deleted_only_for_self":true,"can_be_forwarded":true,"can_be_saved":true}}}}}
+{"Await":{"expect":{"Kind":"DownloadFile"},"respond":{"Ok":{"File":{"id":77,"expected_size":3500000,"downloaded_size":0,"is_downloading":true,"is_completed":false,"local_path":null}}}}}
+{"Await":{"expect":{"Kind":"ToggleReaction"},"respond":{"Ok":"Ok"}}}
+{"Await":{"expect":{"Kind":"DeleteMessages"},"respond":{"Ok":"Ok"}}}
+{"Await":{"expect":{"Kind":"SendMessageText"},"respond":{"Ok":{"Message":{"id":9001,"chat_id":4242424242,"sender":{"User":7},"sender_name":"Me","is_outgoing":true,"date":1700100000,"content":{"Text":{"text":"shipping tonight","entities":[]}},"reply_to":null,"send_state":"Sending","reactions":[],"caps":{"can_be_edited":false,"can_be_deleted_for_all_users":false,"can_be_deleted_only_for_self":false,"can_be_forwarded":false,"can_be_saved":false},"is_edited":false}}}}}
+{"Await":{"expect":{"Kind":"SendMessageText"},"respond":{"Ok":{"Message":{"id":9002,"chat_id":4242424242,"sender":{"User":7},"sender_name":"Me","is_outgoing":true,"date":1700100000,"content":{"Text":{"text":"acknowledged-42","entities":[]}},"reply_to":null,"send_state":"Sending","reactions":[],"caps":{"can_be_edited":false,"can_be_deleted_for_all_users":false,"can_be_deleted_only_for_self":false,"can_be_forwarded":false,"can_be_saved":false},"is_edited":false}}}}}
+{"Await":{"expect":{"Kind":"GetMessageProperties"},"respond":{"Ok":{"MessageProperties":{"can_be_edited":true,"can_be_deleted_for_all_users":true,"can_be_deleted_only_for_self":true,"can_be_forwarded":true,"can_be_saved":true}}}}}
+{"Await":{"expect":{"Kind":"EditMessageText"},"respond":{"Ok":"Ok"}}}
+{"Await":{"expect":{"Kind":"GetMessageProperties"},"respond":{"Ok":{"MessageProperties":{"can_be_edited":true,"can_be_deleted_for_all_users":true,"can_be_deleted_only_for_self":true,"can_be_forwarded":true,"can_be_saved":true}}}}}
+{"Await":{"expect":{"Kind":"SearchChatMessages"},"respond":{"Ok":{"FoundMessages":{"message_ids":[101]}}}}}
