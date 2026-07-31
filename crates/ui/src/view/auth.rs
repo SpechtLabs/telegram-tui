@@ -200,7 +200,10 @@ fn in_flight_marker(auth: &AuthState) -> &'static str {
 }
 
 fn draw_credentials(area: Rect, auth: &AuthState, theme: &Theme, f: &mut Frame) {
-    let inner = panel(area, theme, f, 70, 14, "Connect to Telegram");
+    // 16 = the 14 interior rows the layout below needs, plus the panel's two
+    // border rows (`panel` takes the OUTER height — getting this wrong
+    // squeezes the first input box into its title line).
+    let inner = panel(area, theme, f, 70, 16, "Connect to Telegram");
 
     let [
         explain_area,
@@ -724,6 +727,25 @@ mod tests {
         assert!(rendered.contains("my.telegram.org"));
         assert!(rendered.contains("API id"));
         assert!(rendered.contains("API hash"));
+    }
+
+    /// Regression for the field-manned live bug where the panel height was
+    /// given as interior-rows rather than outer-rows, squeezing the API id
+    /// input to just its title line: typed text was invisible. The snapshot
+    /// pins BOTH input boxes at full 3-row height with the typed content
+    /// and cursor rendered.
+    #[test]
+    fn credentials_wizard_input_boxes_render_typed_text_100x30() {
+        let mut state = fixture_state();
+        state.auth.active_field = AuthField::ApiId;
+        state.auth.api_id.text = "1234567".to_string();
+        state.auth.api_id.cursor = state.auth.api_id.text.len();
+        let rendered = render_to_string(100, 30, &state);
+        assert!(
+            rendered.contains("1234567"),
+            "typed API id must be visible:\n{rendered}"
+        );
+        insta::assert_snapshot!(rendered);
     }
 
     #[test]
