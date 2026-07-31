@@ -255,6 +255,7 @@ fn chat_list_from(
         filter: None,
         scroll_offset: 0,
         load: ChatLoadPhase::Complete,
+        folder_titles: HashMap::new(),
     }
 }
 

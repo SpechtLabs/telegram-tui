@@ -72,12 +72,14 @@
 //!
 //! 1. An "esc/a  back" hint, only while `active_list == Archive` (the section
 //!    label also becomes `ARCHIVE` in that state).
-//! 2. A folder tab strip (`Main · Folder 1 · Folder 2`, active one in
-//!    accent), only when `folder_cycle` has more than just `Main` and the
-//!    list isn't the archive. There is no folder *name* anywhere in the
-//!    model (`ChatListId::Folder` is a bare `i32`), so tabs are labelled by
-//!    id; a future task that projects `ChatFolderInfo` titles can replace
-//!    `folder_label` without touching layout.
+//! 2. A folder tab strip (`Main · Work · News`, active one in accent), only
+//!    when `folder_cycle` has more than just `Main` and the list isn't the
+//!    archive. `folder_label` (task #60) names each tab from
+//!    `ChatListState.folder_titles` — TDLib's `updateChatFolders`, projected
+//!    by `chat_list::handle_td` — truncated to a fixed display-column budget
+//!    since a title can carry emoji; an id nobody has named yet (or that
+//!    means nothing at all) falls back to `Folder {n}` rather than an empty
+//!    tab.
 //! 3. The existing `/` filter input line (T15/T22), unchanged.
 //!
 //! Below those, the row list itself is `visible_rows` (already pinned-first,
@@ -119,6 +121,8 @@
 //! pinned chats end" — and a blank line can't carry the same meaning inside
 //! a list of otherwise-identical rows the way it can between chrome and
 //! content. It's the one place in this view a rule still earns its keep.
+
+use std::collections::HashMap;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -187,7 +191,15 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
         next += 1;
     }
     if show_folder_tabs {
-        draw_folder_tabs(areas[next], &folders, list.active_list, theme, f, hits);
+        draw_folder_tabs(
+            areas[next],
+            &folders,
+            list.active_list,
+            &list.folder_titles,
+            theme,
+            f,
+            hits,
+        );
         next += 1;
     }
     if let Some(filter) = &list.filter {
@@ -414,6 +426,7 @@ fn draw_folder_tabs(
     area: Rect,
     folders: &[ChatListId],
     active: ChatListId,
+    folder_titles: &HashMap<i32, String>,
     theme: &Theme,
     f: &mut Frame,
     hits: &mut HitMap,
@@ -432,7 +445,7 @@ fn draw_folder_tabs(
         } else {
             Style::new().fg(theme.text_muted)
         };
-        let label = folder_label(*id);
+        let label = folder_label(*id, folder_titles);
         let label_width = label.width() as u16;
         // A strip wider than the pane is clipped by the `Paragraph`, so the
         // regions are clipped the same way: no tab is clickable past the
@@ -453,12 +466,24 @@ fn draw_folder_tabs(
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// See the module docs: there is no folder title anywhere in the model yet,
-/// so folders are labelled by id.
-fn folder_label(id: ChatListId) -> String {
+/// TDLib's real folder title (task #60) when `folder_titles` has heard
+/// `updateChatFolders` name this id; the bare id otherwise — an id nobody
+/// has named yet (the update hasn't landed) or not at all (a stale key
+/// somehow surviving a delete, which `chat_list::handle_td`'s wholesale
+/// replace should already prevent) degrades the tab label instead of
+/// vanishing it or panicking. Truncated to `FOLDER_TITLE_MAX_WIDTH` display
+/// columns via `truncate_to_width`: TDLib caps a folder name at 12
+/// characters server-side, but that bounds the input, not what a future
+/// server or TDLib version might actually send, and column count is not
+/// character count once custom emoji are involved.
+fn folder_label(id: ChatListId, folder_titles: &HashMap<i32, String>) -> String {
+    const FOLDER_TITLE_MAX_WIDTH: usize = 16;
     match id {
         ChatListId::Main => "Main".to_string(),
-        ChatListId::Folder(n) => format!("Folder {n}"),
+        ChatListId::Folder(n) => folder_titles
+            .get(&n)
+            .map(|title| truncate_to_width(title, FOLDER_TITLE_MAX_WIDTH))
+            .unwrap_or_else(|| format!("Folder {n}")),
         // `folder_cycle` never yields this; kept exhaustive rather than
         // `unreachable!()` so a future change to that invariant degrades
         // instead of panicking mid-render.
@@ -743,6 +768,7 @@ mod tests {
             filter: None,
             scroll_offset: 0,
             load: ChatLoadPhase::Complete,
+            folder_titles: HashMap::new(),
         }
     }
 
@@ -925,6 +951,7 @@ mod tests {
             filter: None,
             scroll_offset: 0,
             load: ChatLoadPhase::Complete,
+            folder_titles: HashMap::new(),
         }
     }
 
@@ -1126,5 +1153,61 @@ mod tests {
         assert_eq!(truncate_to_width("hello world", 6), "hello…");
         assert_eq!(truncate_to_width("hello", 0), "");
         assert_eq!(truncate_to_width("hello", 1), "…");
+    }
+
+    #[test]
+    fn folder_label_uses_the_real_title_when_known() {
+        let titles = HashMap::from([(1, "Work".to_string())]);
+        assert_eq!(folder_label(ChatListId::Folder(1), &titles), "Work");
+    }
+
+    /// The bug this task fixes: an id `updateChatFolders` has not (yet)
+    /// named — because it hasn't landed, or the id means nothing at all —
+    /// must still produce a usable tab label rather than an empty one or a
+    /// panic.
+    #[test]
+    fn folder_label_falls_back_to_the_bare_id_when_unknown() {
+        let titles = HashMap::new();
+        assert_eq!(folder_label(ChatListId::Folder(50), &titles), "Folder 50");
+    }
+
+    /// Emoji cost more than one display column each — `.len()` (bytes) or
+    /// even `.chars().count()` would both undercount this and let a title
+    /// overrun its budget.
+    #[test]
+    fn folder_label_truncates_long_titles_by_display_width_not_length() {
+        let long = "🎉".repeat(20); // 20 * 2 display columns, 80 bytes.
+        let titles = HashMap::from([(1, long)]);
+        let label = folder_label(ChatListId::Folder(1), &titles);
+        assert!(
+            label.width() <= 16,
+            "expected the label clipped to the display-width budget: {label:?} (width {})",
+            label.width()
+        );
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn sidebar_folder_tabs_render_real_titles_once_named() {
+        let mut list = sidebar_organization_chat_list();
+        list.folder_titles = HashMap::from([(1, "Work".to_string()), (2, "🏠 Home".to_string())]);
+        let state = fixture_state(list);
+        let rendered = render_to_string(120, 40, &state);
+        assert!(
+            rendered.contains("Main"),
+            "expected the tab strip on screen:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Work"),
+            "expected folder 1's real title in the tab strip:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Home"),
+            "expected folder 2's real title in the tab strip:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Folder 1") && !rendered.contains("Folder 2"),
+            "the id fallback must not show once a title is known:\n{rendered}"
+        );
     }
 }

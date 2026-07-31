@@ -416,6 +416,15 @@ pub enum ChatListId {
     Folder(i32),
 }
 
+/// A `ChatFolderInfo`'s title, keyed by the same id `ChatListId::Folder`
+/// names (task #60). Icon, color and sharing flags are TDLib fields this
+/// client doesn't render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderInfo {
+    pub id: i32,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatPositionEntry {
     pub list: ChatListId,
@@ -978,6 +987,13 @@ pub struct ChatListState {
     pub filter: Option<InputField>,
     pub scroll_offset: usize,
     pub load: ChatLoadPhase,
+    /// `ChatListId::Folder`'s id -> title, from `updateChatFolders` (task
+    /// #60). Replaced wholesale on every update — TDLib always sends the
+    /// complete set, never a delta — so a rename or a deletion can't leave a
+    /// stale entry. An id with no entry (not yet named, or genuinely
+    /// unknown) is not an error: `view::chat_list`'s `folder_label` falls
+    /// back to the bare id.
+    pub folder_titles: HashMap<i32, String>,
 }
 
 impl Default for ChatListId {
@@ -1382,7 +1398,7 @@ pub enum TdResponse {
 ```rust
 // core/src/td/update.rs
 use serde::{Deserialize, Serialize};
-use crate::model::chat::{ChatPositionEntry, ChatView, MessagePreview};
+use crate::model::chat::{ChatPositionEntry, ChatView, FolderInfo, MessagePreview};
 use crate::model::ids::{ChatId, MessageId, UserId};
 use crate::model::message::{FileSnapshot, MessageContent, MessageView, ReactionView};
 use crate::td::error::TdError;
@@ -1432,6 +1448,10 @@ pub enum TdUpdate {
     File(FileSnapshot),
     UserStatus { user_id: UserId, status: PresenceStatus },
     ChatAction { chat_id: ChatId, user_id: UserId, is_typing: bool },
+    /// `updateChatFolders`: the complete current set, every time (task
+    /// #60) — never a delta, so `chat_list::handle_td` replaces rather
+    /// than merges.
+    ChatFolders(Vec<FolderInfo>),
 }
 ```
 

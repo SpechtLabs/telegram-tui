@@ -1,6 +1,6 @@
 //! TDLib update projections. See docs/architecture.md §4.7.
 
-use crate::model::chat::{ChatPositionEntry, ChatView, MessagePreview};
+use crate::model::chat::{ChatPositionEntry, ChatView, FolderInfo, MessagePreview};
 use crate::model::ids::{ChatId, MessageId, UserId};
 use crate::model::message::{FileSnapshot, MessageContent, MessageView, ReactionView};
 use crate::td::error::TdError;
@@ -119,6 +119,10 @@ pub enum TdUpdate {
         user_id: UserId,
         is_typing: bool,
     },
+    /// TDLib's `updateChatFolders`: the *complete* current set, every time
+    /// (task #60) — never a delta, so the handler replaces rather than
+    /// merges.
+    ChatFolders(Vec<FolderInfo>),
 }
 
 #[cfg(test)]
@@ -180,6 +184,23 @@ mod tests {
             last_message: None,
             is_muted: false,
         });
+        let json = serde_json::to_string(&update).unwrap();
+        let back: TdUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(update, back);
+    }
+
+    #[test]
+    fn chat_folders_serde_round_trips() {
+        let update = TdUpdate::ChatFolders(vec![
+            FolderInfo {
+                id: 1,
+                title: "Work".to_string(),
+            },
+            FolderInfo {
+                id: 2,
+                title: "🏠 Home".to_string(),
+            },
+        ]);
         let json = serde_json::to_string(&update).unwrap();
         let back: TdUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(update, back);

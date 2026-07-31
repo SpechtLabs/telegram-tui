@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use tdlib_rs::{enums as td_enums, functions, types as td_types};
 use tokio::sync::mpsc;
 
-use tgt_core::model::chat::{ChatKind, ChatListId, ChatPositionEntry, ChatView, MessagePreview};
+use tgt_core::model::chat::{
+    ChatKind, ChatListId, ChatPositionEntry, ChatView, FolderInfo, MessagePreview,
+};
 use tgt_core::model::entity::{EntityKind, FormattedText, TextEntity};
 use tgt_core::model::ids::{ChatId, FileId, MessageId, UserId};
 use tgt_core::model::message::{
@@ -845,6 +847,23 @@ fn map_update(names: &NameCache, update: td_enums::Update) -> Option<TdUpdate> {
             chat_id: ChatId(u.chat_id),
             muted: is_muted(&u.notification_settings),
         }),
+        // The complete current folder set, every time (task #60): a rename
+        // or a deletion re-sends the whole list rather than a delta, which
+        // is exactly why `chat_list::handle_td`'s arm replaces wholesale
+        // instead of merging. `ChatFolderInfo.name` is a `ChatFolderName`
+        // (`FormattedText` + an animate-custom-emoji flag, per TDLib's
+        // 1-12-character limit on folder names) — `.text.text` is the
+        // plain string a sidebar tab needs; entities and the animation flag
+        // have nothing to render here.
+        td_enums::Update::ChatFolders(u) => Some(TdUpdate::ChatFolders(
+            u.chat_folders
+                .into_iter()
+                .map(|f| FolderInfo {
+                    id: f.id,
+                    title: f.name.text.text,
+                })
+                .collect(),
+        )),
 
         td_enums::Update::NewMessage(u) => {
             Some(TdUpdate::NewMessage(map_message_with(names, u.message).0))
@@ -1987,6 +2006,60 @@ mod tests {
         for list in [ChatListId::Main, ChatListId::Archive, ChatListId::Folder(7)] {
             assert_eq!(map_chat_list(&to_td_chat_list(list)), list);
         }
+    }
+
+    /// The field this task exists for: TDLib nests a folder's plain title
+    /// three levels deep (`ChatFolderInfo.name: ChatFolderName` wrapping a
+    /// `FormattedText`), and `map_update` has to pull `.text.text` out of
+    /// that without losing or misattributing an id.
+    #[test]
+    fn chat_folders_maps_id_and_plain_title() {
+        let update = td_enums::Update::ChatFolders(td_types::UpdateChatFolders {
+            chat_folders: vec![
+                td_types::ChatFolderInfo {
+                    id: 1,
+                    name: td_types::ChatFolderName {
+                        text: td_types::FormattedText {
+                            text: "Work".to_string(),
+                            entities: Vec::new(),
+                        },
+                        animate_custom_emoji: false,
+                    },
+                    ..Default::default()
+                },
+                td_types::ChatFolderInfo {
+                    id: 2,
+                    name: td_types::ChatFolderName {
+                        text: td_types::FormattedText {
+                            text: "🏠 Home".to_string(),
+                            entities: Vec::new(),
+                        },
+                        animate_custom_emoji: false,
+                    },
+                    ..Default::default()
+                },
+            ],
+            main_chat_list_position: 0,
+            are_tags_enabled: false,
+        });
+
+        let mapped = map_update(&NameCache::default(), update);
+        let Some(TdUpdate::ChatFolders(folders)) = mapped else {
+            panic!("expected TdUpdate::ChatFolders, got {mapped:?}");
+        };
+        assert_eq!(
+            folders,
+            vec![
+                FolderInfo {
+                    id: 1,
+                    title: "Work".to_string(),
+                },
+                FolderInfo {
+                    id: 2,
+                    title: "🏠 Home".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

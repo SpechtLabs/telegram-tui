@@ -30,6 +30,18 @@ pub enum ChatListId {
     Folder(i32),
 }
 
+/// A `ChatFolderInfo`'s title, keyed by the same `i32` a chat's
+/// `ChatListId::Folder` names (task #60). TDLib's `updateChatFolders`
+/// delivers the *complete* current set of folders on every call — a rename,
+/// a deletion, the first sync — so this carries only what a v1 sidebar tab
+/// needs; icon, color and sharing flags are TDLib fields this client
+/// doesn't render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderInfo {
+    pub id: i32,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatPositionEntry {
     pub list: ChatListId,

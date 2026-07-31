@@ -73,6 +73,12 @@ pub struct ChatListState {
     /// that half of "keep the selection visible" is the view's job.
     pub scroll_offset: usize,
     pub load: ChatLoadPhase,
+    /// `ChatListId::Folder`'s id -> the folder's title, from TDLib's
+    /// `updateChatFolders` (task #60). Absent until that update lands at
+    /// least once, or for an id TDLib has never named — `view::chat_list`'s
+    /// `folder_label` falls back to the bare id either way, so an unknown
+    /// title degrades the tab label rather than breaking the cycle.
+    pub folder_titles: HashMap<i32, String>,
 }
 
 // ChatListId is a foreign type (owned by T02's model/chat.rs, not touched
@@ -141,6 +147,14 @@ pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
             if let Some(chat) = app.chat_list.chats.get_mut(chat_id) {
                 chat.is_muted = *muted;
             }
+        }
+        // TDLib sends the *complete* set every time (module docs on
+        // `TdUpdate::ChatFolders`), so this replaces wholesale rather than
+        // merging — a rename or a deletion must not leave a stale title
+        // behind for a `Folder(id)` that no longer exists or means
+        // something else now.
+        TdUpdate::ChatFolders(folders) => {
+            app.chat_list.folder_titles = folders.iter().map(|f| (f.id, f.title.clone())).collect();
         }
         // ChatReadOutbox is T16's (read-receipt marker on the conversation);
         // everything else (messages, files, presence, auth, connection) is
@@ -599,7 +613,7 @@ mod tests {
     use super::*;
     use crate::app::Screen;
     use crate::effect::TelemetryMode;
-    use crate::model::chat::ChatKind;
+    use crate::model::chat::{ChatKind, FolderInfo};
     use crate::model::time::Millis;
     use crate::state::auth::{AuthField, AuthState};
     use crate::state::composer::ComposerState;
@@ -998,6 +1012,63 @@ mod tests {
         );
 
         assert_eq!(app.chat_list.chats.get(&ChatId(1)).unwrap().unread_count, 0);
+    }
+
+    /// TDLib sends the *complete* set on every `updateChatFolders`, never a
+    /// delta: a second update that renames one folder and drops another
+    /// must leave neither a stale name nor a phantom entry behind.
+    #[test]
+    fn chat_folders_replaces_the_whole_title_set() {
+        let mut app = fixture_state();
+        handle_td(
+            &mut app,
+            &TdUpdate::ChatFolders(vec![
+                FolderInfo {
+                    id: 1,
+                    title: "Work".to_string(),
+                },
+                FolderInfo {
+                    id: 2,
+                    title: "News".to_string(),
+                },
+            ]),
+        );
+        assert_eq!(
+            app.chat_list.folder_titles.get(&1).map(String::as_str),
+            Some("Work")
+        );
+        assert_eq!(
+            app.chat_list.folder_titles.get(&2).map(String::as_str),
+            Some("News")
+        );
+
+        // Folder 1 renamed, folder 2 deleted, folder 3 created.
+        handle_td(
+            &mut app,
+            &TdUpdate::ChatFolders(vec![
+                FolderInfo {
+                    id: 1,
+                    title: "Office".to_string(),
+                },
+                FolderInfo {
+                    id: 3,
+                    title: "Family".to_string(),
+                },
+            ]),
+        );
+        assert_eq!(
+            app.chat_list.folder_titles.get(&1).map(String::as_str),
+            Some("Office"),
+            "a rename must not leave the old title behind"
+        );
+        assert!(
+            !app.chat_list.folder_titles.contains_key(&2),
+            "a deleted folder must not leave a stale name behind"
+        );
+        assert_eq!(
+            app.chat_list.folder_titles.get(&3).map(String::as_str),
+            Some("Family")
+        );
     }
 
     #[test]

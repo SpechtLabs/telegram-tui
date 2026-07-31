@@ -1283,7 +1283,11 @@ impl App {
             | TdUpdate::ChatLastMessage { .. }
             | TdUpdate::ChatTitle { .. }
             | TdUpdate::ChatUnreadMentionCount { .. }
-            | TdUpdate::ChatNotificationSettings { .. } => {
+            | TdUpdate::ChatNotificationSettings { .. }
+            // The folder tab strip's titles (task #60) — sidebar-only in
+            // exactly the same sense: nothing outside `chat_list` reads a
+            // folder's name.
+            | TdUpdate::ChatFolders(_) => {
                 self.dirty = true;
                 chat_list::handle_td(&mut self.state, update)
             }
