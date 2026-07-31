@@ -1,0 +1,28 @@
+---
+source: crates/ui/src/view/palette.rs
+expression: rendered
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                    ┌──────────────────────── palette ─────────────────────────┐                    
+                    │›                                                         │                    
+                    │──────────────────────────────────────────────────────────│                    
+                    │▸ Bob                                                     │                    
+                    │  Alice                                                   │                    
+                    │  Toggle theme                                         cmd│                    
+                    │  Telemetry settings                                   cmd│                    
+                    │  Send file                                            cmd│                    
+                    │  Log out                                              cmd│                    
+                    │  Quit                                                 cmd│                    
+                    │                                                          │                    
+                    │                                                          │                    
+                    │                                                          │                    
+                    │                                                          │                    
+                    │                                                          │                    
+                    │                                                          │                    
+                    │                                                          │                    
+                    └──────────────────────────────────────────────────────────┘
