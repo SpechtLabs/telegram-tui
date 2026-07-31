@@ -7,10 +7,11 @@
 //! terminal itself; it receives the result of this probe as plain data
 //! (see that module's docs for the boundary rationale).
 //!
-//! `main` runs the probe once at startup and logs the result. Handing it to
-//! the draw path is what turns it into actual pixels, and that is still
-//! open: see the `T55/polish` note in `tgt_ui::view::conversation`, which
-//! renders every photo as the T37 placeholder card for now.
+//! `main` runs the probe once at startup, logs the result, maps it into
+//! `tgt_ui::render::image::Capability` and hands it to the draw path in the
+//! `RenderState` it builds (architecture §4.9.1). A `None` here — for any of
+//! the reasons below — is what makes every photo render as its one-line card
+//! (docs/design-language.md §4) instead of a picture.
 
 use std::env;
 
@@ -44,6 +45,17 @@ pub fn probe() -> GraphicsProtocol {
 /// otherwise stomp on each other's `TERM` / `TERM_PROGRAM`).
 ///
 /// Rules, first match wins:
+/// 0. **Multiplexer** — if `TMUX` is set, the answer is [`GraphicsProtocol::None`]
+///    regardless of everything below, unless `TGT_FORCE_GRAPHICS` is exactly
+///    `"1"`. tmux does not forward kitty or iTerm2 graphics escapes unless
+///    it is built and configured with passthrough (`allow-passthrough`), and
+///    the sequences it does not forward do not vanish — they land in the
+///    pane as garbage and corrupt the display. The env vars the rules below
+///    read are worse than useless inside tmux, too: `KITTY_WINDOW_ID` and
+///    `TERM_PROGRAM` are inherited from the terminal tmux was *started*
+///    from, which may not even be attached any more. Declining is the only
+///    answer that is right in every one of those cases; users who have set
+///    passthrough up can say so with `TGT_FORCE_GRAPHICS=1`.
 /// 1. **Kitty** — `TERM == "xterm-kitty"`, or `KITTY_WINDOW_ID` is set, or
 ///    `TERM_PROGRAM == "ghostty"` / `TERM` contains `"ghostty"` (Ghostty
 ///    speaks the Kitty graphics protocol). Checked before iTerm2 so a
@@ -58,6 +70,10 @@ pub fn probe() -> GraphicsProtocol {
 /// 4. **None** otherwise — the T37 placeholder card is always available as
 ///    a fallback regardless of this outcome.
 pub fn probe_from(vars: impl Fn(&str) -> Option<String>) -> GraphicsProtocol {
+    if vars("TMUX").is_some() && vars("TGT_FORCE_GRAPHICS").as_deref() != Some("1") {
+        return GraphicsProtocol::None;
+    }
+
     let term = vars("TERM").unwrap_or_default();
 
     if term == "xterm-kitty" || vars("KITTY_WINDOW_ID").is_some() {
@@ -166,6 +182,72 @@ mod tests {
     #[test]
     fn tgt_sixel_requires_exact_value_1() {
         assert_eq!(probe_with(&[("TGT_SIXEL", "true")]), GraphicsProtocol::None);
+    }
+
+    /// Inside tmux the inherited `KITTY_WINDOW_ID` still says "kitty", and
+    /// believing it is what put escape-sequence garbage on the user's
+    /// screen. Nothing below rule 0 gets a say.
+    #[test]
+    fn tmux_without_passthrough_reports_no_capability() {
+        assert_eq!(
+            probe_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1234,0"),
+                ("TERM", "xterm-kitty")
+            ]),
+            GraphicsProtocol::None
+        );
+        assert_eq!(
+            probe_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1234,0"),
+                ("KITTY_WINDOW_ID", "1")
+            ]),
+            GraphicsProtocol::None
+        );
+        assert_eq!(
+            probe_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1234,0"),
+                ("TERM_PROGRAM", "iTerm.app")
+            ]),
+            GraphicsProtocol::None
+        );
+        // Even the explicit sixel opt-in: it is an opt-in to a protocol, not
+        // to tmux forwarding it.
+        assert_eq!(
+            probe_with(&[("TMUX", "/tmp/tmux-501/default,1234,0"), ("TGT_SIXEL", "1")]),
+            GraphicsProtocol::None
+        );
+    }
+
+    /// `TGT_FORCE_GRAPHICS=1` is how someone who has set tmux's
+    /// `allow-passthrough` up says so. It re-enables detection; it does not
+    /// itself claim a protocol.
+    #[test]
+    fn tgt_force_graphics_overrides_the_tmux_veto() {
+        assert_eq!(
+            probe_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1234,0"),
+                ("TERM", "xterm-kitty"),
+                ("TGT_FORCE_GRAPHICS", "1")
+            ]),
+            GraphicsProtocol::Kitty
+        );
+        // Forcing inside tmux with nothing to detect is still nothing.
+        assert_eq!(
+            probe_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1234,0"),
+                ("TGT_FORCE_GRAPHICS", "1")
+            ]),
+            GraphicsProtocol::None
+        );
+        // Same exact-value discipline as TGT_SIXEL: "true" is not "1".
+        assert_eq!(
+            probe_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1234,0"),
+                ("TERM", "xterm-kitty"),
+                ("TGT_FORCE_GRAPHICS", "true")
+            ]),
+            GraphicsProtocol::None
+        );
     }
 
     #[test]

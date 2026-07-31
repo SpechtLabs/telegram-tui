@@ -37,6 +37,15 @@ pub enum Capability {
 /// height"). Keeps a single tall photo from dominating the viewport.
 pub const MAX_IMAGE_ROWS: u16 = 15;
 
+/// The cell footprint [`ImageArea::plan`] expects an image to occupy, so the
+/// caller can reserve exactly that many rows in its own layout before
+/// anything is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// Cell aspect ratio used to size images when no queried terminal font size
 /// is available. `tgt-ui` must not query the terminal itself (see module
 /// docs), so this is a fixed, conservative stand-in — the same fallback
@@ -78,6 +87,16 @@ struct CachedImage {
 pub struct ImageArea {
     capability: Option<Capability>,
     cached: Option<CachedImage>,
+    /// Pixel dimensions read from `path`'s header by [`ImageArea::plan`],
+    /// which the caller runs once per frame while it is laying rows out.
+    /// Memoized so that repeated frames of a stationary photo don't re-open
+    /// the file just to ask how tall it is.
+    dimensions: Option<(PathBuf, (u32, u32))>,
+    /// A path whose last [`ImageArea::render`] returned `false`. Planning
+    /// declines it from then on, so a file that reads far enough to report
+    /// its dimensions but not far enough to decode (a truncated download)
+    /// costs one frame of reserved rows rather than every frame's.
+    failed: Option<PathBuf>,
 }
 
 impl ImageArea {
@@ -91,7 +110,54 @@ impl ImageArea {
         Self {
             capability,
             cached: None,
+            dimensions: None,
+            failed: None,
         }
+    }
+
+    /// How many cells this image would take inside `max_cols` x `max_rows`
+    /// (itself capped to [`MAX_IMAGE_ROWS`]), or `None` when no image can be
+    /// placed at all — no protocol, no room, a path whose header won't read,
+    /// or one whose full decode already failed once.
+    ///
+    /// The point of this call is that it is *cheap*: `image_dimensions`
+    /// parses the file's header and stops, where [`ImageArea::render`]
+    /// decodes every pixel. A view has to know how many rows to reserve
+    /// while it is still building lines, long before it has a `Frame` to
+    /// draw into, and it must not pay for a full decode per frame to find
+    /// out.
+    ///
+    /// The answer is an estimate — it applies the same aspect-fit at
+    /// [`FALLBACK_FONT_SIZE`] that `render` does, but `render` re-derives the
+    /// exact footprint from the decoded image and always draws *inside* the
+    /// area it is given. So a disagreement of a cell costs a blank row or
+    /// column, never an overflow.
+    pub fn plan(&mut self, path: &Path, max_cols: u16, max_rows: u16) -> Option<Footprint> {
+        self.capability?;
+        if self.failed.as_deref() == Some(path) {
+            return None;
+        }
+        let max_rows = max_rows.min(MAX_IMAGE_ROWS);
+        if max_cols == 0 || max_rows == 0 {
+            return None;
+        }
+        let (width_px, height_px) = self.dimensions_of(path)?;
+        Some(footprint(
+            width_px,
+            height_px,
+            Size::new(max_cols, max_rows),
+        ))
+    }
+
+    fn dimensions_of(&mut self, path: &Path) -> Option<(u32, u32)> {
+        if let Some((cached_path, size)) = &self.dimensions
+            && cached_path == path
+        {
+            return Some(*size);
+        }
+        let size = image::image_dimensions(path).ok()?;
+        self.dimensions = Some((path.to_path_buf(), size));
+        Some(size)
     }
 
     /// Clears any cached encoded protocol state.
@@ -101,12 +167,16 @@ impl ImageArea {
     /// invalidated whenever the region they were drawn into scrolls out
     /// from under them, or stale pixels can bleed through the next frame
     /// ("ghosting", spec §8.3). This type has no notion of "the viewport
-    /// scrolled" — that is a `view::conversation` concern, and that view
-    /// does not own an `ImageArea` yet (see its "File cards" module docs:
-    /// photos still render as placeholder cards) — so the caller decides
-    /// when to call this; `ImageArea` only guarantees
-    /// that after the call, the next `render()` re-decodes and re-encodes
-    /// from scratch rather than reusing anything.
+    /// scrolled" — that is `render::state::RenderState`'s job, which owns
+    /// every live `ImageArea` and invalidates the lot whenever the frame's
+    /// content moves under them — so the caller decides when to call this;
+    /// `ImageArea` only guarantees that after the call, the next `render()`
+    /// re-decodes and re-encodes from scratch rather than reusing anything.
+    ///
+    /// The memoized header dimensions and the "this path failed to decode"
+    /// note go with it: both are judgments about a file that may since have
+    /// finished downloading, and re-reading a header is the cheap half of
+    /// what this call already throws away.
     ///
     /// MANUAL GATE CHECK (documented per plan.md T38 — ghosting cannot be
     /// asserted from a `TestBackend` buffer, since it's a property of the
@@ -117,6 +187,8 @@ impl ImageArea {
     /// message's current on-screen position.
     pub fn invalidate(&mut self) {
         self.cached = None;
+        self.dimensions = None;
+        self.failed = None;
     }
 
     /// Renders the image at `path` into `area`, bounded to
@@ -147,27 +219,12 @@ impl ImageArea {
             return true;
         }
 
-        let Ok(bytes) = std::fs::read(path) else {
-            return false;
-        };
-        let Ok(dyn_img) = image::load_from_memory(&bytes) else {
-            return false;
-        };
-
-        let target = Size::new(bounded.width, bounded.height);
-        let (image, size) = fit(dyn_img, target);
-        if size.width == 0 || size.height == 0 {
-            return false;
-        }
-
-        let built = match capability {
-            Capability::Kitty => {
-                Kitty::new(image, size, next_kitty_id(), false).map(Protocol::Kitty)
-            }
-            Capability::Iterm2 => Iterm2::new(image, size, false).map(Protocol::ITerm2),
-            Capability::Sixel => Sixel::new(image, size, false).map(Protocol::Sixel),
-        };
-        let Ok(protocol) = built else {
+        // Every failure from here on is a property of this file rather than
+        // of the area it was asked to fill, so it is worth remembering:
+        // `plan` declines the path afterwards and the caller keeps drawing
+        // the placeholder card instead of reserving rows nothing can fill.
+        let Some((protocol, size)) = self.encode(capability, bounded, path) else {
+            self.failed = Some(path.to_path_buf());
             return false;
         };
 
@@ -185,6 +242,68 @@ impl ImageArea {
             protocol,
         });
         true
+    }
+
+    /// Reads, decodes, fits and protocol-encodes `path` for `bounded`.
+    /// `None` is the single "this file cannot be drawn" answer its caller
+    /// records; the individual reasons (unreadable, undecodable, fits in no
+    /// cells, protocol encoder refused it) are not distinguished because
+    /// nothing downstream would treat them differently — all four mean "the
+    /// placeholder card stands in".
+    fn encode(
+        &self,
+        capability: Capability,
+        bounded: Rect,
+        path: &Path,
+    ) -> Option<(Protocol, Size)> {
+        let bytes = std::fs::read(path).ok()?;
+        let dyn_img = image::load_from_memory(&bytes).ok()?;
+
+        let target = Size::new(bounded.width, bounded.height);
+        let (image, size) = fit(dyn_img, target);
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+
+        let built = match capability {
+            Capability::Kitty => {
+                Kitty::new(image, size, next_kitty_id(), false).map(Protocol::Kitty)
+            }
+            Capability::Iterm2 => Iterm2::new(image, size, false).map(Protocol::ITerm2),
+            Capability::Sixel => Sixel::new(image, size, false).map(Protocol::Sixel),
+        };
+        Some((built.ok()?, size))
+    }
+}
+
+/// The cell footprint an image of `width_px` x `height_px` gets inside
+/// `target`, without a decoded image in hand. Mirrors [`fit`] — natural size
+/// when it already fits, otherwise `Resize::Fit`'s proportional shrink — in
+/// the pixel arithmetic `ratatui-image` performs internally, so the rows
+/// [`ImageArea::plan`] reserves and the rows [`ImageArea::render`] fills are
+/// the same rows. (`Resize::size_for` would answer this directly but wants a
+/// `DynamicImage`, i.e. the full decode this exists to avoid.)
+fn footprint(width_px: u32, height_px: u32, target: Size) -> Footprint {
+    let natural = round_to_cells(width_px, height_px);
+    if natural.cols <= target.width && natural.rows <= target.height {
+        return natural;
+    }
+    let available_px = (
+        u32::from(target.width) * u32::from(FALLBACK_FONT_SIZE.width),
+        u32::from(target.height) * u32::from(FALLBACK_FONT_SIZE.height),
+    );
+    let ratio = f64::from(available_px.0.min(width_px)) / f64::from(width_px);
+    let ratio = ratio.min(f64::from(available_px.1.min(height_px)) / f64::from(height_px));
+    round_to_cells(
+        ((f64::from(width_px) * ratio).round() as u32).max(1),
+        ((f64::from(height_px) * ratio).round() as u32).max(1),
+    )
+}
+
+fn round_to_cells(width_px: u32, height_px: u32) -> Footprint {
+    Footprint {
+        cols: (width_px as f32 / f32::from(FALLBACK_FONT_SIZE.width)).ceil() as u16,
+        rows: (height_px as f32 / f32::from(FALLBACK_FONT_SIZE.height)).ceil() as u16,
     }
 }
 
@@ -320,6 +439,104 @@ mod tests {
         let drawn = render_once(image_area, Rect::new(0, 0, 0, 0), &path);
 
         assert!(!drawn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The contract the conversation view depends on: the rows `plan`
+    /// reserves are the rows `render` fills. A mismatch is not a crash, but
+    /// it is a visible gap (reserved too many) or a clipped image (too few),
+    /// and the two derive their answer from different inputs — a file header
+    /// vs. a decoded image — so nothing but a test keeps them agreeing.
+    #[test]
+    fn plan_reserves_the_rows_render_actually_fills() {
+        // Wide, tall, square, and one that fits without any resizing at all.
+        for (i, (w, h)) in [(400u32, 100u32), (100, 2000), (300, 300), (30, 40)]
+            .into_iter()
+            .enumerate()
+        {
+            let path = scratch_path(&format!("plan-{i}.png"));
+            write_png(&path, w, h);
+
+            let mut image_area = ImageArea::new(Some(Capability::Kitty));
+            let planned = image_area
+                .plan(&path, 30, 40)
+                .expect("a readable PNG with a capability plans a footprint");
+            assert!(
+                planned.rows <= MAX_IMAGE_ROWS && planned.cols <= 30,
+                "{w}x{h}: plan {planned:?} escaped its bounds"
+            );
+
+            let area_rect = Rect::new(0, 0, 30, planned.rows);
+            let mut terminal = Terminal::new(TestBackend::new(40, 40)).expect("backend");
+            let mut drawn = false;
+            terminal
+                .draw(|f| drawn = image_area.render(area_rect, &path, f))
+                .expect("draw");
+            assert!(drawn, "{w}x{h}: should have rendered");
+
+            let rect = image_area.cached.as_ref().expect("cached").rect;
+            assert_eq!(
+                (rect.width, rect.height),
+                (planned.cols, planned.rows),
+                "{w}x{h}: plan {planned:?} disagrees with the rendered footprint"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn plan_declines_without_capability_or_room_or_a_readable_file() {
+        let path = scratch_path("plan-declines.png");
+        write_png(&path, 40, 40);
+
+        assert!(
+            ImageArea::new(None).plan(&path, 20, 20).is_none(),
+            "no capability plans nothing"
+        );
+        let mut with_capability = ImageArea::new(Some(Capability::Kitty));
+        assert!(with_capability.plan(&path, 0, 20).is_none(), "no columns");
+        assert!(with_capability.plan(&path, 20, 0).is_none(), "no rows");
+        assert!(
+            with_capability
+                .plan(&scratch_path("plan-missing.png"), 20, 20)
+                .is_none(),
+            "a missing file plans nothing"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Bytes that read far enough to report dimensions but not far enough to
+    /// decode: `plan` can't see that coming, so `render` reports it once and
+    /// `plan` declines from then on rather than reserving rows every frame
+    /// that nothing will ever fill.
+    #[test]
+    fn a_failed_render_stops_the_path_from_being_planned_again() {
+        let path = scratch_path("truncated.png");
+        write_png(&path, 40, 40);
+        let bytes = std::fs::read(&path).expect("read the valid PNG");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate it");
+
+        let mut image_area = ImageArea::new(Some(Capability::Kitty));
+        assert!(
+            image_area.plan(&path, 20, 20).is_some(),
+            "the header alone still parses, so planning cannot tell yet"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 20)).expect("backend");
+        let mut drawn = true;
+        terminal
+            .draw(|f| drawn = image_area.render(Rect::new(0, 0, 20, 20), &path, f))
+            .expect("draw");
+        assert!(!drawn, "truncated bytes must not render");
+        assert!(
+            image_area.plan(&path, 20, 20).is_none(),
+            "planning must decline a path whose decode already failed"
+        );
+
+        // …until something invalidates, which is also how a file that was
+        // still downloading gets a second chance.
+        image_area.invalidate();
+        assert!(image_area.plan(&path, 20, 20).is_some());
         let _ = std::fs::remove_file(&path);
     }
 

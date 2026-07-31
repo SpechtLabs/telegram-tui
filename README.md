@@ -73,6 +73,7 @@ TOML at `~/.config/telegram-tui/config.toml`, generated with comments on first r
 theme = "default"
 layout_breakpoint_cols = 100
 mouse = true              # shift bypasses capture for native text selection
+inline_images = true      # downloaded photos render inline where the terminal can
 
 [keys]
 palette = "ctrl+p"
@@ -82,6 +83,8 @@ mode = "vendor"           # "vendor" | "custom" | "off"
 ```
 
 Themes are TOML files under `~/.config/telegram-tui/themes/<name>.toml` defining twelve semantic color tokens plus an eight-color sender palette. Truecolor is used when the terminal supports it, with a defined 256-color fallback.
+
+A photo you have downloaded renders as the picture itself on terminals that speak kitty, iTerm2, or sixel (kitty, Ghostty, iTerm2, and WezTerm are detected automatically; sixel is opt-in with `TGT_SIXEL=1`). Everywhere else — and inside tmux, which drops the escape sequences unless it is configured for passthrough — it stays a single descriptive line. If you have set tmux's `allow-passthrough` up, `TGT_FORCE_GRAPHICS=1` re-enables detection there.
 
 ## Privacy
 

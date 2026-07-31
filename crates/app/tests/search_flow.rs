@@ -68,7 +68,7 @@ use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
 use tgt_core::td::request::{TdRequest, TdResponse};
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, ConnectionPhase, TdUpdate};
-use tgt_ui::render::cache::LayoutCache;
+use tgt_ui::render::state::RenderState;
 use tgt_ui::theme::Theme;
 
 use config::Config;
@@ -122,6 +122,9 @@ impl Harness {
                 database_encryption_key: vec![7u8; 32],
             },
             key_events,
+            // No terminal graphics: these harnesses drive a TestBackend, and
+            // the design-language §4 line is what a photo renders as there.
+            None,
         );
         Harness { core, fake, keys }
     }
@@ -238,11 +241,11 @@ impl Harness {
     /// string per row, so a plain `contains` can look for rendered text.
     fn render(&self, width: u16, height: u16) -> String {
         let theme = Theme::default_dark();
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
         terminal
             .draw(|f| {
-                tgt_ui::view(self.state(), &theme, f, &mut cache);
+                tgt_ui::view(self.state(), &theme, f, &mut rs);
             })
             .expect("draw");
 

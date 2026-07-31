@@ -71,12 +71,38 @@
 //!   module's "The receipt gutter"). A column of ticks down the pane edge is
 //!   the defect this replaced.
 //!
-//! Inline images (T38's `render::image::ImageArea`) are still not wired
-//! here: `ImageArea` is per-message mutable state that has to outlive a
-//! frame, and this view owns nothing that lives that long — only the
-//! `LayoutCache` it is handed does. A downloaded photo therefore renders as
-//! its §4 line, which spec §8.3 requires to always work anyway. The seam
-//! where the image replaces that line is marked in [`append_attachment`].
+//! ## Inline images (T63, design-language §6)
+//!
+//! A downloaded photo on a terminal with a graphics protocol replaces its §4
+//! line with the picture itself. The per-message `ImageArea`s that hold the
+//! encoded protocol live in the `RenderState` this view is handed
+//! (architecture §4.9.1), which is what makes this possible at all — they
+//! have to outlive the frame, and nothing in this walk does.
+//!
+//! It happens in two passes, because an image is not a `Line` and cannot
+//! travel through the row buffer:
+//!
+//! 1. While laying a block out, [`append_attachment`] asks
+//!    `ImageArea::plan` how many rows the picture will need — a question
+//!    answered from the file's *header*, not a full decode — and inserts
+//!    that many blank, railed rows where the §4 line would have gone. Each
+//!    carries an [`ImageTag`], so the bottom-up walk's clipping and padding
+//!    move the reservation around exactly like any other row (a block
+//!    clipped at the top of the pane simply keeps fewer of them, and the
+//!    image draws smaller into what is left).
+//! 2. [`draw`] renders the row buffer as usual, then draws each image over
+//!    its own run of reserved rows. Those rows are recorded in the hit map
+//!    like every other row of the block, so a click on a photo still
+//!    resolves to its message.
+//!
+//! Every gate is a reason to skip step 1 and keep the §4 line: no protocol
+//! (`rs.graphics` is `None`, which is also how `[app].inline_images = false`
+//! arrives here), not a photo, not finished downloading, no local path, an
+//! upload still in flight, or a file whose header won't parse. The one
+//! failure that cannot be seen coming — bytes that decode no further than
+//! their header — is caught in step 2, where the §4 line is drawn back over
+//! the first reserved row and the path is not planned again. So the fallback
+//! is automatic and silent in all cases, which is what spec §8.3 asks for.
 //!
 //! ## Search-hit highlighting (T47)
 //!
@@ -99,6 +125,8 @@
 //! `chat_list::draw_filter_input`).
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -117,9 +145,10 @@ use tgt_core::state::search::ChatSearchState;
 use crate::render::cache::{LayoutCache, LayoutKey};
 use crate::render::hit::HitMap;
 use crate::render::message_layout::{
-    LayoutOptions, append_marker_inline, file_card_line, file_card_upload_line, groups_with,
-    layout_message_opts, place_row, rail_style,
+    LayoutOptions, RAIL_COLS, RECEIPT_COLS, append_marker_inline, file_card_line,
+    file_card_upload_line, groups_with, layout_message_opts, place_row, rail_style,
 };
+use crate::render::state::RenderState;
 use crate::theme::Theme;
 
 /// Renders the open chat's message window into `area`, border included (the
@@ -136,13 +165,20 @@ pub fn draw(
     state: &AppState,
     theme: &Theme,
     f: &mut Frame,
-    cache: &mut LayoutCache,
+    rs: &mut RenderState,
     hits: &mut HitMap,
 ) {
     // No box: the conversation is a region, not a widget. `view::root` already
     // padded this rect and drew the one rule that separates it from the
     // sidebar (docs/design-language.md §1).
     let messages_area = draw_search_bar_if_active(area, state, theme, f);
+
+    // Before a single row is laid out: if this pane, the open chat, the
+    // scroll anchor or the loaded window moved since the last frame, every
+    // image the last frame placed is now in the wrong place and has to go
+    // (see `render::state`'s "Ghosting"). Ahead of the early returns below,
+    // so closing a chat drops its images too.
+    rs.note_viewport(state, messages_area);
 
     let Some(convo) = open_conversation(state) else {
         draw_centered(messages_area, "select a chat", theme, f);
@@ -160,10 +196,11 @@ pub fn draw(
         messages_area.width,
         messages_area.height,
         theme,
-        cache,
+        rs,
         state.chat_search.as_ref(),
     );
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    let mut placements: Vec<Placement> = Vec::new();
     for (i, row) in rows.into_iter().enumerate() {
         if let Some(message_id) = row.message_id {
             hits.push(
@@ -176,9 +213,80 @@ pub fn draw(
                 HitTarget::Message(message_id),
             );
         }
+        if let Some(tag) = row.image {
+            extend_placement(&mut placements, tag, i as u16);
+        }
         lines.push(row.line);
     }
     f.render_widget(Paragraph::new(lines), messages_area);
+    draw_inline_images(messages_area, &placements, rs, f);
+
+    // Anything the walk above didn't touch has scrolled out of the pane.
+    // Dropping it now is what keeps the store to a viewport's worth of
+    // encoded images — and, more importantly, means nothing off-screen is
+    // still holding a protocol placement.
+    rs.images.sweep();
+}
+
+/// One message's inline image and the rows it ended up occupying, in pane
+/// coordinates. Built during the same pass that flattens rows into lines,
+/// since that pass is where a row's final `y` is known.
+struct Placement {
+    tag: Rc<ImageTag>,
+    top: u16,
+    bottom: u16,
+}
+
+/// Grows the current run, or starts a new one. A message's reserved rows are
+/// always contiguous, so only the last placement can ever be extended.
+fn extend_placement(placements: &mut Vec<Placement>, tag: Rc<ImageTag>, y: u16) {
+    let same_run = placements
+        .last()
+        .is_some_and(|p| p.tag.message_id == tag.message_id);
+    if same_run {
+        if let Some(last) = placements.last_mut() {
+            last.bottom = y;
+        }
+    } else {
+        placements.push(Placement {
+            tag,
+            top: y,
+            bottom: y,
+        });
+    }
+}
+
+/// Draws each planned image over the rows reserved for it. A `render` that
+/// comes back `false` means the file's bytes did not survive a full decode
+/// after its header promised they would; the §4 line goes back over the
+/// first reserved row so the frame still says something true about the
+/// attachment, and `ImageArea` remembers not to plan that path again.
+fn draw_inline_images(pane: Rect, placements: &[Placement], rs: &mut RenderState, f: &mut Frame) {
+    let graphics = rs.graphics;
+    for placement in placements {
+        let tag = &placement.tag;
+        let rect = Rect {
+            x: pane.x + tag.inset,
+            y: pane.y + placement.top,
+            width: tag.cols,
+            height: placement.bottom - placement.top + 1,
+        };
+        let drawn = rs
+            .images
+            .area(tag.message_id, graphics)
+            .render(rect, &tag.path, f);
+        if !drawn {
+            f.render_widget(
+                Paragraph::new(tag.fallback.clone()),
+                Rect {
+                    x: pane.x,
+                    y: pane.y + placement.top,
+                    width: pane.width,
+                    height: 1,
+                },
+            );
+        }
+    }
 }
 
 /// Reserves and draws the one-line search query bar at the top of `inner`
@@ -211,7 +319,7 @@ fn draw_search_bar_if_active(inner: Rect, state: &AppState, theme: &Theme, f: &m
 pub fn visible_range(
     state: &AppState,
     area: Rect,
-    cache: &mut LayoutCache,
+    rs: &mut RenderState,
 ) -> Option<(MessageId, MessageId)> {
     let convo = open_conversation(state)?;
     if convo.messages.is_empty() {
@@ -240,7 +348,7 @@ pub fn visible_range(
         messages_area.width,
         messages_area.height,
         &theme,
-        cache,
+        rs,
         state.chat_search.as_ref(),
     );
 
@@ -286,6 +394,39 @@ fn fallback_theme() -> Theme {
 struct WindowRow {
     message_id: Option<MessageId>,
     line: Line<'static>,
+    /// Set on rows reserved for an inline image (module docs). Shared by
+    /// every row of one message's run, so the run can be recognized after
+    /// the walk has moved, clipped and padded its rows.
+    image: Option<Rc<ImageTag>>,
+}
+
+impl WindowRow {
+    /// A row that belongs to no message: a block separator or the padding
+    /// that bottom-aligns a short history.
+    fn blank() -> Self {
+        WindowRow {
+            message_id: None,
+            line: Line::default(),
+            image: None,
+        }
+    }
+}
+
+/// What one message's reserved image rows need at draw time. Shared behind
+/// an `Rc` rather than cloned per row: the path and the fallback line are
+/// the same for every row of the run, and a tall photo reserves up to
+/// `MAX_IMAGE_ROWS` of them.
+struct ImageTag {
+    message_id: MessageId,
+    /// The downloaded file, from `MediaState`.
+    path: PathBuf,
+    /// Columns between the pane's left edge and the image's first column.
+    inset: u16,
+    /// Planned width in cells. `ImageArea::render` fits inside it.
+    cols: u16,
+    /// The design-language §4 line the image replaced, kept for the one
+    /// failure mode planning cannot foresee (see [`draw_inline_images`]).
+    fallback: Line<'static>,
 }
 
 /// The bottom-up walk described in the module docs. Always returns exactly
@@ -300,13 +441,17 @@ fn build_window(
     width: u16,
     height: u16,
     theme: &Theme,
-    cache: &mut LayoutCache,
+    rs: &mut RenderState,
     chat_search: Option<&ChatSearchState>,
 ) -> VecDeque<WindowRow> {
     let mut rows: VecDeque<WindowRow> = VecDeque::new();
     if width == 0 || height == 0 || convo.messages.is_empty() {
         return rows;
     }
+    // An image never gets more rows than the pane itself has, whatever
+    // `MAX_IMAGE_ROWS` would otherwise allow: a photo that fills the entire
+    // viewport leaves no room for the conversation it is part of.
+    let image_rows_budget = height;
     let height = height as usize;
 
     let (anchor_idx, line_offset) = resolve_anchor(convo);
@@ -325,7 +470,7 @@ fn build_window(
             width,
             theme_generation,
             theme,
-            cache,
+            &mut rs.cache,
         );
 
         if idx == anchor_idx && line_offset > 0 {
@@ -341,7 +486,16 @@ fn build_window(
         // things that invalidate a `LayoutKey` entry; caching them would
         // leave stale percentages, counts, and checkmarks on screen. See
         // the module docs' "The per-frame half of a block".
-        append_attachment(&mut msg_lines, msg, grouped, media, width, theme);
+        let reserved = append_attachment(
+            &mut msg_lines,
+            msg,
+            grouped,
+            media,
+            width,
+            image_rows_budget,
+            theme,
+            rs,
+        );
         append_reactions(&mut msg_lines, msg, width, theme);
         if msg.is_outgoing {
             append_receipt(&mut msg_lines, msg, convo.last_read_outbox, width, theme);
@@ -354,25 +508,23 @@ fn build_window(
         let hit_kind = search_hit_kind(convo, chat_search, msg.id);
         let mut block: Vec<WindowRow> = Vec::with_capacity(msg_lines.len() + 1);
         if idx > 0 && !grouped {
-            block.push(WindowRow {
-                message_id: None,
-                line: Line::default(),
-            });
+            block.push(WindowRow::blank());
         }
-        block.extend(
-            msg_lines
-                .into_iter()
-                .enumerate()
-                .map(|(i, line)| WindowRow {
-                    message_id: Some(msg.id),
-                    line: apply_search_highlight(
-                        apply_selection_highlight(line, selected, width, theme),
-                        hit_kind,
-                        i == 0,
-                        theme,
-                    ),
-                }),
-        );
+        block.extend(msg_lines.into_iter().enumerate().map(|(i, line)| {
+            WindowRow {
+                message_id: Some(msg.id),
+                image: reserved
+                    .as_ref()
+                    .filter(|r| r.covers(i))
+                    .map(|r| Rc::clone(&r.tag)),
+                line: apply_search_highlight(
+                    apply_selection_highlight(line, selected, width, theme),
+                    hit_kind,
+                    i == 0,
+                    theme,
+                ),
+            }
+        }));
 
         // `block` is in top-to-bottom order already; pushing it to the
         // front in reverse keeps that order at the front of `rows`.
@@ -390,10 +542,7 @@ fn build_window(
         rows.pop_front();
     }
     while rows.len() < height {
-        rows.push_front(WindowRow {
-            message_id: None,
-            line: Line::default(),
-        });
+        rows.push_front(WindowRow::blank());
     }
 
     rows
@@ -604,22 +753,17 @@ fn append_reactions(lines: &mut Vec<Line<'static>>, msg: &MessageView, width: u1
 /// An outgoing message with an upload still tracked under its id shows the
 /// upload bar instead of the download affordance: until the send completes
 /// there is no downloadable file on the other end to offer.
+#[allow(clippy::too_many_arguments)]
 fn append_attachment(
     lines: &mut Vec<Line<'static>>,
     msg: &MessageView,
     grouped: bool,
     media: &MediaState,
     width: u16,
+    image_rows_budget: u16,
     theme: &Theme,
-) {
-    // SEAM (inline images, design-language §6): when the terminal has a
-    // graphics protocol and this is a *downloaded* photo, the line built
-    // below is replaced outright by `render::image::ImageArea`, bounded to
-    // MAX_IMAGE_ROWS and inset to the rail column. Everything else about
-    // this function stays as it is — the §4 line remains the fallback for
-    // every other terminal and every not-yet-downloaded photo. Wiring it
-    // needs somewhere to keep an `ImageArea` alive between frames, which
-    // this walk does not have (see the module docs).
+    rs: &mut RenderState,
+) -> Option<ReservedImage> {
     let line = match media.uploads.get(&msg.id) {
         Some(progress) => file_card_upload_line(&msg.content, progress, theme),
         None => {
@@ -627,12 +771,114 @@ fn append_attachment(
             file_card_line(&msg.content, file, theme)
         }
     };
-    let Some(line) = line else {
-        return;
-    };
-    let row = place_row(line.spans, width, msg.is_outgoing, rail_style(msg, theme));
+    let line = line?;
+    let rail = rail_style(msg, theme);
+    let row = place_row(line.spans, width, msg.is_outgoing, rail);
     let at = attachment_index(msg, grouped).min(lines.len());
+
+    // The inline image (design-language §6) replaces that row outright when
+    // every gate in the module docs opens; otherwise the §4 line stands.
+    if let Some(planned) = plan_inline_image(msg, media, width, image_rows_budget, row.clone(), rs)
+    {
+        let blank = place_row(Vec::new(), width, msg.is_outgoing, rail);
+        for offset in 0..planned.rows {
+            lines.insert(at + offset as usize, blank.clone());
+        }
+        return Some(ReservedImage {
+            at,
+            rows: planned.rows,
+            tag: Rc::new(planned.tag),
+        });
+    }
+
     lines.insert(at, row);
+    None
+}
+
+/// The rows [`append_attachment`] reserved, in indices into the message's
+/// own line vector — which is what the block-building loop tags rows by.
+struct ReservedImage {
+    at: usize,
+    rows: u16,
+    tag: Rc<ImageTag>,
+}
+
+impl ReservedImage {
+    fn covers(&self, line_index: usize) -> bool {
+        line_index >= self.at && line_index < self.at + self.rows as usize
+    }
+}
+
+/// A planned image plus how many rows it needs.
+struct PlannedImage {
+    tag: ImageTag,
+    rows: u16,
+}
+
+/// Decides whether `msg` gets an inline image this frame, and where it goes.
+/// `None` — the common answer — means the §4 card line stands, and every
+/// reason for it is silent by design (module docs).
+///
+/// The image sits in the block's text column: one rail width in on an
+/// incoming message, right-aligned to the text edge on an own one. Own
+/// messages additionally keep `RECEIPT_COLS` free at that edge, because a
+/// photo with no caption ends its block on a reserved row and that is
+/// exactly where `append_receipt` puts the tick — an image drawn over it
+/// would erase the only confirmation the sender gets.
+fn plan_inline_image(
+    msg: &MessageView,
+    media: &MediaState,
+    width: u16,
+    image_rows_budget: u16,
+    fallback: Line<'static>,
+    rs: &mut RenderState,
+) -> Option<PlannedImage> {
+    let capability = rs.graphics?;
+    let MessageContent::Photo { file_id, .. } = &msg.content else {
+        return None;
+    };
+    // An upload still in flight owns this row: it is showing progress on a
+    // file that is on its way out, and TDLib reports the local copy as a
+    // completed file the whole time, so without this the progress bar would
+    // be replaced by the picture the moment the send starts.
+    if media.uploads.contains_key(&msg.id) {
+        return None;
+    }
+    let file = media.files.get(file_id)?;
+    if !file.is_completed {
+        return None;
+    }
+    let path = file.local_path.as_ref()?;
+
+    let text_cols = width.saturating_sub(RAIL_COLS);
+    let text_cols = if msg.is_outgoing {
+        text_cols.saturating_sub(RECEIPT_COLS)
+    } else {
+        text_cols
+    };
+    let footprint =
+        rs.images
+            .area(msg.id, Some(capability))
+            .plan(path, text_cols, image_rows_budget)?;
+
+    // An own block is right-aligned, so its image ends where its text ends:
+    // at `text_cols`, which the subtraction above already pulled clear of
+    // the receipt gutter and the trailing rail.
+    let inset = if msg.is_outgoing {
+        text_cols.saturating_sub(footprint.cols)
+    } else {
+        RAIL_COLS
+    };
+    Some(PlannedImage {
+        rows: footprint.rows,
+        tag: ImageTag {
+            message_id: msg.id,
+            path: path.clone(),
+            inset,
+            cols: footprint.cols,
+            fallback,
+        },
+    })
 }
 
 /// How many rows of `msg`'s cached block precede its attachment: the header
@@ -769,6 +1015,8 @@ fn draw_centered(area: Rect, text: &str, theme: &Theme, f: &mut Frame) {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -795,6 +1043,7 @@ mod tests {
     use tgt_core::td::update::{AuthPhase, ConnectionPhase};
 
     use super::*;
+    use crate::render::image::{Capability, MAX_IMAGE_ROWS};
 
     const CHAT: ChatId = ChatId(1);
     const BASE_DATE: i64 = 1_700_000_000;
@@ -966,12 +1215,12 @@ mod tests {
 
     fn render_to_string(width: u16, height: u16, state: &AppState) -> String {
         let theme = Theme::default_dark();
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| {
                 let area = f.area();
-                draw(area, state, &theme, f, &mut cache, &mut HitMap::new());
+                draw(area, state, &theme, f, &mut rs, &mut HitMap::new());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -1103,7 +1352,7 @@ mod tests {
             current_hit: 0,
             in_flight: false,
         };
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
         let rows = build_window(
             &convo,
             &MediaState::default(),
@@ -1111,7 +1360,7 @@ mod tests {
             120,
             40,
             &theme(),
-            &mut cache,
+            &mut rs,
             Some(&search),
         );
 
@@ -1284,7 +1533,7 @@ mod tests {
             };
         }
         let convo = conversation(vec![msg], Scroll::Bottom);
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1293,7 +1542,7 @@ mod tests {
             60,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
         let texts: Vec<String> = rows
@@ -1353,7 +1602,7 @@ mod tests {
             chip_cursor: 0,
             chip_scroll: 0,
         });
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let width = 40;
         let rows = build_window(
@@ -1363,7 +1612,7 @@ mod tests {
             width,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
 
@@ -1385,6 +1634,296 @@ mod tests {
         }
     }
 
+    // --- inline images (T63, design-language §6) --------------------------
+
+    static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const PHOTO_FILE: FileId = FileId(9);
+
+    /// Writes a synthetic PNG under the OS temp dir and returns its path.
+    /// `tgt-ui` carries no `tempfile` dev-dependency (see
+    /// `crates/ui/Cargo.toml`), so this mirrors `render::image`'s own tests:
+    /// a counter-suffixed name, so tests running in parallel cannot collide.
+    fn scratch_png(width: u32, height: u32) -> PathBuf {
+        let n = TEST_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!("tgt-ui-conversation-image-{n}.png"));
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 200])
+        });
+        image::DynamicImage::ImageRgb8(img)
+            .save(&path)
+            .expect("write test PNG");
+        path
+    }
+
+    fn photo_msg(id: i64, width: u32, height: u32) -> MessageView {
+        MessageView {
+            id: MessageId(id),
+            chat_id: CHAT,
+            sender: Sender::User(UserId(2)),
+            sender_name: "Bob".to_string(),
+            is_outgoing: false,
+            date: BASE_DATE,
+            content: MessageContent::Photo {
+                file_id: PHOTO_FILE,
+                width,
+                height,
+                caption: FormattedText {
+                    text: String::new(),
+                    entities: Vec::new(),
+                },
+            },
+            reply_to: None,
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            caps: MessageCaps::default(),
+            is_edited: false,
+        }
+    }
+
+    /// One photo message, plus the `MediaState` entry that decides whether
+    /// it can render inline: `Some(path)` is a finished download, `None` is
+    /// a photo nobody has fetched yet.
+    fn photo_state(pixels: (u32, u32), downloaded: Option<&Path>) -> AppState {
+        let mut state = fixture_state(Some(conversation(
+            vec![photo_msg(1, pixels.0, pixels.1)],
+            Scroll::Bottom,
+        )));
+        state.media.files.insert(
+            PHOTO_FILE,
+            FileSnapshot {
+                id: PHOTO_FILE,
+                expected_size: 4_096,
+                downloaded_size: if downloaded.is_some() { 4_096 } else { 0 },
+                is_downloading: false,
+                is_completed: downloaded.is_some(),
+                local_path: downloaded.map(Path::to_path_buf),
+            },
+        );
+        state
+    }
+
+    /// Drives the real `draw` against a caller-owned `RenderState`, so a
+    /// test can inspect what the frame left behind.
+    fn draw_frame(
+        width: u16,
+        height: u16,
+        state: &AppState,
+        rs: &mut RenderState,
+    ) -> (String, HitMap) {
+        let theme = Theme::default_dark();
+        let mut hits = HitMap::new();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| draw(f.area(), state, &theme, f, rs, &mut hits))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::with_capacity(buffer.content.len() + buffer.area.height as usize);
+        for row in buffer.content.chunks(buffer.area.width as usize) {
+            for cell in row {
+                out.push_str(cell.symbol());
+            }
+            out.push('\n');
+        }
+        (out, hits)
+    }
+
+    /// How many of `height`'s rows resolve to `message_id` when clicked.
+    fn clickable_rows(hits: &HitMap, height: u16, message_id: MessageId) -> usize {
+        (0..height)
+            .filter(|&y| hits.target_at(1, y) == Some(HitTarget::Message(message_id)))
+            .count()
+    }
+
+    /// The headline of design-language §6: a downloaded photo on a terminal
+    /// with a protocol *is* the picture — the §4 line is gone, rows are
+    /// reserved in its place, and every one of them still belongs to the
+    /// message as far as a click is concerned.
+    #[test]
+    fn image_rows_replace_the_card_when_downloaded_and_supported() {
+        let path = scratch_png(200, 100);
+        let state = photo_state((200, 100), Some(&path));
+
+        let mut plain = RenderState::new(None);
+        let (without, plain_hits) = draw_frame(60, 20, &state, &mut plain);
+        assert!(
+            without.contains("🖼 photo · 200×100 · ⏎ open"),
+            "the §4 line is what a terminal without a protocol shows:\n{without}"
+        );
+
+        let mut rs = RenderState::new(Some(Capability::Kitty));
+        let (with, hits) = draw_frame(60, 20, &state, &mut rs);
+        assert!(
+            !with.contains("🖼"),
+            "the image replaces the card outright, it does not join it:\n{with}"
+        );
+        assert!(!with.contains("⏎ open"), "…affordance included:\n{with}");
+        assert_eq!(rs.images.len(), 1, "the message got an ImageArea");
+
+        // The rows it took: more than the one row the card had, capped by
+        // MAX_IMAGE_ROWS, and all of them clickable.
+        let reserved = clickable_rows(&hits, 20, MessageId(1))
+            - clickable_rows(&plain_hits, 20, MessageId(1))
+            + 1;
+        assert!(
+            (2..=MAX_IMAGE_ROWS as usize).contains(&reserved),
+            "a 200x100 photo should occupy several bounded rows, got {reserved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two bounds design-language §6 puts on the picture: the hard
+    /// `MAX_IMAGE_ROWS` cap, and the pane it has to fit inside — a photo may
+    /// never squeeze the conversation it is part of off the screen.
+    #[test]
+    fn reserved_rows_are_bounded_by_the_cap_and_by_the_pane() {
+        let path = scratch_png(100, 4_000);
+        let state = photo_state((100, 4_000), Some(&path));
+        let convo = state.conversations.get(&CHAT).unwrap();
+
+        for (pane_height, bound) in [(40u16, MAX_IMAGE_ROWS), (8, 8)] {
+            let mut rs = RenderState::new(Some(Capability::Kitty));
+            let rows = build_window(
+                convo,
+                &state.media,
+                0,
+                60,
+                pane_height,
+                &theme(),
+                &mut rs,
+                None,
+            );
+            let reserved = rows.iter().filter(|r| r.image.is_some()).count();
+            assert!(
+                reserved > 0 && reserved <= bound as usize,
+                "pane height {pane_height}: reserved {reserved} rows, bound is {bound}"
+            );
+            assert!(
+                rows.iter()
+                    .filter(|r| r.image.is_some())
+                    .all(|r| r.message_id == Some(MessageId(1))),
+                "a reserved row belongs to its message, or a click on the photo hits nothing"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn falls_back_to_card_when_unsupported() {
+        let path = scratch_png(200, 100);
+        let state = photo_state((200, 100), Some(&path));
+
+        let mut rs = RenderState::new(None);
+        let (rendered, _) = draw_frame(60, 20, &state, &mut rs);
+
+        assert!(
+            rendered.contains("🖼 photo · 200×100 · ⏎ open"),
+            "a downloaded photo with no protocol keeps its §4 line:\n{rendered}"
+        );
+        assert!(
+            rs.images.is_empty(),
+            "no capability means nothing is ever planned, not even an empty slot"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A photo that has not been downloaded has no local file to decode, so
+    /// the §4 line stands even where the terminal could draw one — and it
+    /// still offers the download that would change that.
+    #[test]
+    fn falls_back_to_card_when_the_file_is_not_downloaded() {
+        let state = photo_state((200, 100), None);
+
+        let mut rs = RenderState::new(Some(Capability::Kitty));
+        let (rendered, _) = draw_frame(60, 20, &state, &mut rs);
+
+        assert!(
+            rendered.contains("🖼 photo · 200×100 · ⏎ download"),
+            "an un-fetched photo shows the card and its affordance:\n{rendered}"
+        );
+    }
+
+    /// One way the pane's content can move: a label, what it changes about
+    /// the state, and the pane the next frame would draw into.
+    struct MoveCase(&'static str, fn(&mut AppState), Rect);
+
+    /// Ghosting (spec §8.3): protocol cells are terminal-side state, so an
+    /// image whose rows are about to move has to be dropped rather than
+    /// redrawn elsewhere. Every input that moves them is fingerprinted; this
+    /// checks each one.
+    #[test]
+    fn scroll_invalidates_placed_images() {
+        let path = scratch_png(200, 100);
+        let pane = Rect::new(0, 0, 60, 20);
+        let state = photo_state((200, 100), Some(&path));
+
+        let mut rs = RenderState::new(Some(Capability::Kitty));
+        draw_frame(60, 20, &state, &mut rs);
+        assert_eq!(rs.images.len(), 1, "the first frame placed an image");
+
+        // An identical frame keeps it: invalidating on every draw would
+        // re-encode every image at the draw rate for no reason at all.
+        draw_frame(60, 20, &state, &mut rs);
+        assert_eq!(rs.images.len(), 1, "an unchanged frame keeps its images");
+
+        // Everything that moves a message's rows, each starting from a
+        // freshly drawn frame that has an image placed.
+        let cases = [
+            MoveCase(
+                "a moved scroll anchor",
+                |s| {
+                    s.conversations.get_mut(&CHAT).unwrap().scroll = Scroll::At {
+                        message_id: MessageId(1),
+                        line_offset: 2,
+                    }
+                },
+                pane,
+            ),
+            // A new message pushes everything above it up even though the
+            // anchor (`Scroll::Bottom`) itself never changed — the case a
+            // naive "did the anchor move" check misses, and the one a user
+            // hits most often.
+            MoveCase(
+                "an arriving message",
+                |s| {
+                    s.conversations
+                        .get_mut(&CHAT)
+                        .unwrap()
+                        .messages
+                        .push_back(text_msg(
+                            2,
+                            Sender::User(UserId(1)),
+                            "Alice",
+                            false,
+                            900,
+                            "nice shot",
+                            None,
+                        ))
+                },
+                pane,
+            ),
+            MoveCase("a resized pane", |_| {}, Rect::new(0, 0, 40, 20)),
+            MoveCase("a theme switch", |s| s.theme_generation += 1, pane),
+            MoveCase("closing the chat", |s| s.open_chat = None, pane),
+        ];
+
+        for MoveCase(label, mutate, moved_pane) in cases {
+            let mut rs = RenderState::new(Some(Capability::Kitty));
+            draw_frame(60, 20, &state, &mut rs);
+            assert_eq!(rs.images.len(), 1, "{label}: nothing placed to begin with");
+
+            let mut moved = photo_state((200, 100), Some(&path));
+            mutate(&mut moved);
+            rs.note_viewport(&moved, moved_pane);
+            assert!(rs.images.is_empty(), "{label} must drop placed images");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // --- bottom-up fill (unit) --------------------------------------------
 
     #[test]
@@ -1400,7 +1939,7 @@ mod tests {
             None,
         );
         let convo = conversation(vec![msg], Scroll::Bottom);
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1409,7 +1948,7 @@ mod tests {
             20,
             5,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
 
@@ -1431,7 +1970,7 @@ mod tests {
     fn short_history_bottom_aligns_with_blank_padding_on_top() {
         let msg = text_msg(1, Sender::User(UserId(1)), "Alice", false, 0, "hi", None);
         let convo = conversation(vec![msg], Scroll::Bottom);
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1440,7 +1979,7 @@ mod tests {
             40,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
 
@@ -1462,7 +2001,7 @@ mod tests {
             text_msg(3, bob, "Bob", false, 20, "three", None),   // new block
         ];
         let convo = conversation(messages, Scroll::Bottom);
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1471,7 +2010,7 @@ mod tests {
             40,
             40,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
         let rendered: Vec<String> = rows
@@ -1517,7 +2056,7 @@ mod tests {
                 line_offset: 1,
             },
         );
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let full = build_window(
             &convo_no_offset,
@@ -1526,7 +2065,7 @@ mod tests {
             40,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
         let trimmed = build_window(
@@ -1536,7 +2075,7 @@ mod tests {
             40,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
 
@@ -1587,7 +2126,7 @@ mod tests {
             },
         ];
         let convo = conversation(vec![msg], Scroll::Bottom);
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1596,7 +2135,7 @@ mod tests {
             40,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
         let reaction_row = rows
@@ -1635,7 +2174,7 @@ mod tests {
             vec![text_msg(1, me, "You", true, 0, "on it", None)],
             Scroll::Bottom,
         );
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1644,7 +2183,7 @@ mod tests {
             40,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
         let texts: Vec<String> = rows
@@ -1681,7 +2220,7 @@ mod tests {
             vec![text_msg(1, me, "You", true, 0, body.trim(), None)],
             Scroll::Bottom,
         );
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         for width in [40u16, 80, 140] {
             let rows = build_window(
@@ -1691,7 +2230,7 @@ mod tests {
                 width,
                 20,
                 &theme(),
-                &mut cache,
+                &mut rs,
                 None,
             );
             let marker_rows = rows
@@ -1723,7 +2262,7 @@ mod tests {
         let newer = text_msg(2, me, "You", true, 60, "done", None);
         let mut convo = conversation(vec![older, newer], Scroll::Bottom);
         convo.last_read_outbox = MessageId(1);
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         let rows = build_window(
             &convo,
@@ -1732,7 +2271,7 @@ mod tests {
             40,
             10,
             &theme(),
-            &mut cache,
+            &mut rs,
             None,
         );
         let texts: Vec<String> = rows
@@ -1791,10 +2330,10 @@ mod tests {
     #[test]
     fn visible_range_reports_the_newest_shown_message_at_the_bottom() {
         let state = fixture_state(Some(conversation(mixed_history(), Scroll::Bottom)));
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
         let area = Rect::new(0, 0, 80, 24);
 
-        let (oldest, newest) = visible_range(&state, area, &mut cache).unwrap();
+        let (oldest, newest) = visible_range(&state, area, &mut rs).unwrap();
         assert_eq!(newest, MessageId(10));
         assert!(oldest <= newest);
     }
@@ -1802,14 +2341,14 @@ mod tests {
     #[test]
     fn visible_range_none_without_open_chat() {
         let state = fixture_state(None);
-        let mut cache = LayoutCache::new();
-        assert!(visible_range(&state, Rect::new(0, 0, 80, 24), &mut cache).is_none());
+        let mut rs = RenderState::new(None);
+        assert!(visible_range(&state, Rect::new(0, 0, 80, 24), &mut rs).is_none());
     }
 
     #[test]
     fn visible_range_none_for_empty_conversation() {
         let state = fixture_state(Some(conversation(Vec::new(), Scroll::Bottom)));
-        let mut cache = LayoutCache::new();
-        assert!(visible_range(&state, Rect::new(0, 0, 80, 24), &mut cache).is_none());
+        let mut rs = RenderState::new(None);
+        assert!(visible_range(&state, Rect::new(0, 0, 80, 24), &mut rs).is_none());
     }
 }

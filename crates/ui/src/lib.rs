@@ -8,8 +8,8 @@ pub mod view;
 use ratatui::Frame;
 use tgt_core::app::{AppState, Screen};
 
-use crate::render::cache::LayoutCache;
 use crate::render::hit::HitMap;
+use crate::render::state::RenderState;
 use crate::theme::Theme;
 
 /// Draws one frame and returns where its clickable regions ended up
@@ -17,21 +17,31 @@ use crate::theme::Theme;
 /// next draw replaces it; it is what turns a mouse event's coordinates into
 /// an `Action`.
 ///
+/// `rs` is the state a frame leaves behind for the next one (architecture
+/// §4.9.1): laid-out lines, placed images, and the terminal's graphics
+/// capability. The caller owns it across frames and is responsible for
+/// nothing but handing it back.
+///
 /// The consent screen and the auth wizard are keyboard-only and hand back an
 /// empty map — there is nothing on either that a click could mean.
-pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) -> HitMap {
+pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, rs: &mut RenderState) -> HitMap {
     match state.screen {
         // The consent screen and the auth wizard each own the whole frame;
-        // both are screens, not panes.
+        // both are screens, not panes. Neither has a conversation pane to
+        // sweep the image store, and both cover the whole terminal, so any
+        // image a previous frame placed is gone from view and must be
+        // dropped here rather than be redrawn stale on the way back.
         Screen::Consent => {
+            rs.invalidate_images();
             view::consent::draw(state, theme, f);
             HitMap::new()
         }
         Screen::Auth => {
+            rs.invalidate_images();
             view::auth::draw(state, theme, f);
             HitMap::new()
         }
-        Screen::Main => view::root::draw(state, theme, f, cache),
+        Screen::Main => view::root::draw(state, theme, f, rs),
     }
 }
 
@@ -123,11 +133,11 @@ mod tests {
         state.auth.phase = AuthPhase::WaitTdlibParameters;
         let theme = Theme::default_dark();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         terminal
             .draw(|f| {
-                view(&state, &theme, f, &mut cache);
+                view(&state, &theme, f, &mut rs);
             })
             .unwrap();
 
@@ -147,11 +157,11 @@ mod tests {
         let state = fixture_state();
         let theme = Theme::default_dark();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
 
         terminal
             .draw(|f| {
-                view(&state, &theme, f, &mut cache);
+                view(&state, &theme, f, &mut rs);
             })
             .unwrap();
 

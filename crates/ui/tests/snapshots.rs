@@ -35,8 +35,8 @@ use tgt_core::state::focus::{Focus, FocusStack};
 use tgt_core::state::palette::{CommandId, PaletteItem};
 use tgt_core::td::error::TdError;
 use tgt_core::td::update::AuthPhase;
-use tgt_ui::render::cache::LayoutCache;
 use tgt_ui::render::hit::HitMap;
+use tgt_ui::render::state::RenderState;
 use tgt_ui::theme::Theme;
 
 use states::*;
@@ -47,11 +47,14 @@ use states::*;
 /// tests uses, so a diff here reads the same way those diffs do.
 fn render(width: u16, height: u16, state: &AppState) -> String {
     let theme = Theme::default_dark();
-    let mut cache = LayoutCache::new();
+    // Snapshots run with no graphics capability: every photo therefore
+    // renders as its design-language §4 line, which is the one rendering a
+    // text buffer can capture.
+    let mut rs = RenderState::new(None);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
-            tgt_ui::view(state, &theme, f, &mut cache);
+            tgt_ui::view(state, &theme, f, &mut rs);
         })
         .unwrap();
     let buffer = terminal.backend().buffer();
@@ -451,12 +454,15 @@ fn sidebar_archive_active_100x30() {
 /// rendered and then probe that exact cell.
 fn render_with_hits(width: u16, height: u16, state: &AppState) -> (String, HitMap) {
     let theme = Theme::default_dark();
-    let mut cache = LayoutCache::new();
+    // Snapshots run with no graphics capability: every photo therefore
+    // renders as its design-language §4 line, which is the one rendering a
+    // text buffer can capture.
+    let mut rs = RenderState::new(None);
     let mut hits = HitMap::new();
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
-            hits = tgt_ui::view(state, &theme, f, &mut cache);
+            hits = tgt_ui::view(state, &theme, f, &mut rs);
         })
         .unwrap();
     let buffer = terminal.backend().buffer();

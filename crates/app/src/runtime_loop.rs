@@ -27,8 +27,9 @@ use tgt_core::model::hit::ClickButton;
 use tgt_core::model::time::Millis;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, TdUpdate};
-use tgt_ui::render::cache::LayoutCache;
 use tgt_ui::render::hit::HitMap;
+use tgt_ui::render::image::Capability;
+use tgt_ui::render::state::RenderState;
 use tgt_ui::theme::Theme;
 
 use crate::config::Config;
@@ -78,13 +79,15 @@ pub struct Core {
     /// exclusively via `Action::Tick { now }`, anchored to loop start.
     clock_start: Instant,
     effects: Vec<Effect>,
-    /// T21's `LayoutCache` (architecture.md §4.9), threaded through `view`
-    /// on every draw. Cleared wholesale on a terminal resize — the column
-    /// width lives in `LayoutKey`, so a stale width's cached lines are wrong
-    /// at the new width. Theme changes don't need a clear here:
-    /// `theme_generation` is part of `LayoutKey` too, so a theme swap just
-    /// misses forward without evicting anything explicitly.
-    cache: LayoutCache,
+    /// What one frame leaves for the next (architecture.md §4.9.1): T21's
+    /// `LayoutCache`, the per-message inline images, and the graphics
+    /// capability `main` probed at startup. Cleared wholesale on a terminal
+    /// resize — cached lines are wrapped at the old column width, and placed
+    /// images are addressed in cells that have just moved. Theme changes
+    /// don't need the cache half of that (`theme_generation` is part of
+    /// `LayoutKey`, so a swap misses forward), but they do need the image
+    /// half, which `RenderState` handles itself.
+    render: RenderState,
     /// Where the last drawn frame put everything a mouse can hit
     /// (architecture §7.5), refreshed by `draw_if_due` from `view`'s return
     /// value. Empty until the first frame is drawn and whenever an overlay
@@ -102,6 +105,7 @@ impl Core {
         config: Arc<Mutex<Config>>,
         td_boot: TdBootParams,
         term_events: mpsc::Receiver<Event>,
+        graphics: Option<Capability>,
     ) -> Self {
         let (action_tx, action_rx) = mpsc::channel::<Action>(ACTION_CHANNEL_CAPACITY);
         let td_updates = runtime.updates();
@@ -120,7 +124,7 @@ impl Core {
             tick,
             clock_start: Instant::now(),
             effects: Vec::new(),
-            cache: LayoutCache::new(),
+            render: RenderState::new(graphics),
             last_hits: HitMap::new(),
         }
     }
@@ -181,10 +185,13 @@ impl Core {
             }
             Input::Term(event) => {
                 // A resize invalidates every cached layout: they're wrapped
-                // at the old column width. `LayoutKey::theme_generation`
-                // handles theme swaps on its own, so only width needs this.
+                // at the old column width. It invalidates every placed image
+                // too — protocol cells do not move with the reflow, they
+                // ghost (spec §8.3). `LayoutKey::theme_generation` handles
+                // theme swaps on its own, so only width needs the cache half
+                // of this.
                 if let Event::Resize(_, _) = event {
-                    self.cache.clear();
+                    self.render.clear();
                 }
                 if let Some(action) = tgt_ui::input::map_event(event) {
                     self.apply(resolve_pasted_path(action));
@@ -312,27 +319,44 @@ struct LiveTheme {
 /// module still has to typecheck standalone either way.
 type ThemeResolver = fn(&str) -> Theme;
 
+/// How a frame is put on screen, as opposed to what is in it: everything
+/// [`run`] needs for drawing and nothing it needs for running the app.
+/// `main.rs` resolves all three from config and the startup probe.
+pub struct Presentation {
+    /// The theme resolved for the app's *starting* `theme_generation`.
+    pub theme: Theme,
+    /// How a later generation is resolved. See [`ThemeResolver`].
+    pub resolve_theme: ThemeResolver,
+    /// The terminal graphics protocol, or `None` for the design-language §4
+    /// fallback (`main.rs::graphics_capability`).
+    pub graphics: Option<Capability>,
+}
+
 /// Runs `app` to completion. The caller owns terminal setup/teardown (raw
 /// mode, alternate screen) around this call — `terminal` is only ever drawn
 /// into here, never (re)configured.
 ///
-/// `theme` is the theme resolved for `app`'s *starting* `theme_generation`;
-/// after that, `draw_if_due` is the sole place a new one is resolved, always
-/// through `resolve_theme` — the same builtin → user-file → `default_dark`
-/// chain `main.rs` uses at startup (it's the same function, passed in by
-/// the caller — see [`ThemeResolver`]), so a mid-session switch and the
-/// initial resolution can never disagree about what a theme name means.
+/// After the first frame, `draw_if_due` is the sole place a theme is
+/// resolved, always through `presentation.resolve_theme` — the same builtin
+/// → user-file → `default_dark` chain `main.rs` uses at startup (it's the
+/// same function, passed in by the caller — see [`ThemeResolver`]), so a
+/// mid-session switch and the initial resolution can never disagree about
+/// what a theme name means.
 pub async fn run(
     app: App,
-    theme: Theme,
     terminal: &mut DefaultTerminal,
     runtime: Arc<dyn TdRuntime>,
     config: Arc<Mutex<Config>>,
     td_boot: TdBootParams,
-    resolve_theme: ThemeResolver,
+    presentation: Presentation,
 ) -> io::Result<()> {
+    let Presentation {
+        theme,
+        resolve_theme,
+        graphics,
+    } = presentation;
     let (term_events, event_reader_running) = spawn_terminal_event_reader();
-    let mut core = Core::new(app, runtime, config, td_boot, term_events);
+    let mut core = Core::new(app, runtime, config, td_boot, term_events, graphics);
     let mut live_theme = LiveTheme {
         generation: core.app().state().theme_generation,
         theme,
@@ -378,12 +402,12 @@ fn draw_if_due(
     // gate alone; this app's inputs never come close to that rate.
     if core.take_dirty() && gate_ready {
         // Destructured so the draw closure borrows `app` (for its state)
-        // and `cache`/`last_hits` as the disjoint fields they are, rather
-        // than needing both a `&core.app()` and a `&mut core.cache_mut()`
+        // and `render`/`last_hits` as the disjoint fields they are, rather
+        // than needing both a `&core.app()` and a `&mut core.render_mut()`
         // live at once.
         let Core {
             app,
-            cache,
+            render,
             last_hits,
             ..
         } = core;
@@ -396,16 +420,19 @@ fn draw_if_due(
         // `theme_generation`, so the stale entries left behind by the old
         // generation would only ever miss forward and never render wrong —
         // clearing here just stops them from accumulating as dead weight.
+        // (Placed images need no attention here: `theme_generation` is part
+        // of what `RenderState::note_viewport` fingerprints, so the frame
+        // this resolves for drops them itself.)
         if state.theme_generation != live_theme.generation {
             live_theme.theme = resolve_theme(&state.theme_name);
             live_theme.generation = state.theme_generation;
-            cache.clear();
+            render.cache.clear();
         }
 
         // Every frame replaces the hit map wholesale: it describes the frame
         // now on screen, and a click can only ever mean something against
         // the frame the user was looking at.
-        terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, cache))?;
+        terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, render))?;
         *last_draw = Some(Instant::now());
     }
     Ok(())

@@ -5,7 +5,7 @@
 //! # Schema
 //!
 //! The on-disk shape matches spec §12: `[app]` (theme, layout_breakpoint_cols,
-//! mouse),
+//! mouse, inline_images),
 //! `[keys]` (palette), `[telemetry]` (mode, optional endpoint/protocol/headers).
 //! Two sections extend beyond the spec's illustrative sample so the state
 //! `ConfigPatch` can mutate actually persists somewhere: `[credentials]`
@@ -59,6 +59,17 @@ pub struct Config {
     /// `tgt-core`, which only ever sees the semantic actions a resolved
     /// click produces.
     pub mouse: bool,
+    /// Whether a downloaded photo may render as a picture on a terminal that
+    /// supports one (docs/design-language.md §6). Default on. Read once at
+    /// startup by `main.rs`, which turns it off by handing `tgt-ui` no
+    /// graphics capability at all; like `mouse`, it never reaches
+    /// `tgt-core`.
+    ///
+    /// This is the switch for "my terminal claims a protocol but the result
+    /// looks wrong", which no terminal probe can detect on the user's
+    /// behalf — over ssh into a host whose terminal type is misreported, or
+    /// under a multiplexer the probe does not know about.
+    pub inline_images: bool,
     /// Raw `"ctrl+p"`-style string; parsed into a `Key` by `boot_fields`.
     pub palette_key: String,
     pub telemetry_mode: TelemetryMode,
@@ -79,6 +90,7 @@ impl Default for Config {
             theme: "default".to_string(),
             layout_breakpoint_cols: 100,
             mouse: true,
+            inline_images: true,
             palette_key: "ctrl+p".to_string(),
             telemetry_mode: TelemetryMode::Vendor,
             telemetry_endpoint: None,
@@ -218,7 +230,12 @@ impl Config {
         out.push_str("# Mouse reporting: click a chat, a folder tab or the composer, and scroll\n");
         out.push_str("# either pane with the wheel. While it is on, the terminal's own text\n");
         out.push_str("# selection needs shift held down — set this to false to get it back.\n");
-        out.push_str(&format!("mouse = {}\n\n", self.mouse));
+        out.push_str(&format!("mouse = {}\n", self.mouse));
+        out.push_str("# Inline images: render a downloaded photo as a picture where the\n");
+        out.push_str("# terminal speaks kitty, iTerm2 or sixel. Off, or on a terminal without\n");
+        out.push_str("# one, a photo shows as a single descriptive line instead. Inside tmux\n");
+        out.push_str("# images stay off unless TGT_FORCE_GRAPHICS=1 says passthrough is set up.\n");
+        out.push_str(&format!("inline_images = {}\n\n", self.inline_images));
 
         out.push_str("[keys]\n");
         out.push_str("# Global command-palette shortcut, e.g. \"ctrl+p\" or a bare character.\n");
@@ -349,7 +366,7 @@ const KNOWN_SECTIONS: &[&str] = &["app", "keys", "telemetry", "credentials", "co
 
 fn known_keys(section: &str) -> &'static [&'static str] {
     match section {
-        "app" => &["theme", "layout_breakpoint_cols", "mouse"],
+        "app" => &["theme", "layout_breakpoint_cols", "mouse", "inline_images"],
         "keys" => &["palette"],
         "telemetry" => &["mode", "endpoint", "protocol", "headers"],
         "credentials" => &["api_id", "api_hash"],
@@ -419,6 +436,11 @@ fn parse(text: &str) -> eyre::Result<Config> {
             cfg.mouse = v
                 .as_bool()
                 .ok_or_else(|| eyre::eyre!("[app].mouse must be a boolean"))?;
+        }
+        if let Some(v) = app.get("inline_images") {
+            cfg.inline_images = v
+                .as_bool()
+                .ok_or_else(|| eyre::eyre!("[app].inline_images must be a boolean"))?;
         }
     }
 
@@ -633,6 +655,47 @@ mod tests {
         assert!(load().expect("load should succeed").mouse);
 
         clear_related_env();
+    }
+
+    /// Inline images are on unless the config says otherwise — the terminal
+    /// probe decides whether anything comes of that (design-language §6) —
+    /// and, like `mouse`, a config written before the key existed keeps the
+    /// default.
+    ///
+    /// Drives `render`/`parse` rather than `load`, so it needs neither the
+    /// filesystem nor `XDG_CONFIG_HOME`: `load`'s own first-run-generates
+    /// and file-round-trip behavior is already covered by the tests above,
+    /// and every test that sets that variable is one more thread racing the
+    /// tests in `otel.rs` that set it under a *different* lock.
+    #[test]
+    fn inline_images_default_on_and_can_be_turned_off() {
+        let defaults = Config::default();
+        assert!(defaults.inline_images, "inline images are on by default");
+        let generated = defaults.render();
+        assert!(
+            generated.contains("inline_images = true"),
+            "the generated template should document the key:\n{generated}"
+        );
+        assert!(
+            parse(&generated)
+                .expect("the generated template must parse")
+                .inline_images,
+            "the template has to round-trip through the parser"
+        );
+
+        assert!(
+            !parse("[app]\ninline_images = false\n")
+                .expect("parse should succeed")
+                .inline_images
+        );
+        // A config from before the key existed still boots with it on.
+        assert!(
+            parse("[app]\ntheme = \"midnight\"\n")
+                .expect("parse should succeed")
+                .inline_images
+        );
+        // And a non-boolean is a loud error, like every other typed key.
+        assert!(parse("[app]\ninline_images = \"yes\"\n").is_err());
     }
 
     #[test]

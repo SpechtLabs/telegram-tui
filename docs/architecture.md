@@ -1701,6 +1701,27 @@ pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, rs: &mut RenderState
 into `ui`'s `Capability` when constructing `RenderState`; the ui crate never
 reads the environment.
 
+Three decisions this amendment settled:
+
+- **Two-pass placement.** An image is not a `Line` and cannot travel through the
+  conversation's row buffer, so `ImageArea::plan` (a header read, not a decode)
+  answers how many rows a photo needs while the block is being laid out, blank
+  railed rows are reserved there, and the images are drawn over those rows after
+  the paragraph. The reserved rows are recorded in the `HitMap` like any other
+  row of the block, so a click on a photo still resolves to its message.
+- **Invalidation is blunt.** `RenderState::note_viewport` fingerprints the pane
+  rect, open chat, scroll anchor, newest loaded message, loaded count and theme
+  generation, and drops every placed image when any of it changes. A cautious
+  wrong answer costs a re-encode; the other kind leaves protocol cells smeared
+  across the screen (spec §8.3).
+- **Multiplexers decline by default.** Under `TMUX`, `probe_from` reports
+  `None` unless `TGT_FORCE_GRAPHICS=1`: tmux drops kitty/iTerm2 sequences into
+  the pane as garbage unless it is configured for passthrough, and the env vars
+  the other rules read are inherited from whatever terminal started tmux.
+  `[app] inline_images = false` (default true) is the same "off" arriving from
+  config rather than from the environment — both reach `ui` as `graphics: None`,
+  which is the only thing it can see.
+
 Visual conventions (chrome, hierarchy, message and attachment rendering,
 selection, themes) are specified in `docs/design-language.md`, which supersedes
 the decoration implied by spec §6.1's mock.

@@ -38,8 +38,8 @@ use tgt_core::app::AppState;
 use tgt_core::model::hit::{HitTarget, ScrollArea};
 use tgt_core::state::focus::Focus;
 
-use crate::render::cache::LayoutCache;
 use crate::render::hit::HitMap;
+use crate::render::state::RenderState;
 use crate::theme::Theme;
 use crate::view::{
     chat_list, chips, composer, conversation, header, help, hint_bar, modal, palette, toast,
@@ -108,8 +108,9 @@ fn draw_rule_junction(x: u16, y: u16, theme: &Theme, f: &mut Frame) {
     );
 }
 
-/// `cache` is threaded down to the conversation pane, the only view that lays
-/// messages out and therefore the only one that can hit or fill it.
+/// `rs` is threaded down to the conversation pane, the only view that lays
+/// messages out — and therefore the only one that can hit or fill the layout
+/// cache, or place an inline image (architecture §4.9.1).
 ///
 /// ## Hit regions (architecture §7.5)
 ///
@@ -127,15 +128,15 @@ fn draw_rule_junction(x: u16, y: u16, theme: &Theme, f: &mut Frame) {
 /// "nothing here is clickable"; and building the panes' map anyway keeps the
 /// draw path branch-free — the overlay decision is made once, at the end,
 /// where the focus is already being read to decide what to paint.
-pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) -> HitMap {
+pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, rs: &mut RenderState) -> HitMap {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme.surface)), area);
 
     let mut hits = HitMap::new();
     if state.width >= state.layout_breakpoint_cols {
-        draw_two_pane(area, state, theme, f, cache, &mut hits);
+        draw_two_pane(area, state, theme, f, rs, &mut hits);
     } else {
-        draw_single_pane(area, state, theme, f, cache, &mut hits);
+        draw_single_pane(area, state, theme, f, rs, &mut hits);
     }
 
     draw_overlays(state, theme, f);
@@ -209,7 +210,7 @@ fn draw_two_pane(
     state: &AppState,
     theme: &Theme,
     f: &mut Frame,
-    cache: &mut LayoutCache,
+    rs: &mut RenderState,
     hits: &mut HitMap,
 ) {
     let [content_area, bottom_area] =
@@ -237,7 +238,7 @@ fn draw_two_pane(
     header::draw(pad(header_area), state, theme, f);
     draw_horizontal_rule(header_rule, theme, f);
     draw_rule_junction(rule_area.x, header_rule.y, theme, f);
-    draw_conversation_and_composer(body_area, state, theme, f, cache, hits);
+    draw_conversation_and_composer(body_area, state, theme, f, rs, hits);
 
     draw_bottom_row(pad(bottom_area), state, theme, f);
 }
@@ -250,7 +251,7 @@ fn draw_single_pane(
     state: &AppState,
     theme: &Theme,
     f: &mut Frame,
-    cache: &mut LayoutCache,
+    rs: &mut RenderState,
     hits: &mut HitMap,
 ) {
     let showing_chat_list = state.open_chat.is_none()
@@ -276,7 +277,7 @@ fn draw_single_pane(
 
     draw_breadcrumb(pad(breadcrumb_area), state, theme, f);
     draw_horizontal_rule(breadcrumb_rule, theme, f);
-    draw_conversation_and_composer(body_area, state, theme, f, cache, hits);
+    draw_conversation_and_composer(body_area, state, theme, f, rs, hits);
     draw_bottom_row(pad(bottom_area), state, theme, f);
 }
 
@@ -311,7 +312,7 @@ fn draw_conversation_and_composer(
     state: &AppState,
     theme: &Theme,
     f: &mut Frame,
-    cache: &mut LayoutCache,
+    rs: &mut RenderState,
     hits: &mut HitMap,
 ) {
     let composer_height = COMPOSER_BOX_ROWS + composer_banner_rows(state);
@@ -326,7 +327,7 @@ fn draw_conversation_and_composer(
     .areas(pad(area));
 
     hits.push_area(conversation_area, ScrollArea::Conversation);
-    conversation::draw(conversation_area, state, theme, f, cache, hits);
+    conversation::draw(conversation_area, state, theme, f, rs, hits);
     // The whole composer area, banners included: a click anywhere in this
     // block means "type here", and a reply banner is part of the composer,
     // not a separate thing to hit.
@@ -471,11 +472,11 @@ mod tests {
 
     fn render_to_string(width: u16, height: u16, state: &AppState) -> String {
         let theme = Theme::default_dark();
-        let mut cache = LayoutCache::new();
+        let mut rs = RenderState::new(None);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|f| {
-                draw(state, &theme, f, &mut cache);
+                draw(state, &theme, f, &mut rs);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

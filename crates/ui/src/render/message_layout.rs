@@ -178,7 +178,12 @@ pub const GROUP_WINDOW_SECS: i64 = 300;
 const RAIL: &str = "▏";
 
 /// Columns the rail and its adjoining space take on every line of a block.
-const RAIL_COLS: u16 = 2;
+///
+/// Public for the same reason [`RECEIPT_COLS`] is: the conversation view
+/// draws things this module doesn't lay out — chiefly an inline image
+/// (design-language §6), which has to start exactly where a block's text
+/// starts or it reads as belonging to no message at all.
+pub const RAIL_COLS: u16 = 2;
 
 /// Columns an own message keeps free at the end of every line so the view can
 /// append a read receipt inline: one separating space plus the widest marker

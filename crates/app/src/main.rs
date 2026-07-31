@@ -89,14 +89,15 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
 
     // Once per session, before raw mode: the probe only reads environment
     // variables the terminal set when it started this process, so nothing
-    // later can change its answer. The draw path still renders every photo
-    // as a placeholder card (see `graphics`'s module docs); the probe's
-    // other consumer is the telemetry session below.
+    // later can change its answer. Its two consumers are the draw path (via
+    // `graphics_capability` below) and the telemetry session further down.
     let graphics_protocol = graphics::probe();
     tracing::info!(
         protocol = graphics::telemetry_str(graphics_protocol),
+        inline_images = config.inline_images,
         "terminal graphics protocol probed"
     );
+    let graphics = graphics_capability(graphics_protocol, config.inline_images);
 
     // The install id is exported; the salt never is — it is what makes
     // `chat.hash` irreversible (spec §13.4). Both are read (or generated)
@@ -157,12 +158,15 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
         let runtime: Arc<dyn TdRuntime> = Arc::new(TdlibRuntime::new().await);
         runtime_loop::run(
             app,
-            theme,
             &mut terminal,
             runtime,
             config,
             td_boot,
-            resolve_theme,
+            runtime_loop::Presentation {
+                theme,
+                resolve_theme,
+                graphics,
+            },
         )
         .await
     });
@@ -269,6 +273,36 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
+    }
+}
+
+/// Maps the startup probe into the value `tgt-ui` draws from
+/// (architecture §4.9.1). Two distinct "no" answers collapse into the same
+/// `None`, which is the whole point of the boundary: the ui crate never
+/// learns *why* it has no protocol, only that it has none and must draw the
+/// design-language §4 line instead.
+///
+/// - `enabled` is `[app].inline_images`. Turning it off is how a user
+///   overrules a probe that guessed right about the protocol and wrong about
+///   the result (`config.rs` has the cases).
+/// - `GraphicsProtocol::None` is the probe finding nothing to speak — which
+///   includes running under tmux without `TGT_FORCE_GRAPHICS=1` (see
+///   `graphics::probe_from`).
+fn graphics_capability(
+    protocol: graphics::GraphicsProtocol,
+    enabled: bool,
+) -> Option<tgt_ui::render::image::Capability> {
+    use graphics::GraphicsProtocol;
+    use tgt_ui::render::image::Capability;
+
+    if !enabled {
+        return None;
+    }
+    match protocol {
+        GraphicsProtocol::Kitty => Some(Capability::Kitty),
+        GraphicsProtocol::Iterm2 => Some(Capability::Iterm2),
+        GraphicsProtocol::Sixel => Some(Capability::Sixel),
+        GraphicsProtocol::None => None,
     }
 }
 
@@ -400,6 +434,30 @@ mod tests {
             effective_telemetry_mode(&cli, TelemetryMode::Custom),
             TelemetryMode::Custom
         );
+    }
+
+    /// Every protocol the probe can report has to reach `tgt-ui` as the
+    /// capability that speaks it — a mapping that is easy to get silently
+    /// wrong (the two enums are deliberately separate types, and three of
+    /// the four variants have near-identical names).
+    #[test]
+    fn every_probed_protocol_maps_to_its_ui_capability() {
+        use graphics::GraphicsProtocol;
+        use tgt_ui::render::image::Capability;
+
+        for (protocol, expected) in [
+            (GraphicsProtocol::Kitty, Some(Capability::Kitty)),
+            (GraphicsProtocol::Iterm2, Some(Capability::Iterm2)),
+            (GraphicsProtocol::Sixel, Some(Capability::Sixel)),
+            (GraphicsProtocol::None, None),
+        ] {
+            assert_eq!(graphics_capability(protocol, true), expected);
+            assert_eq!(
+                graphics_capability(protocol, false),
+                None,
+                "[app].inline_images = false must beat any probed protocol"
+            );
+        }
     }
 
     /// `tgt-core`'s `state::palette::BUILTIN_THEME_NAMES` is a copy of

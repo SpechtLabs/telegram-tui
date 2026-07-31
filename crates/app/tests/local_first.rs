@@ -75,6 +75,9 @@ impl Harness {
                 database_encryption_key: vec![7u8; 32],
             },
             key_events,
+            // No terminal graphics: these harnesses drive a TestBackend, and
+            // the design-language §4 line is what a photo renders as there.
+            None,
         );
         Harness { core, fake, keys }
     }
