@@ -13,13 +13,11 @@ use crate::theme::Theme;
 
 pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
     match state.screen {
-        // The auth wizard owns the whole frame; it is a screen, not a pane.
+        // The consent screen and the auth wizard each own the whole frame;
+        // both are screens, not panes.
+        Screen::Consent => view::consent::draw(state, theme, f),
         Screen::Auth => view::auth::draw(state, theme, f),
-        // TODO(T50): `Screen::Consent` gets `view::consent::draw`. Until the
-        // consent screen exists nothing ever sets that screen (main.rs boots
-        // with `consent_needed: false`), so falling through to the shell is
-        // unreachable rather than wrong.
-        Screen::Consent | Screen::Main => view::root::draw(state, theme, f, cache),
+        Screen::Main => view::root::draw(state, theme, f, cache),
     }
 }
 

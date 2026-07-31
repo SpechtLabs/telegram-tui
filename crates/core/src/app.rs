@@ -12,7 +12,7 @@ use crate::model::time::Millis;
 use crate::state::auth::{self, AuthField, AuthState, InputField, LoginMethod};
 use crate::state::chat_list::{self, ChatListState, ChatLoadPhase};
 use crate::state::composer::{self, ComposerState};
-use crate::state::consent::{ConsentChoice, ConsentState};
+use crate::state::consent::{self, ConsentChoice, ConsentState};
 use crate::state::conversation::{self, ConversationState};
 use crate::state::focus::{Focus, FocusStack};
 use crate::state::media::{self, MediaState};
@@ -329,6 +329,16 @@ impl App {
     fn dispatch_key(&mut self, key: Key) -> Option<Vec<Effect>> {
         if key == self.state.bindings.quit {
             return Some(vec![Effect::Quit]);
+        }
+
+        // 0. The consent screen is a gate in front of everything else,
+        //    `Screen::Auth` included (spec §13.5: shown before login and
+        //    before any data is sent). It claims every key while
+        //    `Screen::Consent` is up and nothing once it isn't, so no pane,
+        //    modal or global binding below is ever reachable from it.
+        if let Some(effects) = consent::handle_key(&mut self.state, key) {
+            self.dirty = true;
+            return Some(effects);
         }
 
         // 1. Modal. Top of the table because a modal swallows every key it is

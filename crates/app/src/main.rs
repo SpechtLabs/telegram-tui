@@ -87,9 +87,11 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     } else {
         config.telemetry_mode
     };
-    // T50 replaces `consent_acknowledged` with a real first-run screen. The
-    // gate itself is already the one that matters: no acknowledgement, no
-    // exporter, no matter what the config says.
+    // Read from disk before the consent screen (below, via `App::new`) can
+    // possibly run this session — an unacknowledged first run therefore
+    // never constructs an exporter, whatever the user is about to choose.
+    // The screen's own acknowledgement only takes effect on the *next* run,
+    // once its `ConfigPatch::ConsentAcknowledged` has round-tripped to disk.
     let otel_guard = if config.consent_acknowledged && telemetry_mode != TelemetryMode::Off {
         install_exporter(&export_handle, telemetry_mode, &config, &identity)
     } else {
@@ -235,11 +237,12 @@ fn boot_from(
         // Generated once per install and persisted `0600` next to the
         // install id; never transmitted (spec §13.4).
         telemetry_salt,
-        // TODO(T50): the first-run consent screen decides this from
-        // `config.consent_acknowledged`. Until that screen exists there is
-        // nothing to consent to (no exporter until T49), so booting straight
-        // to auth is honest rather than skipping a gate.
-        consent_needed: false,
+        // The first-run screen (spec §13.5): shown whenever the config does
+        // not yet record an acknowledged choice. It is the only writer of
+        // `consent_acknowledged` (via `ConfigPatch::ConsentAcknowledged`),
+        // so an unacknowledged install always boots here before auth and
+        // before `install_exporter` above ever runs.
+        consent_needed: !config.consent_acknowledged,
         has_credentials: fields.has_credentials,
         width: size.width,
         height: size.height,

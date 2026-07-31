@@ -1,0 +1,32 @@
+---
+source: crates/ui/src/view/consent.rs
+assertion_line: 263
+expression: "render_to_string(100, 30, &state)"
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+              ┌────────────────────────── Before we start ───────────────────────────┐              
+              │telegram-tui can send anonymous usage telemetry to help find bugs and │              
+              │see which features get used.                                          │              
+              │                                                                      │              
+              │Collected: app/OS version, terminal type, action names (e.g. "sent a  │              
+              │message"), outcomes, error kinds, durations, and a random per-install │              
+              │id.                                                                   │              
+              │                                                                      │              
+              │Never collected: message text, contact names, phone numbers, chat     │              
+              │titles, or file names.                                                │              
+              │                                                                      │              
+              │Sent to: the telegram-tui project's telemetry endpoint.               │              
+              │                                                                      │              
+              │                                                                      │              
+              │Change your mind later: `--no-telemetry`,                             │              
+              │`TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK=1`, or edit config.toml.  │              
+              │                                                                      │              
+              │             ▶ Enable                             Disable             │              
+              │                                                                      │              
+              │                                                                      │              
+              │↑↓←→/tab choose · ⏎ confirm                                           │              
+              │                                                                      │              
+              │                                                                      │              
+              └──────────────────────────────────────────────────────────────────────┘
