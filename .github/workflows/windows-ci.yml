@@ -1,0 +1,113 @@
+name: Windows CI
+
+# Split out of ci.yml (task #75). Windows used to be a third leg of that
+# workflow's matrix, kept non-gating with `continue-on-error`. That stopped a
+# red Windows job *failing* a release, but not *delaying* one:
+# release.yaml's `build` job needs the whole `ci` workflow_call to finish, and
+# a called workflow does not report done until every job inside it does,
+# `continue-on-error` or not. Windows is reliably the slowest leg here —
+# Defender scans every file cargo writes and NTFS charges more per file, the
+# same cost ci.yml documents for its own two platforms — so every release and
+# every repair sat waiting on a platform that ships no artifact and gates
+# nothing.
+#
+# This file is not `workflow_call`-able and release.yaml does not reference
+# it, so nothing downstream ever waits on it. Coverage is preserved rather
+# than traded away for that: it runs on the same two events ci.yml's matrix
+# does (`pull_request`, and — unlike ci.yml — a direct `push` to main, since
+# there is no release run to piggyback on any more), so a Windows regression
+# is still caught at the commit that introduced it. It is advisory in the
+# same sense ci.yml's old Windows leg was: it runs, it reports, and it gates
+# nothing. Nothing forces a red run here to be fixed, so it can rot
+# unnoticed — check it before believing the platform still builds, and if
+# it is red for long, either fix it or drop the job. A permanently red
+# advisory job is worse than no job.
+#
+# macOS and Linux stay in ci.yml: they ship release artifacts (release.yaml)
+# and release.yaml's build job genuinely needs them to pass first.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Never called from another workflow (see above), so `github.workflow`
+# always resolves to this workflow's own name here — none of the deadlock
+# risk ci.yml's concurrency comment documents for a `workflow_call`'d file.
+# Always cancelling a superseded run (on `push` too, not just `pull_request`)
+# is safe specifically because nothing depends on this job completing: it
+# ships no artifact and blocks no release, unlike release.yaml's own runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # See ci.yml's identical setting for why: incremental compilation is a pure
+  # cost on a runner that only ever compiles once, and skipping it here saves
+  # 8+ minutes in "Post Cache" (tar.exe over hundreds of thousands of small
+  # files) that this job feels more than the other two ever did.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: Checks (windows-latest)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          version: 2026.6.10
+          install: true
+          cache: true
+
+      # Defender scans every file synchronously as it is written, and a debug
+      # build of this workspace writes hundreds of thousands of small ones
+      # (rlibs, object files, fingerprints, dep-info). That tax is the single
+      # largest reason this job takes multiples of ci.yml's Linux leg for
+      # identical work. Excluding the two directories cargo writes into is
+      # the standard mitigation; it applies only to this ephemeral runner,
+      # which is destroyed after the job, and only to paths we produce
+      # ourselves.
+      - name: Exclude the cargo directories from Defender
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionProcess "rustc.exe"
+          Add-MpPreference -ExclusionProcess "cargo.exe"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            !target/debug/incremental
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Same gates as ci.yml, same reason each is its own step: a failure
+      # names itself in the UI, and the commands live in .mise.toml so
+      # `mise run check` locally runs exactly this set. No "Crate boundaries"
+      # step — ci.yml already runs it once, on Linux, and the dependency
+      # graph it checks does not vary by platform.
+      - name: Formatting
+        run: mise run fmt-check
+
+      - name: Clippy
+        run: mise run lint
+
+      - name: Tests
+        run: mise run test
+
+      - name: Pending snapshots
+        run: mise run snapshots

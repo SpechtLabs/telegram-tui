@@ -59,9 +59,10 @@ permissions:
   pull-requests: write
   id-token: write
 
-# A new push supersedes the run in flight. The three-platform matrix is not
-# cheap even when it is free — macOS runners bill at 10x and Windows at 2x on
-# private repos — and a superseded run proves nothing about the current head.
+# A new push supersedes the run in flight. The build matrix is not cheap even
+# when it is free — macOS runners bill at 10x on private repos — and a
+# superseded run proves nothing about the current head. (Windows is not part
+# of what this run waits on — see windows-ci.yml and task #75.)
 # Releases are exempt: cancelling one half-way could leave a tag published
 # with no binary attached to it.
 # Every run gets a group nothing else can occupy: a repair is keyed by the tag
@@ -126,7 +127,9 @@ jobs:
     # tdlib-rs's `download-tdlib` publishes a prebuilt TDLib for exactly these
     # four (plus android and windows) — see its build.rs and the v1.4.0 release
     # assets — so each row has a library to download. Windows is built and
-    # tested by ci.yml but ships no artifact: its loader has no rpath
+    # tested in its own workflow, windows-ci.yml — not called from here, and
+    # not in `needs` below, precisely so this job never waits on it (task
+    # #75) — but ships no artifact regardless: its loader has no rpath
     # equivalent, so the relocatable layout below has no Windows spelling, and
     # nobody has run the client there.
     strategy:

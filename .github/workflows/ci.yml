@@ -7,18 +7,19 @@ on:
   #
   # Deliberately no `push` trigger. release.yaml already runs on every push to
   # main and calls this workflow, so a push trigger here ran the whole
-  # three-platform matrix a second time against the identical commit —
-  # doubling the queue, and the wait, for no extra signal. Pushes to main are
-  # covered by the CI job inside the Release run; pull requests are covered
-  # here directly.
+  # matrix a second time against the identical commit — doubling the queue,
+  # and the wait, for no extra signal. Pushes to main are covered by the CI
+  # job inside the Release run; pull requests are covered here directly.
+  # (windows-ci.yml is the exception: it has its own direct `push` trigger,
+  # since it is never called from release.yaml — see the `check` job below.)
   workflow_call:
 
 permissions:
   contents: read
 
-# A new push supersedes the run in flight. The three-platform matrix is not
-# cheap even when it is free — macOS runners bill at 10x and Windows at 2x on
-# private repos — and a superseded run proves nothing about the current head.
+# A new push supersedes the run in flight. The matrix is not cheap even when
+# it is free — macOS runners bill at 10x on private repos — and a superseded
+# run proves nothing about the current head.
 # Releases are exempt: cancelling one half-way could leave a tag published
 # with no binary attached to it.
 #
@@ -45,38 +46,35 @@ env:
   # Incremental compilation is a pure cost on a runner: every job starts from a
   # restored cache and compiles once, so nothing is ever recompiled to benefit
   # from it — but it emits by far the most files in target/, which is what the
-  # cache has to tar up afterwards. Leaving it on cost the Windows job 8+
-  # minutes in "Post Cache" alone (Git's tar.exe is punishingly slow over many
-  # small files) for artifacts no later step reads.
+  # cache has to tar up afterwards. Leaving it on cost the Windows job (now
+  # windows-ci.yml, same setting there) 8+ minutes in "Post Cache" alone
+  # (Git's tar.exe is punishingly slow over many small files) for artifacts no
+  # later step reads.
   CARGO_INCREMENTAL: 0
 
 jobs:
   check:
     # macOS and Linux both ship release artifacts (see release.yaml), on both
-    # architectures. Windows is built and tested here and nowhere else: its
-    # loader has no rpath equivalent, so the relocatable bin/ + lib/ layout the
-    # release depends on has no Windows spelling, and nobody has run the client
-    # there.
+    # architectures.
     #
-    # Windows is advisory: it runs, it reports, and it does not gate. The job
-    # is multiples slower than the other two for identical work — Defender
-    # scans every file cargo writes and NTFS charges more per file — and being
-    # slowest made it the one a superseding push always cancelled, so it
-    # blocked releases without ever finishing. Since it ships no artifact and
-    # is documented experimental, failing the run on it bought nothing that
-    # reading the run summary does not.
-    #
-    # The cost is real and worth stating: nothing forces a red Windows job to
-    # be fixed, so it can rot unnoticed. Check it before believing the platform
-    # still builds, and if it is red for long, either fix it or drop the job —
-    # a permanently red advisory job is worse than no job.
+    # Windows is checked in its own workflow, windows-ci.yml, not this
+    # matrix — it used to be a third entry here behind `continue-on-error`,
+    # which stopped a red Windows job *failing* a release but not *delaying*
+    # one. release.yaml's `build` job needs this whole workflow_call to
+    # finish, and a called workflow does not report done until every job
+    # inside it does, `continue-on-error` or not; Windows is reliably the
+    # slowest leg (Defender + NTFS overhead, see windows-ci.yml), so every
+    # release and every repair waited on a platform that ships no artifact
+    # and gates nothing. windows-ci.yml has its own `pull_request` and `push`
+    # triggers — same events this matrix runs on — so a Windows regression is
+    # still caught at the commit that introduced it; it is simply no longer
+    # something release.yaml's `build` job needs to wait for.
     name: Checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-latest, windows-latest]
+        os: [macos-15, ubuntu-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -95,22 +93,6 @@ jobs:
       - name: Install libc++ (Linux TDLib runtime dependency)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
-
-      # Defender scans every file synchronously as it is written, and a debug
-      # build of this workspace writes hundreds of thousands of small ones
-      # (rlibs, object files, fingerprints, dep-info). That tax is the single
-      # largest reason the Windows job takes multiples of the Linux one for
-      # identical work. Excluding the two directories cargo writes into is the
-      # standard mitigation; it applies only to this ephemeral runner, which is
-      # destroyed after the job, and only to paths we produce ourselves.
-      - name: Exclude the cargo directories from Defender
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionProcess "rustc.exe"
-          Add-MpPreference -ExclusionProcess "cargo.exe"
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
