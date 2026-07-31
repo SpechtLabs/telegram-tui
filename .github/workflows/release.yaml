@@ -29,8 +29,16 @@ permissions:
 # private repos — and a superseded run proves nothing about the current head.
 # Releases are exempt: cancelling one half-way could leave a tag published
 # with no binary attached to it.
+# A manual repair gets a group of its own, keyed by the tag it is rebuilding.
+# With cancel-in-progress false GitHub keeps only ONE pending run per group, so
+# while this shared `github.ref` with ordinary pushes, every push to main
+# cancelled a queued repair before it started — which is exactly when a repair
+# is wanted, since the branch is active precisely because something is being
+# fixed. v0.1.4's repair was cancelled twice this way. Keying on the tag also
+# means two repairs of different tags no longer block each other, while a
+# second repair of the same tag still queues behind the first.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
