@@ -112,15 +112,75 @@ pub(crate) mod tests {
         ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// Generates a `set_<x>_dir`/`unset_<x>_dir` pair that redirects one of
+    /// `etcetera`'s directories into a tempdir for the life of an
+    /// `env_lock()` guard.
+    ///
+    /// The variable name is platform-dependent because
+    /// `etcetera::choose_base_strategy()` picks the OS's *native* strategy,
+    /// not always XDG. On unix that native strategy *is* XDG, so
+    /// `XDG_*_HOME` works. On Windows it reads `APPDATA`/`LOCALAPPDATA`
+    /// straight from the environment before ever falling back to the
+    /// Roaming/Local known folders (see
+    /// `etcetera-0.11.0/src/base_strategy/windows.rs`) and never looks at
+    /// `XDG_*_HOME` at all. `state_dir` in particular has no Windows XDG
+    /// equivalent at all: `etcetera` answers `None` for it there and
+    /// `logging::state_dir` falls back to `cache_dir`, which is
+    /// `%LOCALAPPDATA%` — the same variable `data_dir` uses. Setting only
+    /// the XDG name here would pass silently on unix while silently
+    /// reading and writing the *real* user profile on Windows (the bug this
+    /// module exists to close, T71). Do not "simplify" this back to a single
+    /// XDG_* variable.
+    ///
+    /// Prefer these `set_*`/`unset_*` pairs to a bare `remove_var` sweep
+    /// where the two differ: unsetting `APPDATA`/`LOCALAPPDATA` outright
+    /// makes `etcetera` fall back to the *real* known folder rather than
+    /// erroring, so a "clear ambient state" step that removes it and then
+    /// forgets to set a tempdir back would point a Windows test at the
+    /// user's actual profile instead of failing loudly.
+    macro_rules! env_dir_override {
+        ($set:ident, $unset:ident, unix: $unix_var:literal, windows: $win_var:literal) => {
+            /// # Safety
+            /// Caller must be holding [`env_lock`].
+            #[cfg(unix)]
+            pub(crate) unsafe fn $set(path: &std::path::Path) {
+                // SAFETY: forwarded to the caller of this unsafe fn.
+                unsafe { std::env::set_var($unix_var, path) };
+            }
+            #[cfg(windows)]
+            pub(crate) unsafe fn $set(path: &std::path::Path) {
+                // SAFETY: forwarded to the caller of this unsafe fn.
+                unsafe { std::env::set_var($win_var, path) };
+            }
+
+            /// # Safety
+            /// Caller must be holding [`env_lock`].
+            #[cfg(unix)]
+            pub(crate) unsafe fn $unset() {
+                // SAFETY: forwarded to the caller of this unsafe fn.
+                unsafe { std::env::remove_var($unix_var) };
+            }
+            #[cfg(windows)]
+            pub(crate) unsafe fn $unset() {
+                // SAFETY: forwarded to the caller of this unsafe fn.
+                unsafe { std::env::remove_var($win_var) };
+            }
+        };
+    }
+
+    env_dir_override!(set_config_dir, unset_config_dir, unix: "XDG_CONFIG_HOME", windows: "APPDATA");
+    env_dir_override!(set_data_dir, unset_data_dir, unix: "XDG_DATA_HOME", windows: "LOCALAPPDATA");
+    env_dir_override!(set_state_dir, unset_state_dir, unix: "XDG_STATE_HOME", windows: "LOCALAPPDATA");
+
     #[test]
     fn logging_writes_under_state_dir() {
         let _lock = env_lock();
 
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: serialized by ENV_LOCK above; no other thread reads or
-        // writes XDG_STATE_HOME while this guard is held.
+        // writes the state-dir override while this guard is held.
         unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            set_state_dir(tmp.path());
         }
 
         let (guard, _export_handle) =
@@ -128,8 +188,9 @@ pub(crate) mod tests {
         tracing::info!("logging smoke test event");
         drop(guard);
 
+        // SAFETY: serialized by ENV_LOCK above.
         unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
+            unset_state_dir();
         }
 
         let app_dir = tmp.path().join(APP_DIR);

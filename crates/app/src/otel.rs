@@ -831,30 +831,32 @@ mod tests {
         assert!(protocol_from(Some("carrier-pigeon")).is_err());
     }
 
-    /// Unix only, for two reasons that both stop it dead on Windows: there
-    /// are no mode bits to assert, and `XDG_CONFIG_HOME` — the hook this test
-    /// uses to keep the identity files inside a tempdir — is not consulted by
-    /// `etcetera`'s Windows strategy, which answers `%APPDATA%` regardless.
-    /// Running it there would write to the real config directory and still
-    /// prove nothing about privacy.
+    /// Unix only: the mode-bit assertions below have no Windows equivalent.
+    /// `set_config_dir` (see its docs in `logging::tests`) does redirect the
+    /// identity files into a tempdir on Windows too — via `APPDATA`, since
+    /// `etcetera`'s Windows strategy never consults `XDG_CONFIG_HOME` — but
+    /// there are no permission bits there to check.
     #[cfg(unix)]
     #[test]
     fn identity_is_stable_across_calls_and_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
+
+        use crate::logging::tests::{set_config_dir, unset_config_dir};
 
         let tmp = tempfile::tempdir().unwrap();
         let _lock = crate::logging::tests::env_lock();
         // SAFETY: serialized against every other test that touches the
         // process environment by the shared lock above.
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let first = load_or_create_identity().expect("identity is created on first run");
         let second = load_or_create_identity().expect("identity is read back on later runs");
 
+        // SAFETY: serialized by the shared lock above.
         unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unset_config_dir();
         }
 
         assert_eq!(first.install_id, second.install_id);

@@ -200,6 +200,7 @@ mod tests {
     use tgt_core::telemetry::schema::ALLOWED_KEYS;
 
     use super::*;
+    use crate::logging::tests::{set_config_dir, unset_config_dir};
 
     /// Every `key = value` line `show_to` writes must name a key from the
     /// allowlist. This is spec §13.2's structural guarantee, checked from
@@ -211,7 +212,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: serialized by the shared env lock other telemetry tests use.
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let config = Config::default();
@@ -219,7 +220,7 @@ mod tests {
         show_to(&config, &mut buf).expect("show_to should succeed against a scratch config dir");
 
         unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unset_config_dir();
         }
 
         let output = String::from_utf8(buf).expect("show_to writes UTF-8");
@@ -246,7 +247,7 @@ mod tests {
         let _lock = crate::logging::tests::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let config = Config {
@@ -259,7 +260,7 @@ mod tests {
         show_to(&config, &mut buf).unwrap();
 
         unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unset_config_dir();
         }
 
         let output = String::from_utf8(buf).unwrap();
@@ -279,7 +280,7 @@ mod tests {
         let _lock = crate::logging::tests::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let before = otel::load_or_create_identity().expect("identity is created on first read");
@@ -287,7 +288,7 @@ mod tests {
         let after = otel::load_or_create_identity().expect("identity is read back after reset");
 
         unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
+            unset_config_dir();
         }
 
         assert_eq!(old_id, before.install_id);

@@ -590,18 +590,69 @@ mod tests {
 
     use super::*;
 
-    // Config loading touches several process-wide env vars (XDG_CONFIG_HOME
-    // plus the override vars). Serialize every test that mutates any of
-    // them so parallel `cargo test` runs don't race each other; tolerate
-    // poisoning from a prior panicking test rather than cascading failures.
+    // Config loading touches several process-wide env vars (the config-dir
+    // override plus the literal override vars below). Serialize every test
+    // that mutates any of them so parallel `cargo test` runs don't race each
+    // other; tolerate poisoning from a prior panicking test rather than
+    // cascading failures.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Redirects `etcetera`'s notion of the OS config directory into `path`
+    /// for the life of an `ENV_LOCK` guard.
+    ///
+    /// `etcetera::choose_base_strategy()` picks the platform's *native*
+    /// strategy, not always XDG: on Windows it reads `APPDATA` straight from
+    /// the environment (see `etcetera-0.11.0/src/base_strategy/windows.rs`)
+    /// and never looks at `XDG_CONFIG_HOME` at all. Setting only the XDG
+    /// name here would pass silently on unix and silently read/write the
+    /// *real* user profile on Windows — the bug T71 exists to close. Do not
+    /// "simplify" this back to one variable.
+    ///
+    /// This duplicates `logging::tests::set_config_dir`/`unset_config_dir`
+    /// rather than reusing them: several integration tests under `tests/`
+    /// pull in this file via `#[path]` without `logging.rs` (see
+    /// `Config::custom_destination`'s docs for the same constraint applied
+    /// to `otel.rs`), so `config.rs`'s own test module must stay free of
+    /// that dependency too. Keep the two implementations in sync by hand.
+    ///
+    /// # Safety
+    /// Caller must be holding `ENV_LOCK`.
+    #[cfg(unix)]
+    unsafe fn set_config_dir(path: &std::path::Path) {
+        // SAFETY: forwarded to the caller of this unsafe fn.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+    }
+    #[cfg(windows)]
+    unsafe fn set_config_dir(path: &std::path::Path) {
+        // SAFETY: forwarded to the caller of this unsafe fn.
+        unsafe { std::env::set_var("APPDATA", path) };
+    }
+
+    /// Clears whatever `set_config_dir` set. See its docs for why the
+    /// variable name is platform-dependent.
+    ///
+    /// # Safety
+    /// Caller must be holding `ENV_LOCK`.
+    #[cfg(unix)]
+    unsafe fn unset_config_dir() {
+        // SAFETY: forwarded to the caller of this unsafe fn.
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+    #[cfg(windows)]
+    unsafe fn unset_config_dir() {
+        // SAFETY: forwarded to the caller of this unsafe fn.
+        unsafe { std::env::remove_var("APPDATA") };
+    }
+
+    // The config-dir override is handled separately by `unset_config_dir`
+    // above: which env var that means is platform-dependent (see its
+    // docs), unlike these, which `load()` reads literally on every
+    // platform.
     const RELATED_VARS: &[&str] = &[
-        "XDG_CONFIG_HOME",
         "TELEGRAM_API_ID",
         "TELEGRAM_API_HASH",
         "TELEGRAM_TUI_TELEMETRY",
@@ -617,6 +668,7 @@ mod tests {
             for var in RELATED_VARS {
                 std::env::remove_var(var);
             }
+            unset_config_dir();
         }
     }
 
@@ -627,7 +679,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: serialized by ENV_LOCK.
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let cfg = load().expect("load should generate and return defaults");
@@ -658,7 +710,7 @@ mod tests {
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let cfg = load().expect("first run generates defaults");
@@ -775,7 +827,7 @@ mod tests {
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let dir = tmp.path().join("telegram-tui");
@@ -810,7 +862,7 @@ mod tests {
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let dir = tmp.path().join("telegram-tui");
@@ -843,7 +895,7 @@ mod tests {
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let dir = tmp.path().join("telegram-tui");
@@ -879,7 +931,7 @@ mod tests {
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            set_config_dir(tmp.path());
         }
 
         let mut cfg = load().expect("initial load should generate defaults");

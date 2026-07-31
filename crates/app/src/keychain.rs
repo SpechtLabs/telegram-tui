@@ -141,21 +141,24 @@ mod tests {
         assert!(decode_key("deadbeef").is_err());
     }
 
-    /// Unix only, for two reasons that both stop it dead on Windows: there
-    /// are no mode bits to assert, and `XDG_DATA_HOME` — the hook this test
-    /// uses to redirect the directory into a tempdir — is not consulted by
-    /// `etcetera`'s Windows strategy, which answers `%APPDATA%` regardless.
-    /// Whether Windows creates the directory at all is left to the
-    /// integration tests.
+    /// Unix only: the mode-bit assertion below has no Windows equivalent.
+    /// `set_data_dir` (see its docs in `logging::tests`) does redirect this
+    /// path on Windows too — via `LOCALAPPDATA`, since `etcetera`'s Windows
+    /// strategy never consults `XDG_DATA_HOME` — but there are no permission
+    /// bits there to check. Whether Windows creates the directory at all is
+    /// left to the integration tests.
     #[cfg(unix)]
     #[test]
     fn td_database_dir_created_with_mode_0700() {
+        use crate::logging::tests::{set_data_dir, unset_data_dir};
+
         let _lock = lock_env();
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: serialized by ENV_LOCK; no other thread in this test
-        // binary reads or writes XDG_DATA_HOME while this guard is held.
+        // binary reads or writes the data-dir override while this guard is
+        // held.
         unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
+            set_data_dir(tmp.path());
         }
 
         let dir = td_database_dir().expect("should create the td database dir");
@@ -166,8 +169,9 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "expected mode 0700, got {mode:o}");
 
+        // SAFETY: serialized by ENV_LOCK.
         unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
+            unset_data_dir();
         }
     }
 
