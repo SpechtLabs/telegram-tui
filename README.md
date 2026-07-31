@@ -31,9 +31,28 @@ Press `↑` on an empty composer and you're in selection mode: the newest messag
 
 ## Status
 
-Usable for daily text conversations: login, chat list, history, sending, replies, edits, deletes, reactions, media download, search. Pre-1.0 and macOS on Apple Silicon only, so expect rough edges and occasional breaking changes. Nothing in the architecture rules out Linux or Windows; they're simply not built or tested yet.
+Usable for daily text conversations: login, chat list, history, sending, replies, edits, deletes, reactions, media download, search. Pre-1.0, so expect rough edges and occasional breaking changes.
 
 Not in v1: multiple accounts, voice and video calls, secret chats.
+
+### Platforms
+
+| Platform | Status |
+|---|---|
+| macOS (Apple Silicon) | Supported. The only platform with a release build. |
+| Linux | **Experimental, untested.** Compiles and passes the test suite in CI, nobody has run it. Build from source. |
+| Windows | **Experimental, untested.** Same, with the caveats below. |
+
+Linux and Windows exist because the code turned out to be portable, not because
+anyone has used the client there. If you try either, please open an issue about
+what broke — that feedback is the only way they stop being experimental.
+
+Two things to know before you do. On Linux the prebuilt TDLib is linked against
+LLVM's libc++, so you need `libc++1` (and `libc++abi1`) installed or the binary
+will not start, and the credential store needs a running Secret Service provider
+such as gnome-keyring. On Windows the `0700` lockdown that protects the TDLib
+database directory and the telemetry salt is unix-only; those inherit ACLs
+instead, and hardening them properly is unfinished work.
 
 ## Install
 

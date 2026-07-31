@@ -37,6 +37,15 @@ jobs:
           install: true
           cache: true
 
+      # The prebuilt TDLib that `download-tdlib` fetches for Linux is linked
+      # against LLVM's libc++, which the Ubuntu image does not ship, so every
+      # binary that loads it dies with "libc++.so.1: cannot open shared object
+      # file". This is a real runtime dependency for Linux users too, not a CI
+      # quirk — see the platform note in README.md.
+      - name: Install libc++ (Linux TDLib runtime dependency)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
+
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
