@@ -323,6 +323,14 @@ fi
 # have to agree on it. Replacing an aarch64-apple-darwin tree with an
 # x86_64-unknown-linux-gnu one fails at dyld load, which is the unrecoverable
 # shape: the binary that would repair it can no longer start.
+# The installer rides along, so `tgt update` can hand the swap back to it
+# instead of carrying a second implementation of stage/rename/probe/rollback.
+# It is the NEW release's copy that performs the swap, so a layout change
+# applies itself rather than being executed by an older script that predates
+# it — and because it is inside the tarball, `--require-signature` covers the
+# code doing the replacing, not just the bytes being installed.
+install -m 755 scripts/install.sh "$dist_dir/install.sh"
+
 cat >"$dist_dir/.tgt-install" <<EOF
 # Written by scripts/package.sh. Read by scripts/install.sh and \`tgt update\`
 # to confirm a directory is a tgt tree before replacing it.

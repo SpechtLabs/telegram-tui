@@ -255,10 +255,33 @@ See https://github.com/$REPO/releases/tag/$tag"
 Refusing to install. Please report this."
 
     check_linux_runtime
+    swap_tree "$workdir/unpacked/tgt" "$target"
+}
 
-    # Swap the tree in one rename, keeping the old one until the new binary
-    # has proved it runs. Both live under the same parent, so the renames are
-    # atomic and reversible.
+# --- the swap ---------------------------------------------------------------
+
+# Replaces $INSTALL_ROOT with the already-extracted tree at $1, keeping the old
+# one until the new binary has proved it starts.
+#
+# This is the dangerous part of both entry points, and it exists once on
+# purpose. `tgt update` does not reimplement it: it downloads, verifies
+# (including the pinned cosign check this script deliberately does not do),
+# extracts, and then calls this same function through `--swap-from`. Two
+# implementations of a stage/rename/probe/rollback would drift silently, and
+# the drift would only show up when a rollback was needed — which is exactly
+# when nobody is watching. Sharing it also means every curl install exercises
+# the path the updater depends on.
+swap_tree() {
+    source_tree="$1"
+    target="$2"
+
+    # The tarball contains a single tgt/ directory holding bin/ and lib/.
+    # Anything else means the layout changed and this script is out of date;
+    # refuse rather than guess where to put things.
+    [ -x "$source_tree/bin/tgt" ] ||
+        die "$source_tree does not look like a tgt tree (no bin/tgt).
+Refusing to install. Please report this."
+
     # Before anything is renamed or removed. An install into a fresh path
     # skips this; only an existing directory has to prove itself.
     if [ -e "$INSTALL_ROOT" ]; then
@@ -269,15 +292,18 @@ Refusing to install. Please report this."
     staged="$INSTALL_ROOT.new-$$"
     previous="$INSTALL_ROOT.old-$$"
     rm -rf "$staged"
-    mv "$workdir/unpacked/tgt" "$staged"
+    cp -a "$source_tree" "$staged"
 
     if [ -e "$INSTALL_ROOT" ]; then
         mv "$INSTALL_ROOT" "$previous"
     fi
     mv "$staged" "$INSTALL_ROOT"
 
+    # The probe, and the reason the old tree still exists at this point: a
+    # binary paired with the wrong libtdjson fails at dyld load, and this is
+    # the only moment recovery is still possible. It runs the NEW tree's
+    # binary, which is what makes it a test of the thing just installed.
     if ! "$INSTALL_ROOT/bin/tgt" --version >/dev/null 2>&1; then
-        # Put back exactly what was there before touching anything else.
         rm -rf "$INSTALL_ROOT"
         if [ -e "$previous" ]; then
             mv "$previous" "$INSTALL_ROOT"
@@ -303,5 +329,14 @@ On Linux this is usually the missing libc++ noted above."
             ;;
     esac
 }
+
+# `tgt update` hands off here: it has already downloaded, verified and
+# extracted, so this skips straight to the swap. Deliberately does NOT need
+# curl — the network half belongs to whoever called us.
+if [ "${1:-}" = "--swap-from" ]; then
+    [ -n "${2:-}" ] || die "--swap-from needs the path of an extracted tgt tree"
+    swap_tree "$2" "$(detect_target)"
+    exit 0
+fi
 
 main "$@"
