@@ -255,7 +255,7 @@ See https://github.com/$REPO/releases/tag/$tag"
 Refusing to install. Please report this."
 
     check_linux_runtime
-    swap_tree "$workdir/unpacked/tgt" "$target"
+    swap_tree "$workdir/unpacked/tgt" "$target" adopt
 }
 
 # --- the swap ---------------------------------------------------------------
@@ -271,9 +271,20 @@ Refusing to install. Please report this."
 # the drift would only show up when a rollback was needed — which is exactly
 # when nobody is watching. Sharing it also means every curl install exercises
 # the path the updater depends on.
+# $3 decides what happens to the PATH symlink, and the two entry points want
+# different things. An install *adopts* it: the user just asked for this tree
+# to be the tgt they run, so taking the name over is the request. An update
+# only *keeps* what is already its own, because it is invoked for one
+# particular tree — the one whose binary is running — and $BIN_DIR/tgt may
+# belong to a different install entirely, a Homebrew one or a second private
+# tree. Repointing it there would change which tgt the user runs, as a side
+# effect of updating something else, with nothing on screen saying so. That is
+# not hypothetical: it happened the first time `tgt update` was run against a
+# real release, on a tree that was not the one on PATH.
 swap_tree() {
     source_tree="$1"
     target="$2"
+    link_policy="${3:-adopt}"
 
     # The tarball contains a single tgt/ directory holding bin/ and lib/.
     # Anything else means the layout changed and this script is out of date;
@@ -314,20 +325,42 @@ On Linux this is usually the missing libc++ noted above."
     fi
     [ -e "$previous" ] && rm -rf "$previous"
 
-    ln -sfn "$INSTALL_ROOT/bin/tgt" "$BIN_DIR/tgt"
+    # `-e` is false for a dangling symlink, so both tests are needed to mean
+    # "nothing is there". A regular file at that path is somebody else's
+    # binary and is left alone for the same reason a foreign symlink is.
+    if [ "$link_policy" = adopt ]; then
+        link_it=yes
+    elif [ ! -e "$BIN_DIR/tgt" ] && [ ! -L "$BIN_DIR/tgt" ]; then
+        link_it=yes
+    elif [ -L "$BIN_DIR/tgt" ] && [ "$(readlink "$BIN_DIR/tgt")" = "$INSTALL_ROOT/bin/tgt" ]; then
+        link_it=yes
+    else
+        link_it=no
+    fi
+
+    if [ "$link_it" = yes ]; then
+        ln -sfn "$INSTALL_ROOT/bin/tgt" "$BIN_DIR/tgt"
+    fi
 
     say ""
     say "installed $("$INSTALL_ROOT/bin/tgt" --version)"
-    say "  $BIN_DIR/tgt -> $INSTALL_ROOT/bin/tgt"
+    if [ "$link_it" = yes ]; then
+        say "  $BIN_DIR/tgt -> $INSTALL_ROOT/bin/tgt"
 
-    case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *)
-            say ""
-            say "note: $BIN_DIR is not on your PATH. Add it:"
-            say "  export PATH=\"$BIN_DIR:\$PATH\""
-            ;;
-    esac
+        case ":$PATH:" in
+            *":$BIN_DIR:"*) ;;
+            *)
+                say ""
+                say "note: $BIN_DIR is not on your PATH. Add it:"
+                say "  export PATH=\"$BIN_DIR:\$PATH\""
+                ;;
+        esac
+    else
+        say "  in place at $INSTALL_ROOT"
+        say ""
+        say "note: $BIN_DIR/tgt was left alone — it is not this tree's symlink."
+        say "      The tgt on your PATH is still whatever it pointed at."
+    fi
 }
 
 # `tgt update` hands off here: it has already downloaded, verified and
@@ -335,7 +368,7 @@ On Linux this is usually the missing libc++ noted above."
 # curl — the network half belongs to whoever called us.
 if [ "${1:-}" = "--swap-from" ]; then
     [ -n "${2:-}" ] || die "--swap-from needs the path of an extracted tgt tree"
-    swap_tree "$2" "$(detect_target)"
+    swap_tree "$2" "$(detect_target)" keep
     exit 0
 fi
 

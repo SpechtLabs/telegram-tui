@@ -255,9 +255,12 @@ pub fn verify(
                 format!(
                     "The download does not match its published checksum.\n  expected {expected}\n  actual   {actual}"
                 ),
+                // Reversed on purpose; see `advice_reads_in_the_order_it_was
+                // _meant_to`. `human-errors` renders advice back to front, so
+                // the first thing to try has to be written last.
                 &[
-                    "Try again — this is usually a truncated download.",
                     "If it keeps happening, report it rather than installing.",
+                    "Try again — this is usually a truncated download.",
                 ],
             ));
         }
@@ -289,9 +292,12 @@ pub fn verify(
                     "The release's signature did not verify against this project's release workflow.\n{}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
+                // Reversed; see the note on the checksum advice above. Getting
+                // this one backwards leads with "report it" and buries "do not
+                // install", which is the only line that matters here.
                 &[
-                    "Do not install this download.",
                     "Report it — a signature that fails this check is not merely a bad download.",
+                    "Do not install this download.",
                 ],
             ));
         }
@@ -306,9 +312,10 @@ pub fn verify(
         };
         return Err(human_errors::user(
             format!("--require-signature was given, but {why}."),
+            // Reversed; see the note on the checksum advice above.
             &[
-                "Install cosign (https://github.com/sigstore/cosign) and try again.",
                 "Or drop --require-signature to install with only the checks that are available.",
+                "Install cosign (https://github.com/sigstore/cosign) and try again.",
             ],
         ));
     }
@@ -465,8 +472,11 @@ pub fn run(require_signature: bool) -> eyre::Result<()> {
         Install::Foreign { root } => {
             return Err(human_errors::user(
                 format!("{} does not look like a self-contained tgt install, so it cannot be replaced safely.", root.display()),
-                &["Reinstall with: curl -sSL https://tgt.specht-labs.de/install.sh | sh",
-                  "That lays out a private tree which future updates can replace in one step."],
+                // Reversed; see the note on the checksum advice above. This one
+                // shipped backwards in 0.1.5, where the second line arrived
+                // first and read as a sentence with no subject.
+                &["That lays out a private tree which future updates can replace in one step.",
+                  "Reinstall with: curl -sSL https://tgt.specht-labs.de/install.sh | sh"],
             )
             .into());
         }
@@ -514,9 +524,10 @@ pub fn run(require_signature: bool) -> eyre::Result<()> {
         if !response.status().is_success() {
             return Err(human_errors::user(
                 format!("{tag} has no published build for {target}."),
+                // Reversed; see the note on the checksum advice above.
                 &[
-                    "Published builds are macOS and Linux, on aarch64 and x86_64.",
                     "Build from source if you need another platform.",
+                    "Published builds are macOS and Linux, on aarch64 and x86_64.",
                 ],
             )
             .into());
@@ -709,6 +720,40 @@ mod tests {
             signature: true,
         };
         assert!(signed.describe().contains("signature verified"));
+    }
+
+    /// `human-errors` renders advice back to front: `Error::advice()` walks
+    /// the cause chain appending as it goes, then reverses the lot so the
+    /// innermost error's advice comes first. For an error that carries its own
+    /// advice — which is all of ours — that reverses the array as written, and
+    /// nothing about the call site says so. 0.1.5 shipped one that read as a
+    /// sentence with no subject because of it.
+    ///
+    /// So every array in this module is written back to front on purpose, and
+    /// this asserts on what the user actually sees rather than on the literal.
+    /// A reordering that looks like a tidy-up fails here.
+    #[test]
+    fn advice_reads_in_the_order_it_was_meant_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tmp.path().join("t.tar.gz");
+        std::fs::write(&blob, b"payload").unwrap();
+
+        let err =
+            verify(&blob, None, Some("deadbeef"), false).expect_err("checksum must not match");
+        assert_eq!(
+            err.advice().first().copied(),
+            Some("Try again — this is usually a truncated download."),
+            "the first thing to try must be read first: {:?}",
+            err.advice()
+        );
+
+        let err = verify(&blob, None, None, true).expect_err("no bundle, signature required");
+        assert_eq!(
+            err.advice().first().copied(),
+            Some("Install cosign (https://github.com/sigstore/cosign) and try again."),
+            "an alternative beginning \"Or\" must not arrive first: {:?}",
+            err.advice()
+        );
     }
 
     #[test]

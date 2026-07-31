@@ -121,6 +121,8 @@ It refuses rather than guessing. A Homebrew install is left to `brew upgrade`, b
 
 The swap itself is the installer's, shipped inside the tarball and run from the newly extracted copy: stage, rename, run the new `bin/tgt --version` while the old tree still exists, and put the old one back if it can't start. There is one implementation of that procedure and both the installer and the updater use it.
 
+It updates the tree the running binary lives in, and only that. If `~/.local/bin/tgt` is this tree's own symlink it is refreshed; if it points at some other install, it is left alone and the update says so. Installing takes that name over — that is what you asked for — but updating one install must not silently change which `tgt` your PATH finds.
+
 ::: warning What "verified" means here
 The output states exactly which checks ran. A `SHA256SUMS` match is corruption detection only — the sums file comes from the same host over the same connection as the tarball, so anyone able to serve you a modified tarball can serve you a matching digest.
 
