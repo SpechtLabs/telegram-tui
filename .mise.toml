@@ -7,6 +7,7 @@
 [tools]
 rust = "1.97.1"                # mirrors rust-toolchain.toml
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
+pinact = "4.1.0"
 
 [env]
 # Where `mise run install` puts the binary and TDLib's dylib. The packaged
@@ -78,3 +79,7 @@ set -euo pipefail
 rm -f "$TGT_PREFIX/bin/tgt" "$TGT_PREFIX"/lib/libtdjson*.dylib
 echo "removed tgt from $TGT_PREFIX"
 '''
+
+[tasks.update-gha]
+description = "Update GithubActions to latest version and pin their commit sha"
+run = "pinact run -u -e 'cosign-installer'"
