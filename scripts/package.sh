@@ -130,7 +130,15 @@ echo "$version_output" | grep -q "$bin_name" || {
 
 echo "==> Relocation proof passed"
 
-pkg_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+# Take only what is inside the quotes: the line carries a trailing
+# `# x-release-please-version` annotation, and dragging that into the filename
+# produced an artifact with spaces (and a `#`) in its name, which silently
+# truncated the release upload command.
+pkg_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+if [[ ! "$pkg_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    echo "error: could not parse a version from Cargo.toml (got '$pkg_version')" >&2
+    exit 1
+fi
 target_triple="aarch64-apple-darwin"
 tarball="dist/${bin_name}-${pkg_version}-${target_triple}.tar.gz"
 
