@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::model::ids::{ChatId, FileId, MessageId};
 use crate::model::key::Key;
-use crate::model::message::{FileSnapshot, MessageView};
+use crate::model::message::{FileSnapshot, MessageCaps, MessageView};
 use crate::model::time::Millis;
 use crate::td::error::TdError;
 use crate::td::update::TdUpdate;
@@ -57,6 +57,15 @@ pub enum TdResult {
     MessageSent {
         chat_id: ChatId,
         outcome: Result<MessageView, TdError>,
+    },
+    /// `getMessageProperties` completion: the capability flags TDLib does not
+    /// put on `message` (architecture §7). An `Err` leaves the message's
+    /// existing caps in place — chips stay as they were rather than
+    /// collapsing to the pessimistic default.
+    MessagePropertiesLoaded {
+        chat_id: ChatId,
+        message_id: MessageId,
+        outcome: Result<MessageCaps, TdError>,
     },
     EditDone {
         chat_id: ChatId,

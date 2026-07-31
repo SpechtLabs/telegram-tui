@@ -202,6 +202,13 @@ impl TdlibRuntime {
                     messages: self.map_messages(messages.messages),
                 })
             }
+            // T26 added the request (core issues it on every selection move);
+            // the `TdResponse` carrier for `MessageCaps` and the real
+            // `getMessageProperties` call belong to T32 together with the
+            // dispatch mapping, which today classifies this request as
+            // `Completion::Unwired`. Answering `Ok` keeps the boundary total
+            // without inventing capability flags nobody asked TDLib for.
+            TdRequest::GetMessageProperties { .. } => Ok(TdResponse::Ok),
             TdRequest::ViewMessages {
                 chat_id,
                 message_ids,

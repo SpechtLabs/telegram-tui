@@ -46,6 +46,7 @@ use crate::model::message::MessageView;
 use crate::model::time::Millis;
 use crate::state::focus::Focus;
 use crate::state::history::{self, PagingDirective, PagingState};
+use crate::state::selection::SelectionState;
 use crate::td::error::TdError;
 use crate::td::request::TdRequest;
 use crate::td::update::TdUpdate;
@@ -84,6 +85,12 @@ pub struct ConversationState {
     pub last_read_outbox: MessageId,
     /// In-chat search hits (populated by state/search.rs).
     pub search_hits: Vec<MessageId>,
+    /// Selection mode, per open chat and transient (architecture §4.6).
+    /// `None` whenever the user is not in selection mode — and forced back to
+    /// `None` by [`drop_selection_if_gone`] the moment the selected message
+    /// leaves the window (deleted server-side, or evicted by the window
+    /// bound), so no handler ever has to cope with a dangling selection.
+    pub selection: Option<SelectionState>,
 }
 
 /// Ensures a `ConversationState` exists for `chat_id` and makes it the open
@@ -104,6 +111,7 @@ pub fn open(app: &mut AppState, chat_id: ChatId) {
             last_read_inbox: MessageId(0),
             last_read_outbox: MessageId(0),
             search_hits: Vec::new(),
+            selection: None,
         });
     app.open_chat = Some(chat_id);
 }
@@ -201,6 +209,7 @@ fn append_new_message(app: &mut AppState, msg: &MessageView) {
         }
     }
     evict_excess(&mut convo.messages, &convo.scroll);
+    drop_selection_if_gone(convo);
 }
 
 /// Removes deleted ids from the window. If the scroll anchor itself was
@@ -218,6 +227,7 @@ fn remove_deleted_messages(app: &mut AppState, chat_id: ChatId, ids: &[MessageId
         return;
     }
     convo.messages.retain(|m| !deleted.contains(&m.id));
+    drop_selection_if_gone(convo);
 
     if let Scroll::At { message_id, .. } = convo.scroll
         && deleted.contains(&message_id)
@@ -267,6 +277,7 @@ pub fn apply_history_page(
 
             prepend_messages(&mut convo.messages, msgs);
             evict_excess(&mut convo.messages, &convo.scroll);
+            drop_selection_if_gone(convo);
 
             match directive {
                 PagingDirective::Request {
@@ -313,8 +324,46 @@ fn prepend_messages(existing: &mut VecDeque<MessageView>, new_msgs: &[MessageVie
     }
 }
 
+/// Selection plumbing (T26): a selection that no longer names a message in
+/// the window is dropped rather than left dangling. Called after every
+/// mutation that can remove a message — deletion and both eviction paths —
+/// so `selection.message_id` is an invariant, not a hope.
+pub(crate) fn drop_selection_if_gone(convo: &mut ConversationState) {
+    let gone = convo
+        .selection
+        .as_ref()
+        .is_some_and(|sel| index_of(&convo.messages, sel.message_id).is_none());
+    if gone {
+        convo.selection = None;
+    }
+}
+
+/// Selection plumbing (T26): points the scroll anchor at `message_id` so the
+/// viewport follows the selection cursor, and pages older history in when the
+/// selection walks near the top of the window (same trigger the scroll keys
+/// use). Selecting the newest loaded message re-pins to [`Scroll::Bottom`],
+/// which is what "selection starts at the newest message" must mean for a
+/// live chat: new arrivals keep the view at the bottom.
+pub(crate) fn anchor_to(
+    convo: &mut ConversationState,
+    chat_id: ChatId,
+    message_id: MessageId,
+    now: Millis,
+) -> Vec<Effect> {
+    let is_newest = convo.messages.back().is_some_and(|m| m.id == message_id);
+    convo.scroll = if is_newest {
+        Scroll::Bottom
+    } else {
+        Scroll::At {
+            message_id,
+            line_offset: 0,
+        }
+    };
+    trigger_paging_if_near_top(convo, chat_id, now)
+}
+
 /// Binary search for `id` in the ascending-by-id window.
-fn index_of(messages: &VecDeque<MessageView>, id: MessageId) -> Option<usize> {
+pub(crate) fn index_of(messages: &VecDeque<MessageView>, id: MessageId) -> Option<usize> {
     let idx = messages.partition_point(|m| m.id < id);
     match messages.get(idx) {
         Some(m) if m.id == id => Some(idx),
@@ -864,6 +913,85 @@ mod tests {
         let convo = &app.conversations[&CHAT];
         assert!(convo.messages.is_empty());
         assert_eq!(convo.scroll, Scroll::Bottom);
+    }
+
+    // --- selection plumbing (T26) -------------------------------------------
+
+    fn select(app: &mut AppState, id: MessageId) {
+        app.conversations.get_mut(&CHAT).unwrap().selection = Some(SelectionState {
+            message_id: id,
+            chips: Vec::new(),
+            chip_cursor: 0,
+            chip_scroll: 0,
+        });
+    }
+
+    #[test]
+    fn deleting_the_selected_message_clears_selection() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 1..=3 {
+            convo.messages.push_back(msg(id));
+        }
+        select(&mut app, MessageId(2));
+
+        handle_td(
+            &mut app,
+            &TdUpdate::MessagesDeleted {
+                chat_id: CHAT,
+                message_ids: vec![MessageId(2)],
+            },
+        );
+
+        assert!(app.conversations[&CHAT].selection.is_none());
+    }
+
+    #[test]
+    fn deleting_an_unselected_message_keeps_the_selection() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 1..=3 {
+            convo.messages.push_back(msg(id));
+        }
+        select(&mut app, MessageId(2));
+
+        handle_td(
+            &mut app,
+            &TdUpdate::MessagesDeleted {
+                chat_id: CHAT,
+                message_ids: vec![MessageId(1)],
+            },
+        );
+
+        assert_eq!(
+            app.conversations[&CHAT]
+                .selection
+                .as_ref()
+                .map(|s| s.message_id),
+            Some(MessageId(2))
+        );
+    }
+
+    #[test]
+    fn evicting_the_selected_message_clears_selection() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 1..=(WINDOW_MAX_MESSAGES as i64) {
+            convo.messages.push_back(msg(id));
+        }
+        convo.scroll = Scroll::Bottom;
+        // Selected the oldest loaded message: the next arrival evicts it.
+        select(&mut app, MessageId(1));
+
+        handle_td(
+            &mut app,
+            &TdUpdate::NewMessage(msg(WINDOW_MAX_MESSAGES as i64 + 1)),
+        );
+
+        assert!(app.conversations[&CHAT].selection.is_none());
     }
 
     // --- MessageContentChanged / send succeeded / failed -------------------

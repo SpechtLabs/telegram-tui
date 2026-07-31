@@ -347,6 +347,7 @@ fn open_selected(app: &mut AppState) -> Vec<Effect> {
             last_read_inbox: MessageId(0),
             last_read_outbox: MessageId(0),
             search_hits: Vec::new(),
+            selection: None,
         });
     vec![
         Effect::Td(TdRequest::OpenChat { chat_id }),

@@ -60,6 +60,14 @@ pub enum TdRequest {
         limit: u8,
         only_local: bool,
     },
+    /// Per-message capability flags. TDLib serves them from
+    /// `messageProperties`, not on `message` (architecture §7), so selection
+    /// mode refreshes them for whatever message it lands on. Completes as
+    /// `TdResult::MessagePropertiesLoaded`.
+    GetMessageProperties {
+        chat_id: ChatId,
+        message_id: MessageId,
+    },
     ViewMessages {
         chat_id: ChatId,
         message_ids: Vec<MessageId>,
@@ -124,6 +132,7 @@ impl TdRequest {
             TdRequest::OpenChat { .. } => "OpenChat",
             TdRequest::CloseChat { .. } => "CloseChat",
             TdRequest::GetChatHistory { .. } => "GetChatHistory",
+            TdRequest::GetMessageProperties { .. } => "GetMessageProperties",
             TdRequest::ViewMessages { .. } => "ViewMessages",
             TdRequest::SendMessageText { .. } => "SendMessageText",
             TdRequest::SendMessageFile { .. } => "SendMessageFile",
@@ -194,6 +203,10 @@ mod tests {
                 from_message_id: MessageId(0),
                 limit: 50,
                 only_local: false,
+            },
+            TdRequest::GetMessageProperties {
+                chat_id: ChatId(1),
+                message_id: MessageId(1),
             },
             TdRequest::ViewMessages {
                 chat_id: ChatId(1),
@@ -305,6 +318,17 @@ mod tests {
                 text: "hello world".to_string(),
                 entities: Vec::new(),
             },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: TdRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn get_message_properties_serde_round_trips() {
+        let req = TdRequest::GetMessageProperties {
+            chat_id: ChatId(42),
+            message_id: MessageId(7),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: TdRequest = serde_json::from_str(&json).unwrap();
