@@ -530,7 +530,7 @@ use crate::model::time::Millis;
 use crate::td::update::TdUpdate;
 use crate::td::error::TdError;
 use crate::model::ids::{ChatId, FileId, MessageId};
-use crate::model::message::{FileSnapshot, MessageView};
+use crate::model::message::{FileSnapshot, MessageCaps, MessageView};
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -564,6 +564,14 @@ pub enum TdResult {
     },
     /// sendMessage returned: the optimistic message with its temporary id.
     MessageSent { chat_id: ChatId, outcome: Result<MessageView, TdError> },
+    /// getMessageProperties completion: the selected message's capability
+    /// flags (§7 — they do not ride on `message`). An `Err` leaves the
+    /// message's existing caps in place.
+    MessagePropertiesLoaded {
+        chat_id: ChatId,
+        message_id: MessageId,
+        outcome: Result<MessageCaps, TdError>,
+    },
     EditDone { chat_id: ChatId, message_id: MessageId, outcome: Result<(), TdError> },
     DeleteDone { chat_id: ChatId, outcome: Result<(), TdError> },
     ForwardDone { to_chat_id: ChatId, outcome: Result<(), TdError> },
@@ -1200,6 +1208,10 @@ pub enum TdRequest {
         limit: u8,
         only_local: bool,
     },
+    /// Per-message capability flags (§7): TDLib serves them from
+    /// `messageProperties`, not on `message`. Issued when a message is
+    /// selected; completes as `TdResult::MessagePropertiesLoaded`.
+    GetMessageProperties { chat_id: ChatId, message_id: MessageId },
     ViewMessages { chat_id: ChatId, message_ids: Vec<MessageId> },
     SendMessageText {
         chat_id: ChatId,
@@ -1230,6 +1242,10 @@ impl TdRequest {
     /// Discriminant name for RequestMatcher::Kind and local logging.
     pub fn kind(&self) -> &'static str;
 }
+// `GetMessageProperties` + `TdResult::MessagePropertiesLoaded` (§4.3) execute
+// the pending contract change recorded in §7; landed with T26. The
+// `TdResponse` carrier for the caps and the runtime/dispatch mapping land
+// with T32.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TdResponse {
@@ -1987,9 +2003,9 @@ on later tasks):
   defaults the rest to `false`. **T26 must add a
   `TdRequest::GetMessageProperties { chat_id, message_id }` variant (+
   matching `TdResult` completion) and fetch properties when a message is
-  selected** — otherwise edit/delete/forward chips never light up. This is an
-  approved pending contract change; T26's owner edits this document's §4.7
-  when implementing it.
+  selected** — otherwise edit/delete/forward chips never light up. **Landed
+  in T26**: §4.7 carries the request, §4.3 the completion; the `TdResponse`
+  carrier and the runtime/dispatch mapping land with T32.
 - **Reply excerpts are empty for same-chat replies** (TDLib only inlines
   quote/content for cross-chat replies). The conversation/selection layer
   (T16/T25/T26) fills `ReplyPreview.excerpt` from its own message window when

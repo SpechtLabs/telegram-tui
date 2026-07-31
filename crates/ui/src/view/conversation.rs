@@ -497,6 +497,7 @@ mod tests {
             last_read_inbox: MessageId(0),
             last_read_outbox: MessageId(0),
             search_hits: Vec::new(),
+            selection: None,
         }
     }
 
