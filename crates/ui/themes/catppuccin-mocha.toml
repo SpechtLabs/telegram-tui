@@ -1,0 +1,35 @@
+# catppuccin-mocha — https://github.com/catppuccin/catppuccin (Mocha flavor).
+#
+# All hex values are the official Catppuccin Mocha palette, unmodified.
+# Mapping onto our tokens: base -> surface, surface0 -> surface_raised
+# (lighter than base, reading as "raised"), text -> text, overlay1 ->
+# text_muted, blue -> accent, sapphire -> accent_dim (a related, calmer
+# blue for the own-message rail), surface1 -> selection, surface2 -> border
+# (darker than overlay1, so it stays dimmer than text_muted per
+# docs/design-language.md §1). Sender palette: eight of Mocha's named
+# accent hues (red, peach, yellow, green, teal, blue, mauve, pink).
+
+accent = "#89b4fa"         # Blue
+accent_dim = "#74c7ec"     # Sapphire
+text = "#cdd6f4"           # Text
+text_muted = "#7f849c"     # Overlay1
+surface = "#1e1e2e"        # Base
+surface_raised = "#313244" # Surface0
+success = "#a6e3a1"        # Green
+warning = "#f9e2af"        # Yellow
+danger = "#f38ba8"         # Red
+selection = "#45475a"      # Surface1
+rail_own = "#74c7ec"       # Sapphire (= accent_dim)
+rail_other = "#89b4fa"     # Blue (= accent)
+border = "#585b70"         # Surface2
+
+sender_palette = [
+    "#f38ba8", # Red
+    "#fab387", # Peach
+    "#f9e2af", # Yellow
+    "#a6e3a1", # Green
+    "#94e2d5", # Teal
+    "#89b4fa", # Blue
+    "#cba6f7", # Mauve
+    "#f5c2e7", # Pink
+]

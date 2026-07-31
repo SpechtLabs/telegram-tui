@@ -1,0 +1,33 @@
+# nord — https://www.nordtheme.com/docs/colors-and-palettes
+#
+# Official Nord hex values (nord0-nord15). Mapping: nord0 -> surface, nord1
+# -> surface_raised, nord4 -> text, nord3 -> text_muted, nord8 (frost) ->
+# accent, nord10 (frost, darker) -> accent_dim, nord2 -> selection and
+# border (nord2 sits between nord1 and nord3, dimmer than text_muted).
+# Nord's "aurora" group supplies success/warning/danger; the sender palette
+# draws on both frost and aurora for eight distinguishable hues.
+
+accent = "#88c0d0"         # nord8 (frost)
+accent_dim = "#5e81ac"     # nord10 (frost)
+text = "#d8dee9"           # nord4
+text_muted = "#4c566a"     # nord3
+surface = "#2e3440"        # nord0
+surface_raised = "#3b4252" # nord1
+success = "#a3be8c"        # nord14 (aurora green)
+warning = "#ebcb8b"        # nord13 (aurora yellow)
+danger = "#bf616a"         # nord11 (aurora red)
+selection = "#434c5e"      # nord2
+rail_own = "#5e81ac"       # nord10 (= accent_dim)
+rail_other = "#88c0d0"     # nord8 (= accent)
+border = "#434c5e"         # nord2
+
+sender_palette = [
+    "#bf616a", # nord11 red
+    "#d08770", # nord12 orange
+    "#ebcb8b", # nord13 yellow
+    "#a3be8c", # nord14 green
+    "#8fbcbb", # nord7 teal
+    "#88c0d0", # nord8 blue
+    "#b48ead", # nord15 purple
+    "#81a1c1", # nord9 (frost, eighth distinguishing hue)
+]

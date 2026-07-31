@@ -155,7 +155,16 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
         // configured in-band, by the `SetTdlibParameters` the dispatcher
         // sends when TDLib reports `WaitTdlibParameters`.
         let runtime: Arc<dyn TdRuntime> = Arc::new(TdlibRuntime::new().await);
-        runtime_loop::run(app, &theme, &mut terminal, runtime, config, td_boot).await
+        runtime_loop::run(
+            app,
+            theme,
+            &mut terminal,
+            runtime,
+            config,
+            td_boot,
+            resolve_theme,
+        )
+        .await
     });
 
     // Restore the terminal before flushing telemetry: the flush is allowed
@@ -274,8 +283,17 @@ impl Drop for TerminalGuard {
 /// terminal's capability is this call site's job, not the loader's (module
 /// docs on `tgt_ui::theme::loader`).
 ///
-/// Live theme *toggling* (re-resolving mid-session, e.g. from the command
-/// palette) is deferred: the palette's `ToggleTheme` stays a no-op for now.
+/// The one resolution path, used twice: once here at startup (`[app].theme`
+/// from the config file), and again mid-session whenever
+/// `AppState::theme_generation` changes (T60's live theme switching —
+/// `state::palette::CommandId::ToggleTheme`). The second use isn't a direct
+/// call: this function is passed *by value* to `runtime_loop::run` (as its
+/// `ThemeResolver` parameter, a plain `fn(&str) -> Theme`), which stores it
+/// and calls it from `draw_if_due` on a generation change. Threading it
+/// through as a value rather than having `runtime_loop.rs` reach for
+/// `crate::resolve_theme` keeps that module compiling standalone under the
+/// `crates/app/tests/*.rs` integration binaries that `#[path]`-include it
+/// without `main.rs` (see `runtime_loop::ThemeResolver`'s doc comment).
 fn resolve_theme(theme_name: &str) -> Theme {
     let theme = loader::builtin(theme_name).unwrap_or_else(|| match theme_file_path(theme_name) {
         Ok(path) => match loader::load_theme(&path) {
@@ -382,5 +400,52 @@ mod tests {
             effective_telemetry_mode(&cli, TelemetryMode::Custom),
             TelemetryMode::Custom
         );
+    }
+
+    /// `tgt-core`'s `state::palette::BUILTIN_THEME_NAMES` is a copy of
+    /// `tgt_ui::theme::loader::builtin_names()` — `tgt-core` can't depend on
+    /// `tgt-ui` to read the real catalogue directly (crate-boundary rule,
+    /// architecture.md §2), so `ToggleTheme` cycles its own list instead.
+    /// `tgt-app` is the one crate that depends on both and can catch the two
+    /// drifting apart, which would otherwise show up only as a silent gap
+    /// in the palette's theme cycle (a catalogue entry `ToggleTheme` can
+    /// never land on) or a name it offers that `resolve_theme` can't
+    /// actually resolve to that built-in.
+    #[test]
+    fn palette_builtin_theme_names_matches_the_real_catalogue() {
+        assert_eq!(
+            tgt_core::state::palette::BUILTIN_THEME_NAMES.as_slice(),
+            tgt_ui::theme::loader::builtin_names(),
+        );
+    }
+
+    /// Every name in the shared catalogue must actually resolve through
+    /// this file's `resolve_theme` — the same guarantee
+    /// `theme::loader::builtin_catalogue_resolves_every_name_and_defines_every_token`
+    /// gives the loader in isolation, checked again here at the real call
+    /// site the palette's cycle and startup both go through.
+    ///
+    /// `resolve_theme` also applies `COLORTERM`-driven truecolor
+    /// degradation (module docs on `resolve_theme`), so `expected` runs the
+    /// exact same degrade-or-not decision rather than comparing against the
+    /// raw catalogue `Theme` — this test is about catalogue coverage, not
+    /// re-testing `for_terminal`.
+    #[test]
+    fn resolve_theme_resolves_every_builtin_catalogue_name() {
+        let truecolor = std::env::var("COLORTERM")
+            .map(|value| value.contains("truecolor") || value.contains("24bit"))
+            .unwrap_or(false);
+
+        for &name in tgt_ui::theme::loader::builtin_names() {
+            let resolved = resolve_theme(name);
+            let expected = tgt_ui::theme::loader::for_terminal(
+                tgt_ui::theme::loader::builtin(name).unwrap(),
+                truecolor,
+            );
+            assert_eq!(
+                resolved, expected,
+                "resolve_theme({name:?}) did not resolve to the builtin catalogue entry"
+            );
+        }
     }
 }

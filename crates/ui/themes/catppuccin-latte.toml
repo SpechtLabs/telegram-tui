@@ -1,0 +1,36 @@
+# catppuccin-latte — https://github.com/catppuccin/catppuccin (Latte, the
+# only light flavor in the family).
+#
+# Official Latte palette hex values. Same mapping convention as the other
+# Catppuccin themes: base -> surface, surface0 -> surface_raised, text ->
+# text, overlay1 -> text_muted, blue -> accent, sapphire -> accent_dim,
+# surface1 -> selection, surface2 -> border. Latte's tokens run light-to-dark
+# in the opposite direction of the dark flavors (base is the lightest tone,
+# text the darkest), but the same token names still produce the right
+# panel/border/muted-text relationships because Catppuccin defines them
+# consistently across every flavor.
+
+accent = "#1e66f5"         # Blue
+accent_dim = "#209fb5"     # Sapphire
+text = "#4c4f69"           # Text
+text_muted = "#8c8fa1"     # Overlay1
+surface = "#eff1f5"        # Base
+surface_raised = "#ccd0da" # Surface0
+success = "#40a02b"        # Green
+warning = "#df8e1d"        # Yellow
+danger = "#d20f39"         # Red
+selection = "#bcc0cc"      # Surface1
+rail_own = "#209fb5"       # Sapphire (= accent_dim)
+rail_other = "#1e66f5"     # Blue (= accent)
+border = "#acb0be"         # Surface2
+
+sender_palette = [
+    "#d20f39", # Red
+    "#fe640b", # Peach
+    "#df8e1d", # Yellow
+    "#40a02b", # Green
+    "#179299", # Teal
+    "#1e66f5", # Blue
+    "#8839ef", # Mauve
+    "#ea76cb", # Pink
+]
