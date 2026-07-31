@@ -9,21 +9,22 @@
 Built on TDLib and [ratatui](https://ratatui.rs), the binary is called `tgt`. The only modifiers in the whole application are `ctrl+p` for the command palette and `ctrl+c` to quit. Everything else is arrows, Enter, Escape, and single letters that are always visible on screen while they apply. Mouse works too, if you want it.
 
 ```
-┌ telegram-tui ───────────────────────────────── cedi@specht ─┐
-│ CHATS          │ Alice Müller                    online     │
-│────────────────┼────────────────────────────────────────────│
-│▸ Alice      2  │  Alice · 14:02                             │
-│  Team Rust  9  │  ▏hey, did you see the PR?                 │
-│  Mom           │                                            │
-│  #rust-de   1  │                        You · 14:03         │
-│  Bob           │            yeah, reviewing now ▏        ✓✓ │
-│  Archived  12  │                                            │
-│                │  ╭──────────────────────────────────────╮  │
-│                │  │ ›  message…                          │  │
-│                │  ╰──────────────────────────────────────╯  │
-├────────────────┴────────────────────────────────────────────┤
-│ ↑↓ move   ⏎ open   ctrl+p palette   ? help                  │
-└─────────────────────────────────────────────────────────────┘
+ CHATS                       │ Alice Müller                              online
+                             ├──────────────────────────────────────────────────
+ ▏ Alice Müller            2 │ ▏ Alice · 14:02
+   Team Rust               9 │ ▏ hey, did you see the PR?
+   Mom                       │ ▏ also CI is red on main
+   #rust-de                1 │
+   Bob                       │                              You · 14:03
+   Archived                  │                     yeah, reviewing it now ✓✓ ▏
+                             │
+                             │ ▏ Bob · 14:11
+                             │ ▏ 📎 architecture.pdf · 2.4 MB · ⏎ download
+                             │
+                             │ ╭──────────────────────────────────────────────╮
+                             │ │ ›  message…                                  │
+                             │ ╰──────────────────────────────────────────────╯
+ ↑↓ move   ⏎ open   ctrl+p palette   ? help
 ```
 
 Press `↑` on an empty composer and you're in selection mode: the newest message highlights and the hint bar becomes a chip row like `‹ [R Reply] [F Forward] [E React] [C Copy] [D Delete] ›`. Which chips appear comes from TDLib's per-message capability flags, so an action that would fail is never offered. Below 100 columns the two panes collapse into a single-pane stack rendered by the same components.

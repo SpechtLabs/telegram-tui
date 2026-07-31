@@ -50,7 +50,10 @@ use runtime_loop::Core;
 
 /// Ceiling for any single "advance until" wait; every step is driven by a
 /// channel or the 250 ms tick, so this only bounds a hang.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A guard against a genuinely stuck loop, not a performance assertion.
+/// `cargo test --workspace` runs every integration binary concurrently, so a
+/// tight wall-clock bound here fails under load rather than on a real bug.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Harness
