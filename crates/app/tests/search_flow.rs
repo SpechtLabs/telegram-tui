@@ -241,7 +241,9 @@ impl Harness {
         let mut cache = LayoutCache::new();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
         terminal
-            .draw(|f| tgt_ui::view(self.state(), &theme, f, &mut cache))
+            .draw(|f| {
+                tgt_ui::view(self.state(), &theme, f, &mut cache);
+            })
             .expect("draw");
 
         let buffer = terminal.backend().buffer();

@@ -9,14 +9,28 @@ use ratatui::Frame;
 use tgt_core::app::{AppState, Screen};
 
 use crate::render::cache::LayoutCache;
+use crate::render::hit::HitMap;
 use crate::theme::Theme;
 
-pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
+/// Draws one frame and returns where its clickable regions ended up
+/// (architecture §7.5). The caller keeps the returned [`HitMap`] until the
+/// next draw replaces it; it is what turns a mouse event's coordinates into
+/// an `Action`.
+///
+/// The consent screen and the auth wizard are keyboard-only and hand back an
+/// empty map — there is nothing on either that a click could mean.
+pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) -> HitMap {
     match state.screen {
         // The consent screen and the auth wizard each own the whole frame;
         // both are screens, not panes.
-        Screen::Consent => view::consent::draw(state, theme, f),
-        Screen::Auth => view::auth::draw(state, theme, f),
+        Screen::Consent => {
+            view::consent::draw(state, theme, f);
+            HitMap::new()
+        }
+        Screen::Auth => {
+            view::auth::draw(state, theme, f);
+            HitMap::new()
+        }
         Screen::Main => view::root::draw(state, theme, f, cache),
     }
 }
@@ -112,7 +126,9 @@ mod tests {
         let mut cache = LayoutCache::new();
 
         terminal
-            .draw(|f| view(&state, &theme, f, &mut cache))
+            .draw(|f| {
+                view(&state, &theme, f, &mut cache);
+            })
             .unwrap();
 
         let rendered = render_to_string(&terminal);
@@ -134,7 +150,9 @@ mod tests {
         let mut cache = LayoutCache::new();
 
         terminal
-            .draw(|f| view(&state, &theme, f, &mut cache))
+            .draw(|f| {
+                view(&state, &theme, f, &mut cache);
+            })
             .unwrap();
 
         let rendered = render_to_string(&terminal);

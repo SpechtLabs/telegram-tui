@@ -4,7 +4,8 @@
 //!
 //! # Schema
 //!
-//! The on-disk shape matches spec §12: `[app]` (theme, layout_breakpoint_cols),
+//! The on-disk shape matches spec §12: `[app]` (theme, layout_breakpoint_cols,
+//! mouse),
 //! `[keys]` (palette), `[telemetry]` (mode, optional endpoint/protocol/headers).
 //! Two sections extend beyond the spec's illustrative sample so the state
 //! `ConfigPatch` can mutate actually persists somewhere: `[credentials]`
@@ -53,6 +54,11 @@ const CONFIG_FILE: &str = "config.toml";
 pub struct Config {
     pub theme: String,
     pub layout_breakpoint_cols: u16,
+    /// Whether to put the terminal into mouse-reporting mode (architecture
+    /// §7.5). Default on. Read once at startup by `main.rs`; never reaches
+    /// `tgt-core`, which only ever sees the semantic actions a resolved
+    /// click produces.
+    pub mouse: bool,
     /// Raw `"ctrl+p"`-style string; parsed into a `Key` by `boot_fields`.
     pub palette_key: String,
     pub telemetry_mode: TelemetryMode,
@@ -72,6 +78,7 @@ impl Default for Config {
         Config {
             theme: "default".to_string(),
             layout_breakpoint_cols: 100,
+            mouse: true,
             palette_key: "ctrl+p".to_string(),
             telemetry_mode: TelemetryMode::Vendor,
             telemetry_endpoint: None,
@@ -205,9 +212,13 @@ impl Config {
         out.push_str("[app]\n");
         out.push_str(&format!("theme = {}\n", toml_string(&self.theme)));
         out.push_str(&format!(
-            "layout_breakpoint_cols = {}\n\n",
+            "layout_breakpoint_cols = {}\n",
             self.layout_breakpoint_cols
         ));
+        out.push_str("# Mouse reporting: click a chat, a folder tab or the composer, and scroll\n");
+        out.push_str("# either pane with the wheel. While it is on, the terminal's own text\n");
+        out.push_str("# selection needs shift held down — set this to false to get it back.\n");
+        out.push_str(&format!("mouse = {}\n\n", self.mouse));
 
         out.push_str("[keys]\n");
         out.push_str("# Global command-palette shortcut, e.g. \"ctrl+p\" or a bare character.\n");
@@ -338,7 +349,7 @@ const KNOWN_SECTIONS: &[&str] = &["app", "keys", "telemetry", "credentials", "co
 
 fn known_keys(section: &str) -> &'static [&'static str] {
     match section {
-        "app" => &["theme", "layout_breakpoint_cols"],
+        "app" => &["theme", "layout_breakpoint_cols", "mouse"],
         "keys" => &["palette"],
         "telemetry" => &["mode", "endpoint", "protocol", "headers"],
         "credentials" => &["api_id", "api_hash"],
@@ -403,6 +414,11 @@ fn parse(text: &str) -> eyre::Result<Config> {
                 .ok_or_else(|| eyre::eyre!("[app].layout_breakpoint_cols must be an integer"))?;
             cfg.layout_breakpoint_cols = u16::try_from(n)
                 .map_err(|_| eyre::eyre!("[app].layout_breakpoint_cols out of range for u16"))?;
+        }
+        if let Some(v) = app.get("mouse") {
+            cfg.mouse = v
+                .as_bool()
+                .ok_or_else(|| eyre::eyre!("[app].mouse must be a boolean"))?;
         }
     }
 
@@ -576,6 +592,45 @@ mod tests {
         assert_eq!(cfg.telemetry_mode, TelemetryMode::Vendor);
         assert_eq!(cfg.api_id, None);
         assert!(!cfg.consent_acknowledged);
+
+        clear_related_env();
+    }
+
+    /// Mouse support is on unless the config says otherwise, and a config
+    /// written before the key existed keeps that default — the generated
+    /// file has to survive the round trip either way (architecture §7.5).
+    #[test]
+    fn mouse_defaults_on_and_can_be_turned_off() {
+        let _lock = lock_env();
+        clear_related_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+
+        let cfg = load().expect("first run generates defaults");
+        assert!(cfg.mouse, "mouse reporting is on by default");
+        let generated = std::fs::read_to_string(tmp.path().join("telegram-tui/config.toml"))
+            .expect("the generated config should be readable");
+        assert!(
+            generated.contains("mouse = true"),
+            "the generated template should document the key:\n{generated}"
+        );
+
+        std::fs::write(
+            tmp.path().join("telegram-tui/config.toml"),
+            "[app]\nmouse = false\n",
+        )
+        .unwrap();
+        assert!(!load().expect("load should succeed").mouse);
+
+        // A config from before the key existed still boots with it on.
+        std::fs::write(
+            tmp.path().join("telegram-tui/config.toml"),
+            "[app]\ntheme = \"midnight\"\n",
+        )
+        .unwrap();
+        assert!(load().expect("load should succeed").mouse);
 
         clear_related_env();
     }

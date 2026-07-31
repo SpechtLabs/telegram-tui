@@ -1,5 +1,11 @@
 //! Mechanical `crossterm::event::Event` → `Action` translation. No routing
 //! logic lives here; `App::update` decides what a `Key` means.
+//!
+//! `Event::Mouse` deliberately maps to `None` and always will: a mouse event
+//! only becomes an action once its coordinates are resolved against the last
+//! frame's `render::hit::HitMap` (architecture §7.5), and this function has
+//! no frame to resolve against. That translation lives next to the map that
+//! feeds it, in `tgt-app`'s `runtime_loop::translate_mouse`.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tgt_core::action::Action;

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, MissedTickBehavior};
@@ -23,10 +23,12 @@ use tokio::time::{self, MissedTickBehavior};
 use tgt_core::action::Action;
 use tgt_core::app::App;
 use tgt_core::effect::Effect;
+use tgt_core::model::hit::ClickButton;
 use tgt_core::model::time::Millis;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, TdUpdate};
 use tgt_ui::render::cache::LayoutCache;
+use tgt_ui::render::hit::HitMap;
 use tgt_ui::theme::Theme;
 
 use crate::config::Config;
@@ -83,6 +85,12 @@ pub struct Core {
     /// `theme_generation` is part of `LayoutKey` too, so a theme swap just
     /// misses forward without evicting anything explicitly.
     cache: LayoutCache,
+    /// Where the last drawn frame put everything a mouse can hit
+    /// (architecture §7.5), refreshed by `draw_if_due` from `view`'s return
+    /// value. Empty until the first frame is drawn and whenever an overlay
+    /// is up, so a click that arrives before or under either resolves to
+    /// nothing rather than to a stale frame's geometry.
+    last_hits: HitMap,
 }
 
 impl Core {
@@ -113,6 +121,7 @@ impl Core {
             clock_start: Instant::now(),
             effects: Vec::new(),
             cache: LayoutCache::new(),
+            last_hits: HitMap::new(),
         }
     }
 
@@ -162,6 +171,14 @@ impl Core {
         match input {
             Input::Quit => return Step::Quit,
             Input::Action(action) => self.apply(action),
+            // Mouse events are the one kind `tgt_ui::input::map_event` can't
+            // translate on its own: they only mean something relative to the
+            // frame that is on screen (see `translate_mouse`).
+            Input::Term(Event::Mouse(mouse)) => {
+                if let Some(action) = translate_mouse(&self.last_hits, mouse) {
+                    self.apply(action);
+                }
+            }
             Input::Term(event) => {
                 // A resize invalidates every cached layout: they're wrapped
                 // at the old column width. `LayoutKey::theme_generation`
@@ -202,6 +219,45 @@ impl Core {
         if needs_parameters {
             self.dispatcher.request_tdlib_parameters();
         }
+    }
+}
+
+/// Resolves a crossterm mouse event against the last drawn frame's regions
+/// (architecture §7.5). This is the whole of the mouse boundary: everything
+/// past it is a semantic `Action` that `App::update` routes like any other.
+///
+/// Only three kinds of event produce one. A left or right button press
+/// becomes `Action::Click` for whatever target covers the cell; a wheel step
+/// becomes `Action::Scroll` for the pane under the pointer. Motion, drags,
+/// button releases and the middle button are all ignored outright — v1 has
+/// no drag-select, no hover state and nothing bound to the middle button, so
+/// forwarding them would only mean actions core has to discard. A press over
+/// a cell no region covers (the frame border, the hint bar, the gap between
+/// two folder tabs) is likewise nothing at all, not a click on the nearest
+/// thing.
+fn translate_mouse(hits: &HitMap, ev: MouseEvent) -> Option<Action> {
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            hits.target_at(ev.column, ev.row)
+                .map(|target| Action::Click {
+                    target,
+                    button: ClickButton::Left,
+                })
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            hits.target_at(ev.column, ev.row)
+                .map(|target| Action::Click {
+                    target,
+                    button: ClickButton::Right,
+                })
+        }
+        MouseEventKind::ScrollUp => hits
+            .area_at(ev.column, ev.row)
+            .map(|area| Action::Scroll { area, up: true }),
+        MouseEventKind::ScrollDown => hits
+            .area_at(ev.column, ev.row)
+            .map(|area| Action::Scroll { area, up: false }),
+        _ => None,
     }
 }
 
@@ -277,11 +333,20 @@ fn draw_if_due(
     // gate alone; this app's inputs never come close to that rate.
     if core.take_dirty() && gate_ready {
         // Destructured so the draw closure borrows `app` (for its state)
-        // and `cache` as the disjoint fields they are, rather than needing
-        // both a `&core.app()` and a `&mut core.cache_mut()` live at once.
-        let Core { app, cache, .. } = core;
+        // and `cache`/`last_hits` as the disjoint fields they are, rather
+        // than needing both a `&core.app()` and a `&mut core.cache_mut()`
+        // live at once.
+        let Core {
+            app,
+            cache,
+            last_hits,
+            ..
+        } = core;
         let state = app.state();
-        terminal.draw(|f| tgt_ui::view(state, theme, f, cache))?;
+        // Every frame replaces the hit map wholesale: it describes the frame
+        // now on screen, and a click can only ever mean something against
+        // the frame the user was looking at.
+        terminal.draw(|f| *last_hits = tgt_ui::view(state, theme, f, cache))?;
         *last_draw = Some(Instant::now());
     }
     Ok(())
@@ -316,4 +381,124 @@ fn spawn_terminal_event_reader() -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
     });
 
     (rx, running)
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyModifiers;
+    use ratatui::layout::Rect;
+    use tgt_core::model::hit::{HitTarget, ScrollArea};
+    use tgt_core::model::ids::{ChatId, MessageId};
+
+    use super::*;
+
+    /// A sidebar row, a message row and both panes — the geometry a real
+    /// frame publishes, small enough to reason about by hand.
+    fn hit_map() -> HitMap {
+        let mut hits = HitMap::new();
+        hits.push_area(Rect::new(0, 0, 30, 20), ScrollArea::ChatList);
+        hits.push_area(Rect::new(30, 0, 90, 20), ScrollArea::Conversation);
+        hits.push(Rect::new(0, 2, 30, 1), HitTarget::ChatRow(ChatId(7)));
+        hits.push(Rect::new(30, 5, 90, 1), HitTarget::Message(MessageId(3)));
+        hits
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_button_press_becomes_a_click_on_whatever_it_landed_on() {
+        let hits = hit_map();
+
+        assert!(matches!(
+            translate_mouse(&hits, mouse(MouseEventKind::Down(MouseButton::Left), 5, 2)),
+            Some(Action::Click {
+                target: HitTarget::ChatRow(ChatId(7)),
+                button: ClickButton::Left,
+            })
+        ));
+        assert!(matches!(
+            translate_mouse(
+                &hits,
+                mouse(MouseEventKind::Down(MouseButton::Right), 40, 5)
+            ),
+            Some(Action::Click {
+                target: HitTarget::Message(MessageId(3)),
+                button: ClickButton::Right,
+            })
+        ));
+    }
+
+    #[test]
+    fn a_wheel_step_scrolls_the_pane_under_the_pointer() {
+        let hits = hit_map();
+
+        assert!(matches!(
+            translate_mouse(&hits, mouse(MouseEventKind::ScrollUp, 5, 10)),
+            Some(Action::Scroll {
+                area: ScrollArea::ChatList,
+                up: true,
+            })
+        ));
+        assert!(matches!(
+            translate_mouse(&hits, mouse(MouseEventKind::ScrollDown, 40, 10)),
+            Some(Action::Scroll {
+                area: ScrollArea::Conversation,
+                up: false,
+            })
+        ));
+        // Over a chat row the wheel still scrolls the sidebar; the click
+        // target sitting there does not shadow the pane.
+        assert!(matches!(
+            translate_mouse(&hits, mouse(MouseEventKind::ScrollDown, 5, 2)),
+            Some(Action::Scroll {
+                area: ScrollArea::ChatList,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unresolved_coordinates_and_uninteresting_kinds_produce_nothing() {
+        let hits = hit_map();
+
+        // Below both panes: inside the frame, outside every region.
+        assert!(
+            translate_mouse(&hits, mouse(MouseEventKind::Down(MouseButton::Left), 5, 30)).is_none()
+        );
+        assert!(translate_mouse(&hits, mouse(MouseEventKind::ScrollUp, 5, 30)).is_none());
+        // A press inside a pane but not on any target is not a click on the
+        // pane itself.
+        assert!(
+            translate_mouse(&hits, mouse(MouseEventKind::Down(MouseButton::Left), 5, 10)).is_none()
+        );
+
+        // Kinds v1 has nothing to do with, all over a live target.
+        for kind in [
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            assert!(
+                translate_mouse(&hits, mouse(kind, 5, 2)).is_none(),
+                "{kind:?} should not produce an action"
+            );
+        }
+
+        // An empty map is what an overlay frame publishes: nothing resolves.
+        assert!(
+            translate_mouse(
+                &HitMap::new(),
+                mouse(MouseEventKind::Down(MouseButton::Left), 5, 2)
+            )
+            .is_none()
+        );
+    }
 }

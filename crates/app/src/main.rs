@@ -17,10 +17,12 @@ mod td_runtime;
 mod telemetry_cli;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use color_eyre::eyre;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -127,6 +129,15 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // unwinding panic — restores the terminal via this guard's `Drop`.
     let terminal_guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    if config.mouse {
+        // Flagged before the escape sequence goes out, not after: if this
+        // `execute!` fails halfway or something panics inside it, the
+        // restore path still knows to send the disable sequence. Sending it
+        // when capture was never on is harmless; leaving it unsent when it
+        // was is not.
+        MOUSE_CAPTURE.store(true, Ordering::SeqCst);
+        execute!(io::stdout(), EnableMouseCapture)?;
+    }
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let app = App::new(boot_from(&config, &cli, terminal.size()?, identity.salt));
@@ -213,11 +224,31 @@ fn install_exporter(
     }
 }
 
-/// Restores the terminal: leaves the alternate screen, disables raw mode.
-/// Errors are swallowed — there is nothing more to do if this itself fails,
-/// and it may run from inside the panic hook where propagating isn't an
-/// option.
+/// Whether mouse capture was turned on this session, so [`restore_terminal`]
+/// knows whether it has to be turned back off.
+///
+/// A process-global flag rather than a field on `TerminalGuard` or a value
+/// captured by the closure: the panic hook's restore has to run from
+/// whichever thread panicked and therefore must be `Fn() + Send + Sync +
+/// 'static`, and it is installed *before* the config-driven decision is even
+/// made. An `AtomicBool` both threads can read is the smallest thing that
+/// lets one function serve the normal teardown and the panic path
+/// identically — which is the point, since those are exactly the two ways a
+/// terminal gets left in reporting mode, spraying escape codes at the shell.
+static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// Restores the terminal: releases mouse capture (if it was taken), leaves
+/// the alternate screen, disables raw mode. Errors are swallowed — there is
+/// nothing more to do if this itself fails, and it may run from inside the
+/// panic hook where propagating isn't an option.
+///
+/// `swap` rather than `load`: a panic runs this from the hook and then again
+/// from `TerminalGuard::drop` as the stack unwinds, and the second pass has
+/// no reason to re-send a sequence the first one already sent.
 fn restore_terminal() {
+    if MOUSE_CAPTURE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }

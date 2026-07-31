@@ -57,6 +57,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::model::chat::{ChatListId, ChatView};
+use tgt_core::model::hit::HitTarget;
 use tgt_core::model::ids::ChatId;
 use tgt_core::state::auth::InputField;
 use tgt_core::state::chat_list::{
@@ -64,6 +65,7 @@ use tgt_core::state::chat_list::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::render::hit::HitMap;
 use crate::theme::Theme;
 
 /// One line in the combined, scroll-windowed row list: the real chat rows
@@ -74,7 +76,7 @@ enum DisplayRow {
     Chat(ChatId),
 }
 
-pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
+pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &mut HitMap) {
     let list = &state.chat_list;
     let is_archive = list.active_list == ChatListId::Archive;
 
@@ -107,7 +109,7 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
         next += 1;
     }
     if show_folder_tabs {
-        draw_folder_tabs(areas[next], &folders, list.active_list, theme, f);
+        draw_folder_tabs(areas[next], &folders, list.active_list, theme, f, hits);
         next += 1;
     }
     if let Some(filter) = &list.filter {
@@ -123,7 +125,7 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
         draw_empty(rows_area, theme, f);
         return;
     }
-    draw_display_rows(rows_area, &display, list, theme, f);
+    draw_display_rows(rows_area, &display, list, theme, f, hits);
 }
 
 /// `visible_rows` is already pinned-first (see `state::chat_list`); this
@@ -201,6 +203,7 @@ fn draw_display_rows(
     list: &ChatListState,
     theme: &Theme,
     f: &mut Frame,
+    hits: &mut HitMap,
 ) {
     let height = area.height as usize;
     if height == 0 {
@@ -216,15 +219,27 @@ fn draw_display_rows(
     });
     let offset = scroll_offset(display.len(), height, selected_idx);
 
-    let lines: Vec<Line<'static>> = display
-        .iter()
-        .skip(offset)
-        .take(height)
-        .map(|row| match row {
-            DisplayRow::Archive(unread) => archive_row_line(*unread, theme),
+    // The hit region for a row is recorded here, off the same
+    // `(offset, index)` pair that decides where the row is painted, so the
+    // two can't drift apart the way a second pass over `display` could. The
+    // pinned separator is deliberately unclickable: it is a rule, not a row.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height.min(display.len()));
+    for (i, row) in display.iter().skip(offset).take(height).enumerate() {
+        let row_rect = Rect {
+            x: area.x,
+            y: area.y + i as u16,
+            width: area.width,
+            height: 1,
+        };
+        let line = match row {
+            DisplayRow::Archive(unread) => {
+                hits.push(row_rect, HitTarget::ArchiveRow);
+                archive_row_line(*unread, theme)
+            }
             DisplayRow::PinnedSeparator => separator_line(area.width, theme),
             DisplayRow::Chat(chat_id) => match list.chats.get(chat_id) {
                 Some(chat) => {
+                    hits.push(row_rect, HitTarget::ChatRow(*chat_id));
                     let selected = list.selected == Some(*chat_id);
                     chat_row_line(chat, selected, area.width, theme)
                 }
@@ -233,8 +248,9 @@ fn draw_display_rows(
                 // a panic keeps a stale id from crashing the render.
                 None => Line::default(),
             },
-        })
-        .collect();
+        };
+        lines.push(line);
+    }
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -272,24 +288,49 @@ fn draw_archive_hint(area: Rect, theme: &Theme, f: &mut Frame) {
 
 /// `Main · Folder 1 · Folder 2`, active entry in accent+bold. `folders` is
 /// `folder_cycle`'s output, already ordered and Archive-free.
+///
+/// Each label's own columns become its hit region; the ` · ` separators
+/// between them are not part of any tab, so a click that lands on one does
+/// nothing rather than picking a neighbour arbitrarily.
 fn draw_folder_tabs(
     area: Rect,
     folders: &[ChatListId],
     active: ChatListId,
     theme: &Theme,
     f: &mut Frame,
+    hits: &mut HitMap,
 ) {
+    const SEPARATOR: &str = " · ";
+
     let mut spans = Vec::with_capacity(folders.len() * 2);
+    let mut col = 0u16;
     for (i, id) in folders.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", Style::new().fg(theme.text_muted)));
+            spans.push(Span::styled(SEPARATOR, Style::new().fg(theme.text_muted)));
+            col += SEPARATOR.width() as u16;
         }
         let style = if *id == active {
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(theme.text_muted)
         };
-        spans.push(Span::styled(folder_label(*id), style));
+        let label = folder_label(*id);
+        let label_width = label.width() as u16;
+        // A strip wider than the pane is clipped by the `Paragraph`, so the
+        // regions are clipped the same way: no tab is clickable past the
+        // right edge, and one straddling it is only clickable where it shows.
+        let visible_width = label_width.min(area.width.saturating_sub(col));
+        hits.push(
+            Rect {
+                x: area.x + col,
+                y: area.y,
+                width: visible_width,
+                height: 1,
+            },
+            HitTarget::FolderTab(*id),
+        );
+        col += label_width;
+        spans.push(Span::styled(label, style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -548,7 +589,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                draw(area, state, &theme, f);
+                draw(area, state, &theme, f, &mut HitMap::new());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

@@ -112,6 +112,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
+use tgt_core::model::hit::HitTarget;
 use tgt_core::model::ids::{FileId, MessageId};
 use tgt_core::model::message::{MessageContent, MessageView, ReactionView, SendState};
 use tgt_core::state::conversation::{ConversationState, Scroll};
@@ -121,6 +122,7 @@ use tgt_core::state::search::ChatSearchState;
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::cache::{LayoutCache, LayoutKey};
+use crate::render::hit::HitMap;
 use crate::render::message_layout::{
     LayoutOptions, file_card_line, file_card_upload_line, groups_with, layout_message_opts,
 };
@@ -130,7 +132,19 @@ use crate::theme::Theme;
 /// same convention as `view::header` / `view::chat_list`: each pane owns its
 /// own frame). No open chat, or an open chat whose window is empty, renders
 /// a dim centered placeholder instead of a message list.
-pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
+///
+/// Every row that came from a message is recorded in `hits` as it is laid
+/// out, so a right-click resolves to the message whose block covers that
+/// cell — including the partial block clipped at the top of the pane. Blank
+/// separator and padding rows carry no message and stay unclickable.
+pub fn draw(
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    f: &mut Frame,
+    cache: &mut LayoutCache,
+    hits: &mut HitMap,
+) {
     let block = Block::bordered().border_style(Style::new().fg(theme.text_muted));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -156,7 +170,21 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, cache: &
         cache,
         state.chat_search.as_ref(),
     );
-    let lines: Vec<Line<'static>> = rows.into_iter().map(|row| row.line).collect();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.into_iter().enumerate() {
+        if let Some(message_id) = row.message_id {
+            hits.push(
+                Rect {
+                    x: messages_area.x,
+                    y: messages_area.y + i as u16,
+                    width: messages_area.width,
+                    height: 1,
+                },
+                HitTarget::Message(message_id),
+            );
+        }
+        lines.push(row.line);
+    }
     f.render_widget(Paragraph::new(lines), messages_area);
 }
 
@@ -922,7 +950,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                draw(area, state, &theme, f, &mut cache);
+                draw(area, state, &theme, f, &mut cache, &mut HitMap::new());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

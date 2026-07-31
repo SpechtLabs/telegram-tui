@@ -18,9 +18,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
+use tgt_core::model::hit::{HitTarget, ScrollArea};
 use tgt_core::state::focus::Focus;
 
 use crate::render::cache::LayoutCache;
+use crate::render::hit::HitMap;
 use crate::theme::Theme;
 use crate::view::{
     chat_list, chips, composer, conversation, header, help, hint_bar, modal, palette, toast,
@@ -34,7 +36,24 @@ const COMPOSER_BOX_ROWS: u16 = 3;
 
 /// `cache` is threaded down to the conversation pane, the only view that lays
 /// messages out and therefore the only one that can hit or fill it.
-pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
+///
+/// ## Hit regions (architecture §7.5)
+///
+/// The panes record what they painted into a [`HitMap`] as they draw it, so
+/// the geometry a click resolves against is the geometry that actually
+/// rendered rather than a second derivation of it. This function owns the two
+/// regions no pane can see for itself: the composer's box (it draws inside a
+/// `Rect` this layout carved) and the two scrollable pane rects.
+///
+/// While an overlay owns the focus, the map is dropped on the floor and an
+/// empty one is returned instead of the panes'. Two reasons to make it a
+/// *return* rather than a `clear()`: core already ignores clicks and scrolls
+/// under an overlay focus (`app.rs::dispatch_click`), so this is the second
+/// of two independent guards and should be the simplest possible statement of
+/// "nothing here is clickable"; and building the panes' map anyway keeps the
+/// draw path branch-free — the overlay decision is made once, at the end,
+/// where the focus is already being read to decide what to paint.
+pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) -> HitMap {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme.surface)), area);
 
@@ -44,13 +63,30 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCa
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
+    let mut hits = HitMap::new();
     if state.width >= state.layout_breakpoint_cols {
-        draw_two_pane(inner, state, theme, f, cache);
+        draw_two_pane(inner, state, theme, f, cache, &mut hits);
     } else {
-        draw_single_pane(inner, state, theme, f, cache);
+        draw_single_pane(inner, state, theme, f, cache, &mut hits);
     }
 
     draw_overlays(state, theme, f);
+
+    if overlay_is_focused(state) {
+        HitMap::new()
+    } else {
+        hits
+    }
+}
+
+/// Whether one of the keyboard-only layers is on top. Mirrors the conditions
+/// [`draw_overlays`] paints under — toasts excluded, since they belong to no
+/// focus level and never take input.
+fn overlay_is_focused(state: &AppState) -> bool {
+    matches!(
+        state.focus.current(),
+        Focus::Modal(_) | Focus::Palette | Focus::Help
+    )
 }
 
 /// The layers that sit over the whole frame rather than inside a pane, in
@@ -105,6 +141,7 @@ fn draw_two_pane(
     theme: &Theme,
     f: &mut Frame,
     cache: &mut LayoutCache,
+    hits: &mut HitMap,
 ) {
     let [content_area, hint_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
@@ -113,12 +150,13 @@ fn draw_two_pane(
         Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
             .areas(content_area);
 
-    chat_list::draw(sidebar_area, state, theme, f);
+    hits.push_area(sidebar_area, ScrollArea::ChatList);
+    chat_list::draw(sidebar_area, state, theme, f, hits);
 
     let [header_area, body_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(main_area);
     header::draw(header_area, state, theme, f);
-    draw_conversation_and_composer(body_area, state, theme, f, cache);
+    draw_conversation_and_composer(body_area, state, theme, f, cache, hits);
 
     draw_bottom_row(hint_area, state, theme, f);
 }
@@ -132,6 +170,7 @@ fn draw_single_pane(
     theme: &Theme,
     f: &mut Frame,
     cache: &mut LayoutCache,
+    hits: &mut HitMap,
 ) {
     let showing_chat_list = state.open_chat.is_none()
         || matches!(state.focus.current(), Focus::ChatList | Focus::ChatFilter);
@@ -139,7 +178,8 @@ fn draw_single_pane(
     if showing_chat_list {
         let [list_area, hint_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-        chat_list::draw(list_area, state, theme, f);
+        hits.push_area(list_area, ScrollArea::ChatList);
+        chat_list::draw(list_area, state, theme, f, hits);
         draw_bottom_row(hint_area, state, theme, f);
         return;
     }
@@ -152,7 +192,7 @@ fn draw_single_pane(
     .areas(area);
 
     draw_breadcrumb(breadcrumb_area, state, theme, f);
-    draw_conversation_and_composer(body_area, state, theme, f, cache);
+    draw_conversation_and_composer(body_area, state, theme, f, cache, hits);
     draw_bottom_row(hint_area, state, theme, f);
 }
 
@@ -185,12 +225,18 @@ fn draw_conversation_and_composer(
     theme: &Theme,
     f: &mut Frame,
     cache: &mut LayoutCache,
+    hits: &mut HitMap,
 ) {
     let composer_height = COMPOSER_BOX_ROWS + composer_banner_rows(state);
     let [conversation_area, composer_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(composer_height)]).areas(area);
 
-    conversation::draw(conversation_area, state, theme, f, cache);
+    hits.push_area(conversation_area, ScrollArea::Conversation);
+    conversation::draw(conversation_area, state, theme, f, cache, hits);
+    // The whole composer area, banners included: a click anywhere in this
+    // block means "type here", and a reply banner is part of the composer,
+    // not a separate thing to hit.
+    hits.push(composer_area, HitTarget::Composer);
     composer::draw(composer_area, state, theme, f);
 }
 
