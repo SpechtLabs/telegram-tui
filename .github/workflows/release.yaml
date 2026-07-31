@@ -97,8 +97,51 @@ jobs:
     needs: [ci]
     if: github.event_name == 'push'
     steps:
+      # release-please-action acts on the repository's CURRENT state via the
+      # GitHub API, not on the commit this run's own `push` event checked
+      # out — so a run that spent a while queued behind `ci` can wake up
+      # after a *later* push has already been merged, see that merge, and
+      # tag a release on behalf of a head that isn't its own. The newer
+      # run's own release-please step then runs moments later, finds the
+      # release already exists, and reports release_created=false — which
+      # skips Build/Checksums/Homebrew for the run that is actually current.
+      # v0.1.6 shipped intact only because the stale run's Build job checks
+      # out the *tag* rather than its own head, so it happened to build the
+      # right source anyway; a different ordering would have shipped a
+      # third empty tag (the first two are why the group below exists at
+      # all).
+      #
+      # This does not re-serialize pushes against each other — that
+      # tradeoff was made deliberately when the concurrency group below
+      # moved to per-sha groups, precisely so overlap is possible — it only
+      # stops an overlapping run from acting once it is no longer the one
+      # that matters. A run whose head is no longer main's tip by the time
+      # it reaches this point steps aside instead of racing the run that
+      # superseded it; that later run will find itself current when it gets
+      # here and do the work. The normal, single-push case is unaffected —
+      # main has not moved since this run's own push triggered it, so the
+      # check passes and everything below proceeds exactly as before. The
+      # window this narrows (a few seconds between this check and the next
+      # step) rather than closes: release-please has no notion of "as of an
+      # older commit", only "as of now", so nothing shy of serializing every
+      # push closes it completely, and that cost was already rejected.
+      - name: Refuse to act unless this run's head is still main's tip
+        id: still-current
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)"
+          if [ "$tip" = "${{ github.sha }}" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::main has moved to $tip since this run started at ${{ github.sha }}; leaving release-please to that run."
+          fi
+
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release-please
+        if: steps.still-current.outputs.current == 'true'
         with:
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
@@ -525,7 +568,50 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
           path: tap
 
+      # A repair can target any previously published tag, not only the
+      # newest — that is the entire point of task #73, "repair" and
+      # "rebuild the latest release" are different operations. Repairing
+      # v0.1.4 to prove the skip_build logic worked, after v0.1.5 had
+      # already shipped, regenerated and pushed the formula *for v0.1.4*,
+      # clobbering the live v0.1.5 formula until v0.1.6 happened to
+      # overwrite it again — every `brew install` in between silently
+      # downgraded. This job had no notion that the tag it is building
+      # might be older than what the tap already advertises, so it never
+      # checked before writing.
+      #
+      # Compared against the tap's own currently-published version, not
+      # "the latest GitHub release": the tap is what this job is actually
+      # about to overwrite, reading it needs nothing beyond the checkout
+      # above, and it sidesteps a second query's own edge cases (drafts,
+      # prereleases, which "release" the API calls latest).
+      #
+      # `sort -V` (GNU version sort) rather than a lexical compare:
+      # versions here are plain MAJOR.MINOR.PATCH (.release-please-
+      # config.json), and lexical comparison ranks "0.9.0" above "0.10.0" —
+      # checked with `printf '0.9.0\n0.10.0\n' | sort -V` rather than
+      # assumed. No override input for "I genuinely want to push an older
+      # formula than what's live": that case is real but vanishingly rare,
+      # and better done by hand against the tap directly than handed a CI
+      # input nobody would reach for except by mistake.
+      - name: Refuse to downgrade the tap
+        id: tap-guard
+        run: |
+          set -euo pipefail
+          current_version=""
+          if [ -f tap/Formula/tgt.rb ]; then
+            current_version="$(sed -n 's/^ *version "\(.*\)"$/\1/p' tap/Formula/tgt.rb)"
+          fi
+          this_version="${TAG#v}"
+          if [ -z "$current_version" ] ||
+             [ "$(printf '%s\n%s\n' "$current_version" "$this_version" | sort -V | tail -1)" = "$this_version" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::the tap already advertises $current_version, newer than $this_version being built here; leaving the formula alone."
+          fi
+
       - name: Generate the formula
+        if: steps.tap-guard.outputs.skip != 'true'
         run: |
           set -euo pipefail
           mkdir -p tap/Formula
@@ -533,6 +619,7 @@ jobs:
           cat tap/Formula/tgt.rb
 
       - name: Commit and push
+        if: steps.tap-guard.outputs.skip != 'true'
         working-directory: tap
         run: |
           set -euo pipefail
