@@ -17,7 +17,6 @@ warning = "#e5c07b"
 danger = "#e06c75"
 selection = "#313b4f"
 rail_own = "#3a698f"
-rail_other = "#61afef"
 border = "#343944"
 
 sender_palette = [

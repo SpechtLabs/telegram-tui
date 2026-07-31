@@ -93,7 +93,6 @@ const TOKEN_KEYS: &[&str] = &[
     "danger",
     "selection",
     "rail_own",
-    "rail_other",
     "border",
 ];
 
@@ -223,7 +222,6 @@ fn set_token(theme: &mut Theme, key: &str, color: Color) {
         "danger" => theme.danger = color,
         "selection" => theme.selection = color,
         "rail_own" => theme.rail_own = color,
-        "rail_other" => theme.rail_other = color,
         "border" => theme.border = color,
         _ => unreachable!("set_token called with non-token key {key:?}"),
     }
@@ -331,7 +329,6 @@ mod tests {
         danger = "#e06c75"
         selection = "magenta"
         rail_own = "#3a698f"
-        rail_other = "bright_cyan"
         border = "#343944"
 
         sender_palette = [
@@ -346,8 +343,45 @@ mod tests {
         ]
     "##;
 
+    /// `rail_other` was removed once nothing read it, and a user theme
+    /// written before that must keep working. It does, because an
+    /// unrecognized key warns and is ignored rather than failing the parse —
+    /// the same rule that lets a config from a newer binary load in an older
+    /// one. Pinned here because "removing a token is not a breaking change"
+    /// is a property of that fallback, not of the removal, and someone
+    /// tightening unknown keys into an error would break every custom theme
+    /// still carrying it.
     #[test]
-    fn parses_all_thirteen_tokens_plus_palette() {
+    fn a_theme_still_setting_a_removed_token_keeps_loading() {
+        let theme = parse(
+            r##"
+            accent = "#61afef"
+            rail_other = "#61afef"
+            "##,
+        )
+        .expect("a retired token must not fail the parse");
+
+        assert_eq!(theme.accent, Color::Rgb(0x61, 0xaf, 0xef));
+        // And the rest of the file still applied, rather than the unknown
+        // key aborting the walk partway through.
+        assert_eq!(theme, {
+            let mut expected = Theme::default_dark();
+            expected.accent = Color::Rgb(0x61, 0xaf, 0xef);
+            expected
+        });
+    }
+
+    /// An unparseable value under a *removed* token is likewise not an error
+    /// any more — it is never parsed at all. Worth stating, because it is
+    /// the one behaviour change removal actually causes.
+    #[test]
+    fn a_removed_token_is_not_even_colour_checked() {
+        parse("rail_other = \"not-a-colour\"")
+            .expect("a retired token's value is never parsed, so it cannot be wrong");
+    }
+
+    #[test]
+    fn parses_all_twelve_tokens_plus_palette() {
         let theme = parse(FULL_THEME_TOML).expect("fixture must parse");
 
         assert_eq!(theme.accent, Color::Rgb(0x61, 0xaf, 0xef));
@@ -361,7 +395,6 @@ mod tests {
         assert_eq!(theme.danger, Color::Rgb(0xe0, 0x6c, 0x75));
         assert_eq!(theme.selection, Color::Magenta);
         assert_eq!(theme.rail_own, Color::Rgb(0x3a, 0x69, 0x8f));
-        assert_eq!(theme.rail_other, Color::LightCyan);
         // Regression coverage for the gap this task closed: `border` was on
         // `Theme` but missing from `TOKEN_KEYS`/`set_token`, so a theme file
         // setting it was silently ignored.

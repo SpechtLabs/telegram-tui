@@ -18,7 +18,6 @@ warning = "#e0af68"        # yellow
 danger = "#f7768e"         # red
 selection = "#414868"      # terminal_black
 rail_own = "#3d59a1"       # blue0 (= accent_dim)
-rail_other = "#7aa2f7"     # blue (= accent)
 border = "#3b4261"         # fg_gutter
 
 sender_palette = [

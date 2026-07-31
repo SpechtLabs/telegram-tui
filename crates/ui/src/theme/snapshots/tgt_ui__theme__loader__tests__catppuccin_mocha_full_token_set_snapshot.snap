@@ -58,11 +58,6 @@ Theme {
         199,
         236,
     ),
-    rail_other: Rgb(
-        137,
-        180,
-        250,
-    ),
     border: Rgb(
         88,
         91,

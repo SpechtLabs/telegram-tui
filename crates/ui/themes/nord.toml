@@ -18,7 +18,6 @@ warning = "#ebcb8b"        # nord13 (aurora yellow)
 danger = "#bf616a"         # nord11 (aurora red)
 selection = "#434c5e"      # nord2
 rail_own = "#5e81ac"       # nord10 (= accent_dim)
-rail_other = "#88c0d0"     # nord8 (= accent)
 border = "#434c5e"         # nord2
 
 sender_palette = [

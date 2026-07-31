@@ -22,11 +22,10 @@ Theme files are flat TOML with no sections. Every key is optional; anything miss
 | `danger` | The failed-send `✗` marker, auth error text, the consent screen's negative line |
 | `selection` | Row backgrounds inside overlays: the palette result row, the selected modal button |
 | `rail_own` | The `▏` rail on your own outgoing messages |
-| `rail_other` | Nothing. See below. |
 | `border` | The vertical rule between panes, the horizontal rule under the chat header, the unfocused composer box, overlay panel borders, chat-list separators |
 
-::: warning rail_other is dead
-It's in the struct, in the parser, and set by all eight built-in files, but no view reads it. Incoming message rails take their colour from the sender palette instead. Setting it in a custom theme has no visible effect.
+::: tip rail_other was removed
+Older versions had a `rail_other` token that nothing read — incoming message rails take their colour from `sender_palette` instead. It's gone as of this version. A custom theme that still sets it keeps loading: unknown keys warn in the log and are ignored, so there's nothing to change unless you want the warning to stop.
 :::
 
 ## `sender_palette`

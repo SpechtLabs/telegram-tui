@@ -328,7 +328,7 @@ truncated to one line, and are selectable to jump to the original.
 
 Colors are never written at call sites. A `Theme` struct exposes semantic tokens
 (`accent`, `accent_dim`, `text`, `text_muted`, `surface`, `surface_raised`,
-`success`, `warning`, `danger`, `selection`, `rail_own`, `rail_other`). Built-in
+`success`, `warning`, `danger`, `selection`, `rail_own`, `border`). Built-in
 themes ship as TOML; users may supply their own file. Truecolor is used when
 available with a defined 256-color degradation path.
 

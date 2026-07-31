@@ -20,7 +20,6 @@ warning = "#f9e2af"        # Yellow
 danger = "#f38ba8"         # Red
 selection = "#45475a"      # Surface1
 rail_own = "#74c7ec"       # Sapphire (= accent_dim)
-rail_other = "#89b4fa"     # Blue (= accent)
 border = "#585b70"         # Surface2
 
 sender_palette = [

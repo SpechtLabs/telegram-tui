@@ -2262,7 +2262,9 @@ mod tests {
             )]
         };
 
-        let incoming = place_row(content(), 40, false, Style::new().fg(theme.rail_other));
+        // Any color: `place_row` is being checked for rail placement and
+        // alignment, not for which token the caller chose.
+        let incoming = place_row(content(), 40, false, Style::new().fg(theme.accent));
         assert_eq!(line_text(&incoming), "▏ 👍 3");
 
         let own = place_row(content(), 40, true, Style::new().fg(theme.rail_own));
