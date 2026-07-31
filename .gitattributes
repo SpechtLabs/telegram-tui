@@ -1,0 +1,14 @@
+# Keep the working tree LF on every platform.
+#
+# Windows checkouts default to CRLF, which breaks anything that compares file
+# bytes against text generated in-process: `fixtures_on_disk_match_their_scripts`
+# regenerates the FakeTd JSONL fixtures with `\n` and diffs them against what is
+# on disk, so a CRLF checkout fails a test about fixture content with a mismatch
+# about invisible characters. insta snapshots and the shell scripts have the same
+# exposure.
+* text=auto eol=lf
+
+# Belt and braces for the files that are compared byte-for-byte.
+*.jsonl text eol=lf
+*.snap  text eol=lf
+*.sh    text eol=lf
