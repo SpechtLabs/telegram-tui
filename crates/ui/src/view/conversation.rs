@@ -79,16 +79,35 @@
 //!
 //! ## Deferred seams
 //!
-//! Selection highlighting (T26) and in-chat search-hit highlighting (T47)
-//! are both out of scope for this milestone. [`apply_selection_highlight`]
-//! and [`apply_search_highlight`] are the marked seams: both are identity
-//! functions today, called from the one place each content row is built,
-//! ready for a later task to fill in without re-deriving the walk.
+//! Selection highlighting (T26) is still out of scope for this milestone:
+//! [`apply_selection_highlight`] stays an identity function, called from the
+//! one place each content row is built, ready for a later task to fill in
+//! without re-deriving the walk.
+//!
+//! ## Search-hit highlighting (T47)
+//!
+//! `apply_search_highlight` (formerly the identity seam T23 left) now reads
+//! `ConversationState::search_hits` and `ChatSearchState::current_hit`
+//! (T42). **Fidelity note:** `searchChatMessages` (architecture §4.3/§4.7)
+//! answers with matching message ids only — no per-message offset/length of
+//! the substring TDLib actually matched — so there is no matched *text
+//! range* to underline within a message body. This highlights at message
+//! granularity instead: every hit gets a `theme.surface_raised` tint across
+//! all of its rendered lines, and the current hit's first line additionally
+//! goes bold `theme.warning` so it reads as distinct from the rest. Both are
+//! style-only changes (no inserted characters), so no line's width and no
+//! wrapping decision changes — the walk, the cache, and every non-search
+//! snapshot are unaffected.
+//!
+//! The query box itself (`Focus::ChatSearch`) renders as a one-line bar at
+//! the top of the conversation pane, the same treatment `view::chat_list`
+//! gives its `/` filter line (`draw_search_input` mirrors
+//! `chat_list::draw_filter_input`).
 
 use std::collections::VecDeque;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
@@ -96,7 +115,9 @@ use tgt_core::app::AppState;
 use tgt_core::model::ids::{FileId, MessageId};
 use tgt_core::model::message::{MessageContent, MessageView, ReactionView, SendState};
 use tgt_core::state::conversation::{ConversationState, Scroll};
+use tgt_core::state::focus::Focus;
 use tgt_core::state::media::MediaState;
+use tgt_core::state::search::ChatSearchState;
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::cache::{LayoutCache, LayoutKey};
@@ -114,12 +135,14 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, cache: &
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let messages_area = draw_search_bar_if_active(inner, state, theme, f);
+
     let Some(convo) = open_conversation(state) else {
-        draw_centered(inner, "select a chat", theme, f);
+        draw_centered(messages_area, "select a chat", theme, f);
         return;
     };
     if convo.messages.is_empty() {
-        draw_centered(inner, "no messages yet", theme, f);
+        draw_centered(messages_area, "no messages yet", theme, f);
         return;
     }
 
@@ -127,13 +150,34 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, cache: &
         convo,
         &state.media,
         state.theme_generation,
-        inner.width,
-        inner.height,
+        messages_area.width,
+        messages_area.height,
         theme,
         cache,
+        state.chat_search.as_ref(),
     );
     let lines: Vec<Line<'static>> = rows.into_iter().map(|row| row.line).collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), messages_area);
+}
+
+/// Reserves and draws the one-line search query bar at the top of `inner`
+/// when `Focus::ChatSearch` is active, returning the area left over for the
+/// message list (unchanged from `inner` when search isn't active — zero
+/// visual change to every non-search render, including every existing
+/// snapshot).
+fn draw_search_bar_if_active(inner: Rect, state: &AppState, theme: &Theme, f: &mut Frame) -> Rect {
+    let Some(search) = state.chat_search.as_ref() else {
+        return inner;
+    };
+    if !matches!(state.focus.current(), Focus::ChatSearch) {
+        return inner;
+    }
+    if inner.height == 0 {
+        return inner;
+    }
+    let areas = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    draw_search_input(areas[0], search, theme, f);
+    areas[1]
 }
 
 /// `(oldest_visible, newest_visible)` message ids currently laid out inside
@@ -156,16 +200,26 @@ pub fn visible_range(
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
+    let messages_area =
+        if state.chat_search.is_some() && matches!(state.focus.current(), Focus::ChatSearch) {
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner)[1]
+        } else {
+            inner
+        };
+    if messages_area.width == 0 || messages_area.height == 0 {
+        return None;
+    }
 
     let theme = fallback_theme();
     let rows = build_window(
         convo,
         &state.media,
         state.theme_generation,
-        inner.width,
-        inner.height,
+        messages_area.width,
+        messages_area.height,
         &theme,
         cache,
+        state.chat_search.as_ref(),
     );
 
     let mut oldest = None;
@@ -225,6 +279,7 @@ fn build_window(
     height: u16,
     theme: &Theme,
     cache: &mut LayoutCache,
+    chat_search: Option<&ChatSearchState>,
 ) -> VecDeque<WindowRow> {
     let mut rows: VecDeque<WindowRow> = VecDeque::new();
     if width == 0 || height == 0 || convo.messages.is_empty() {
@@ -273,6 +328,7 @@ fn build_window(
             append_receipt(&mut msg_lines, msg, convo.last_read_outbox, width, theme);
         }
 
+        let hit_kind = search_hit_kind(convo, chat_search, msg.id);
         let mut block: Vec<WindowRow> = Vec::with_capacity(msg_lines.len() + 1);
         if idx > 0 && !grouped {
             block.push(WindowRow {
@@ -280,10 +336,20 @@ fn build_window(
                 line: Line::default(),
             });
         }
-        block.extend(msg_lines.into_iter().map(|line| WindowRow {
-            message_id: Some(msg.id),
-            line: apply_search_highlight(apply_selection_highlight(line, msg.id), msg.id),
-        }));
+        block.extend(
+            msg_lines
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| WindowRow {
+                    message_id: Some(msg.id),
+                    line: apply_search_highlight(
+                        apply_selection_highlight(line, msg.id),
+                        hit_kind,
+                        i == 0,
+                        theme,
+                    ),
+                }),
+        );
 
         // `block` is in top-to-bottom order already; pushing it to the
         // front in reverse keeps that order at the front of `rows`.
@@ -317,10 +383,66 @@ fn apply_selection_highlight(line: Line<'static>, _message_id: MessageId) -> Lin
     line
 }
 
-/// In-chat search-hit highlight seam (T47). A no-op today: returns `line`
-/// unmodified. Wire `ConversationState::search_hits` matching in here.
-fn apply_search_highlight(line: Line<'static>, _message_id: MessageId) -> Line<'static> {
-    line
+/// Where `msg_id` sits relative to the open chat's search hits (module docs'
+/// "Search-hit highlighting" section). `None` whenever search isn't active
+/// (`chat_search` is `None`) or the message just isn't a hit — including
+/// while `chat_search` is `Some` but `handle_td_result` hasn't answered yet,
+/// since `search_hits` is empty until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchHitKind {
+    None,
+    Other,
+    Current,
+}
+
+fn search_hit_kind(
+    convo: &ConversationState,
+    chat_search: Option<&ChatSearchState>,
+    msg_id: MessageId,
+) -> SearchHitKind {
+    let Some(search) = chat_search else {
+        return SearchHitKind::None;
+    };
+    match convo.search_hits.iter().position(|&id| id == msg_id) {
+        Some(idx) if idx == search.current_hit => SearchHitKind::Current,
+        Some(_) => SearchHitKind::Other,
+        None => SearchHitKind::None,
+    }
+}
+
+/// In-chat search-hit highlight seam (T47). See the module docs' "Search-hit
+/// highlighting" section for the fidelity note this design accepts. Every
+/// line of a hit's block gets a `theme.surface_raised` tint; the current
+/// hit's `is_first_line` additionally goes bold `theme.warning`, the one
+/// visual cue that tells it apart from the other hits. Both are style-only
+/// edits — no span's text changes — so no line's rendered width moves and no
+/// wrapping decision made upstream is invalidated.
+fn apply_search_highlight(
+    line: Line<'static>,
+    kind: SearchHitKind,
+    is_first_line: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    if kind == SearchHitKind::None {
+        return line;
+    }
+    let emphasize = kind == SearchHitKind::Current && is_first_line;
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| tint_search_hit(span, emphasize, theme))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn tint_search_hit(span: Span<'static>, emphasize: bool, theme: &Theme) -> Span<'static> {
+    let style = span.style.bg(theme.surface_raised);
+    let style = if emphasize {
+        style.fg(theme.warning).add_modifier(Modifier::BOLD)
+    } else {
+        style
+    };
+    Span::styled(span.content, style)
 }
 
 /// Resolves `convo.scroll` to a concrete `(index, line_offset)` into
@@ -553,6 +675,34 @@ fn receipt_marker(
     }
 }
 
+/// Renders the in-chat search query line with a reverse-video cursor cell,
+/// mirroring `view::chat_list::draw_filter_input`'s cursor treatment (this
+/// file's own `InputField`-editing UI, same shape, distinct label since
+/// `/` here means "search this chat" rather than "filter the chat list").
+fn draw_search_input(area: Rect, search: &ChatSearchState, theme: &Theme, f: &mut Frame) {
+    let text = &search.input.text;
+    let chars: Vec<char> = text.chars().collect();
+    let cursor_chars = text[..search.input.cursor].chars().count().min(chars.len());
+    let base = Style::new().fg(theme.text);
+    let cursor_style = Style::new().fg(theme.surface).bg(theme.accent);
+
+    let mut spans = vec![Span::styled("search: ", Style::new().fg(theme.text_muted))];
+    let before: String = chars[..cursor_chars].iter().collect();
+    if !before.is_empty() {
+        spans.push(Span::styled(before, base));
+    }
+    if cursor_chars < chars.len() {
+        spans.push(Span::styled(chars[cursor_chars].to_string(), cursor_style));
+        let after: String = chars[cursor_chars + 1..].iter().collect();
+        if !after.is_empty() {
+            spans.push(Span::styled(after, base));
+        }
+    } else {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn draw_centered(area: Rect, text: &str, theme: &Theme, f: &mut Frame) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -591,6 +741,7 @@ mod tests {
     use tgt_core::state::history::PagingState;
     use tgt_core::state::media::MediaState;
     use tgt_core::state::presence::PresenceState;
+    use tgt_core::state::search::ChatSearchState;
     use tgt_core::state::toasts::ToastState;
     use tgt_core::td::update::{AuthPhase, ConnectionPhase};
 
@@ -831,6 +982,142 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    // --- search highlighting and query bar (T47) --------------------------
+
+    /// Active `Focus::ChatSearch` with three hits and a query bar showing
+    /// "pr": the search bar renders at the top of the pane, the current hit
+    /// (msg 5, `current_hit == 1`) is bold-warning on its first line, and
+    /// the other two hits (msg 2, msg 9) get the subtler `surface_raised`
+    /// tint across their lines. Fixed state, so the snapshot is stable.
+    #[test]
+    fn search_active_with_current_and_other_hits_120x40() {
+        let mut convo = conversation(mixed_history(), Scroll::Bottom);
+        convo.search_hits = vec![MessageId(9), MessageId(5), MessageId(2)];
+        let mut state = fixture_state(Some(convo));
+        state.focus = FocusStack::new(Focus::Composer);
+        state.focus.push(Focus::ChatSearch);
+        state.chat_search = Some(ChatSearchState {
+            input: InputField {
+                text: "pr".to_string(),
+                cursor: 2,
+            },
+            current_hit: 1,
+            in_flight: false,
+        });
+
+        let rendered = render_to_string(120, 40, &state);
+        assert!(
+            rendered.contains("search: pr"),
+            "query bar missing:\n{rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// Search inactive (`chat_search: None`, the default fixture) must look
+    /// pixel-identical to the pre-T47 render: no query bar, no tint on any
+    /// message, even though this conversation's messages are the same as
+    /// `mixed_grouped_history_120x40`'s.
+    #[test]
+    fn search_inactive_matches_pre_search_render() {
+        let with_hits_but_inactive = {
+            let mut convo = conversation(mixed_history(), Scroll::Bottom);
+            // A stale `search_hits` list from a closed search (module docs:
+            // `search::close` clears it, but this proves the highlight seam
+            // itself also gates on `chat_search.is_some()`, not just
+            // `search_hits` being non-empty).
+            convo.search_hits = vec![MessageId(9), MessageId(5), MessageId(2)];
+            fixture_state(Some(convo))
+        };
+        let baseline = fixture_state(Some(conversation(mixed_history(), Scroll::Bottom)));
+
+        assert_eq!(
+            render_to_string(120, 40, &with_hits_but_inactive),
+            render_to_string(120, 40, &baseline),
+            "stale search_hits must not paint a highlight once chat_search is None"
+        );
+    }
+
+    /// `render_to_string`'s snapshot only captures cell text, not `Style` —
+    /// this asserts the styles directly, driving `build_window` the same
+    /// way the other bottom-up-fill unit tests do. Msg 8 (the doc message)
+    /// is the current hit and ungrouped (its own header plus the two-line
+    /// file card = a 3-line block), so it exercises "first line bold
+    /// warning, later lines tinted but not bold/warning". Msg 2 is the
+    /// other hit: tinted throughout, never the current-hit emphasis. Msg 1
+    /// is not a hit at all and must carry neither.
+    #[test]
+    fn search_hit_styles_distinguish_current_from_other_hits() {
+        let mut convo = conversation(mixed_history(), Scroll::Bottom);
+        convo.search_hits = vec![MessageId(8), MessageId(2)];
+        let search = ChatSearchState {
+            input: InputField::default(),
+            current_hit: 0,
+            in_flight: false,
+        };
+        let mut cache = LayoutCache::new();
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            120,
+            40,
+            &theme(),
+            &mut cache,
+            Some(&search),
+        );
+
+        let current_rows: Vec<&WindowRow> = rows
+            .iter()
+            .filter(|r| r.message_id == Some(MessageId(8)))
+            .collect();
+        assert!(
+            current_rows.len() > 1,
+            "expected msg 8's block to span multiple lines: {} rows",
+            current_rows.len()
+        );
+        for span in &current_rows[0].line.spans {
+            assert_eq!(span.style.bg, Some(theme().surface_raised));
+            assert_eq!(span.style.fg, Some(theme().warning));
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
+        // Later lines of the current hit's own block are tinted like any
+        // other hit, but not bold — bold is `emphasize`'s signal, reserved
+        // for the block's first line. (Not asserting `fg != warning` here:
+        // `theme.sender_palette[2]` — Bob's rail color, since msg 8 is
+        // Bob's — happens to equal `theme.warning`'s RGB by coincidence of
+        // the built-in palette, so fg-equality is not a reliable
+        // "was this emphasized" signal; the BOLD modifier is.)
+        for row in &current_rows[1..] {
+            for span in &row.line.spans {
+                assert_eq!(span.style.bg, Some(theme().surface_raised));
+                assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+
+        let other_rows: Vec<&WindowRow> = rows
+            .iter()
+            .filter(|r| r.message_id == Some(MessageId(2)))
+            .collect();
+        assert!(!other_rows.is_empty());
+        for row in &other_rows {
+            for span in &row.line.spans {
+                assert_eq!(span.style.bg, Some(theme().surface_raised));
+                assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+
+        let non_hit_rows: Vec<&WindowRow> = rows
+            .iter()
+            .filter(|r| r.message_id == Some(MessageId(1)))
+            .collect();
+        assert!(!non_hit_rows.is_empty());
+        for row in &non_hit_rows {
+            for span in &row.line.spans {
+                assert_ne!(span.style.bg, Some(theme().surface_raised));
+            }
+        }
+    }
+
     // --- file cards (T40) -------------------------------------------------
 
     /// The two-line card the module docs describe: the cached identity line,
@@ -960,6 +1247,7 @@ mod tests {
             5,
             &theme(),
             &mut cache,
+            None,
         );
 
         assert_eq!(rows.len(), 5);
@@ -990,6 +1278,7 @@ mod tests {
             10,
             &theme(),
             &mut cache,
+            None,
         );
 
         assert_eq!(rows.len(), 10);
@@ -1020,6 +1309,7 @@ mod tests {
             40,
             &theme(),
             &mut cache,
+            None,
         );
         let rendered: Vec<String> = rows
             .iter()
@@ -1074,6 +1364,7 @@ mod tests {
             10,
             &theme(),
             &mut cache,
+            None,
         );
         let trimmed = build_window(
             &convo_offset,
@@ -1083,6 +1374,7 @@ mod tests {
             10,
             &theme(),
             &mut cache,
+            None,
         );
 
         let full_count = full.iter().filter(|r| r.message_id.is_some()).count();
@@ -1142,6 +1434,7 @@ mod tests {
             10,
             &theme(),
             &mut cache,
+            None,
         );
         let reaction_row = rows
             .iter()
@@ -1188,6 +1481,7 @@ mod tests {
             10,
             &theme(),
             &mut cache,
+            None,
         );
         let texts: Vec<String> = rows
             .iter()
