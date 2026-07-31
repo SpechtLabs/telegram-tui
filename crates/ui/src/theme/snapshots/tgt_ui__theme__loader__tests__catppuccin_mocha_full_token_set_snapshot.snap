@@ -1,0 +1,113 @@
+---
+source: crates/ui/src/theme/loader.rs
+expression: "format!(\"{theme:#?}\")"
+---
+Theme {
+    accent: Rgb(
+        137,
+        180,
+        250,
+    ),
+    accent_dim: Rgb(
+        116,
+        199,
+        236,
+    ),
+    text: Rgb(
+        205,
+        214,
+        244,
+    ),
+    text_muted: Rgb(
+        127,
+        132,
+        156,
+    ),
+    surface: Rgb(
+        30,
+        30,
+        46,
+    ),
+    surface_raised: Rgb(
+        49,
+        50,
+        68,
+    ),
+    success: Rgb(
+        166,
+        227,
+        161,
+    ),
+    warning: Rgb(
+        249,
+        226,
+        175,
+    ),
+    danger: Rgb(
+        243,
+        139,
+        168,
+    ),
+    selection: Rgb(
+        69,
+        71,
+        90,
+    ),
+    rail_own: Rgb(
+        116,
+        199,
+        236,
+    ),
+    rail_other: Rgb(
+        137,
+        180,
+        250,
+    ),
+    border: Rgb(
+        88,
+        91,
+        112,
+    ),
+    sender_palette: [
+        Rgb(
+            243,
+            139,
+            168,
+        ),
+        Rgb(
+            250,
+            179,
+            135,
+        ),
+        Rgb(
+            249,
+            226,
+            175,
+        ),
+        Rgb(
+            166,
+            227,
+            161,
+        ),
+        Rgb(
+            148,
+            226,
+            213,
+        ),
+        Rgb(
+            137,
+            180,
+            250,
+        ),
+        Rgb(
+            203,
+            166,
+            247,
+        ),
+        Rgb(
+            245,
+            194,
+            231,
+        ),
+    ],
+}

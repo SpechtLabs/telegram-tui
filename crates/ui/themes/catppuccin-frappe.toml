@@ -1,0 +1,35 @@
+# catppuccin-frappe — https://github.com/catppuccin/catppuccin (Frappe).
+#
+# Official Frappe palette hex values. Same mapping convention as
+# catppuccin-mocha.toml: base -> surface, surface0 -> surface_raised,
+# text -> text, overlay1 -> text_muted, blue -> accent, sapphire ->
+# accent_dim, surface1 -> selection, surface2 -> border.
+#
+# Accepted by name as both "catppuccin-frappe" and "catppuccin_frappe" (see
+# `crate::theme::loader::builtin`); this file itself is only ever looked up
+# by the hyphenated catalogue name.
+
+accent = "#8caaee"         # Blue
+accent_dim = "#85c1dc"     # Sapphire
+text = "#c6d0f5"           # Text
+text_muted = "#838ba7"     # Overlay1
+surface = "#303446"        # Base
+surface_raised = "#414559" # Surface0
+success = "#a6d189"        # Green
+warning = "#e5c890"        # Yellow
+danger = "#e78284"         # Red
+selection = "#51576d"      # Surface1
+rail_own = "#85c1dc"       # Sapphire (= accent_dim)
+rail_other = "#8caaee"     # Blue (= accent)
+border = "#626880"         # Surface2
+
+sender_palette = [
+    "#e78284", # Red
+    "#ef9f76", # Peach
+    "#e5c890", # Yellow
+    "#a6d189", # Green
+    "#81c8be", # Teal
+    "#8caaee", # Blue
+    "#ca9ee6", # Mauve
+    "#f4b8e4", # Pink
+]

@@ -40,13 +40,27 @@
 //!
 //! ## Command effects
 //!
-//! `ToggleTheme`, `TelemetrySettings` and `SendFile` are claimed (the
-//! palette closes, an empty effect list is returned) but are no-ops for now:
-//! real theme switching needs the theme file/generation machinery T53 adds,
-//! a telemetry settings screen doesn't exist before T51, and offering to
-//! send a file needs a file browser this milestone doesn't build. `LogOut`
-//! and `Quit` are real: they emit `Effect::Td(TdRequest::LogOut)` and
-//! `Effect::Quit` respectively.
+//! `TelemetrySettings` and `SendFile` are claimed (the palette closes, an
+//! empty effect list is returned) but stay no-ops: a telemetry settings
+//! screen doesn't exist before T51, and offering to send a file needs a
+//! file browser this milestone doesn't build. `LogOut` and `Quit` are real:
+//! they emit `Effect::Td(TdRequest::LogOut)` and `Effect::Quit`
+//! respectively.
+//!
+//! `ToggleTheme` is real as of T60 (`toggle_theme`): it walks
+//! [`BUILTIN_THEME_NAMES`] — this crate's copy of the built-in catalogue
+//! order from docs/design-language.md §7, since `tgt-core` cannot depend on
+//! `tgt-ui` to read `tgt_ui::theme::loader::builtin_names()` directly — to
+//! the entry after `app.theme_name`, wrapping to the first entry past the
+//! last (and starting the cycle over if the current name isn't in the list
+//! at all, e.g. a user theme file). It sets `app.theme_name`, bumps
+//! `app.theme_generation` (what makes `tgt-ui`'s layout cache, keyed in
+//! part on that generation, stop returning lines styled with the old
+//! theme), and returns `Effect::SaveConfig(ConfigPatch::Theme(name))` so
+//! the choice survives a restart. The `Theme` value itself is never
+//! resolved here — that stays `tgt-app`'s job (`main.rs::resolve_theme`,
+//! re-run by `runtime_loop::Core` on a generation change) — this module
+//! only ever touches the name.
 //!
 //! ## Focus-stack contract
 //!
@@ -64,7 +78,7 @@ use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
 
 use crate::app::AppState;
-use crate::effect::Effect;
+use crate::effect::{ConfigPatch, Effect};
 use crate::model::chat::ChatListId;
 use crate::model::ids::{ChatId, MessageId};
 use crate::model::key::Key;
@@ -105,6 +119,24 @@ const COMMANDS: [(CommandId, &str); 5] = [
     (CommandId::SendFile, "Send file"),
     (CommandId::LogOut, "Log out"),
     (CommandId::Quit, "Quit"),
+];
+
+/// This crate's copy of the built-in theme catalogue's names, in the same
+/// cycle order as `tgt_ui::theme::loader::builtin_names()`
+/// (docs/design-language.md §7). `tgt-core` cannot depend on `tgt-ui` (see
+/// the crate-boundary rule in architecture.md §2), so `ToggleTheme` cycles
+/// over this list rather than the real one; `crates/app/src/main.rs` has a
+/// test asserting the two stay identical, since that's the one crate that
+/// depends on both and can compare them.
+pub const BUILTIN_THEME_NAMES: [&str; 8] = [
+    "default-dark",
+    "catppuccin-frappe",
+    "catppuccin-macchiato",
+    "catppuccin-mocha",
+    "catppuccin-latte",
+    "tokyo-night",
+    "gruvbox-dark",
+    "nord",
 ];
 
 /// Opens the palette: a fresh empty query, results pre-populated for it (all
@@ -191,7 +223,7 @@ fn invoke_selected(app: &mut AppState) -> Vec<Effect> {
     close(app);
     match item {
         Some(PaletteItem::Chat { id, .. }) => open_chat(app, id),
-        Some(PaletteItem::Command { id, .. }) => run_command(id),
+        Some(PaletteItem::Command { id, .. }) => run_command(app, id),
         None => Vec::new(),
     }
 }
@@ -225,10 +257,9 @@ fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
     ]
 }
 
-fn run_command(id: CommandId) -> Vec<Effect> {
+fn run_command(app: &mut AppState, id: CommandId) -> Vec<Effect> {
     match id {
-        // T53 real theme switching.
-        CommandId::ToggleTheme => Vec::new(),
+        CommandId::ToggleTheme => toggle_theme(app),
         // No telemetry settings screen before T51.
         CommandId::TelemetrySettings => Vec::new(),
         // Needs a file browser; deferred (this milestone offers file sends
@@ -237,6 +268,25 @@ fn run_command(id: CommandId) -> Vec<Effect> {
         CommandId::LogOut => vec![Effect::Td(TdRequest::LogOut)],
         CommandId::Quit => vec![Effect::Quit],
     }
+}
+
+/// Cycles `app.theme_name` to the entry after it in [`BUILTIN_THEME_NAMES`],
+/// wrapping around at the end; a name not found in the catalogue at all
+/// (hand-edited config, a user theme file) starts the cycle over from the
+/// first entry rather than refusing to change anything. See the module
+/// docs' "Command effects" section for the generation-bump/persistence
+/// contract.
+fn toggle_theme(app: &mut AppState) -> Vec<Effect> {
+    let next_index = BUILTIN_THEME_NAMES
+        .iter()
+        .position(|&name| name == app.theme_name)
+        .map_or(0, |current| (current + 1) % BUILTIN_THEME_NAMES.len());
+    let next = BUILTIN_THEME_NAMES[next_index];
+
+    app.theme_name = next.to_string();
+    app.theme_generation = app.theme_generation.wrapping_add(1);
+
+    vec![Effect::SaveConfig(ConfigPatch::Theme(next.to_string()))]
 }
 
 /// Recomputes `results` from the current query text and resets `selected`
@@ -664,8 +714,34 @@ mod tests {
     fn no_op_command_closes_palette_and_emits_nothing() {
         let mut app = fixture_state();
         open(&mut app);
-        type_str(&mut app, "Toggle theme");
+        type_str(&mut app, "Telemetry settings");
 
+        let results = &app.palette.as_ref().unwrap().results;
+        assert!(matches!(
+            results[0],
+            PaletteItem::Command {
+                id: CommandId::TelemetrySettings,
+                ..
+            }
+        ));
+
+        let effects = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
+        assert!(effects.is_empty());
+        assert!(app.palette.is_none());
+    }
+
+    /// T60: `ToggleTheme` cycles `app.theme_name` forward through
+    /// `BUILTIN_THEME_NAMES`, bumps `theme_generation` (what makes the
+    /// layout cache stop returning stale-theme lines), and persists the new
+    /// name via `Effect::SaveConfig(ConfigPatch::Theme(_))`.
+    #[test]
+    fn toggle_theme_cycles_persists_and_bumps_generation() {
+        let mut app = fixture_state();
+        app.theme_name = BUILTIN_THEME_NAMES[0].to_string();
+        let starting_generation = app.theme_generation;
+
+        open(&mut app);
+        type_str(&mut app, "Toggle theme");
         let results = &app.palette.as_ref().unwrap().results;
         assert!(matches!(
             results[0],
@@ -676,7 +752,33 @@ mod tests {
         ));
 
         let effects = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
-        assert!(effects.is_empty());
+
+        assert_eq!(app.theme_name, BUILTIN_THEME_NAMES[1]);
+        assert_eq!(app.theme_generation, starting_generation + 1);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::SaveConfig(ConfigPatch::Theme(name)) if name == BUILTIN_THEME_NAMES[1]
+        ));
         assert!(app.palette.is_none());
+
+        // Wraps around at the end of the catalogue back to the first entry.
+        app.theme_name = BUILTIN_THEME_NAMES[BUILTIN_THEME_NAMES.len() - 1].to_string();
+        open(&mut app);
+        type_str(&mut app, "Toggle theme");
+        let effects = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
+        assert_eq!(app.theme_name, BUILTIN_THEME_NAMES[0]);
+        assert!(matches!(
+            &effects[0],
+            Effect::SaveConfig(ConfigPatch::Theme(name)) if name == BUILTIN_THEME_NAMES[0]
+        ));
+
+        // A name outside the catalogue (e.g. a user theme file) starts the
+        // cycle over rather than refusing to change anything.
+        app.theme_name = "my-custom-theme".to_string();
+        open(&mut app);
+        type_str(&mut app, "Toggle theme");
+        let _ = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
+        assert_eq!(app.theme_name, BUILTIN_THEME_NAMES[0]);
     }
 }

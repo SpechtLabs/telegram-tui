@@ -292,27 +292,71 @@ fn resolve_pasted_path(action: Action) -> Action {
     }
 }
 
+/// The resolved `Theme` plus the `AppState::theme_generation` it was
+/// resolved from, so `draw_if_due` can tell a live theme switch (T60's
+/// `state::palette::CommandId::ToggleTheme`, or any future writer of
+/// `theme_generation`) apart from "nothing changed" without re-resolving on
+/// every single frame.
+struct LiveTheme {
+    theme: Theme,
+    generation: u64,
+}
+
+/// Re-resolves a theme by name mid-session. Always `main.rs::resolve_theme`
+/// in the real binary — taken as a plain `fn` pointer (not a `crate::`
+/// reference) rather than called directly, because `runtime_loop.rs` is
+/// `#[path]`-included by several `crates/app/tests/*.rs` integration test
+/// binaries that never pull in `main.rs`, and would fail to compile against
+/// a hard dependency on `crate::resolve_theme`. None of those tests call
+/// [`run`], so they never need to supply one that does anything, but this
+/// module still has to typecheck standalone either way.
+type ThemeResolver = fn(&str) -> Theme;
+
 /// Runs `app` to completion. The caller owns terminal setup/teardown (raw
 /// mode, alternate screen) around this call — `terminal` is only ever drawn
 /// into here, never (re)configured.
+///
+/// `theme` is the theme resolved for `app`'s *starting* `theme_generation`;
+/// after that, `draw_if_due` is the sole place a new one is resolved, always
+/// through `resolve_theme` — the same builtin → user-file → `default_dark`
+/// chain `main.rs` uses at startup (it's the same function, passed in by
+/// the caller — see [`ThemeResolver`]), so a mid-session switch and the
+/// initial resolution can never disagree about what a theme name means.
 pub async fn run(
     app: App,
-    theme: &Theme,
+    theme: Theme,
     terminal: &mut DefaultTerminal,
     runtime: Arc<dyn TdRuntime>,
     config: Arc<Mutex<Config>>,
     td_boot: TdBootParams,
+    resolve_theme: ThemeResolver,
 ) -> io::Result<()> {
     let (term_events, event_reader_running) = spawn_terminal_event_reader();
     let mut core = Core::new(app, runtime, config, td_boot, term_events);
+    let mut live_theme = LiveTheme {
+        generation: core.app().state().theme_generation,
+        theme,
+    };
 
     let mut last_draw: Option<Instant> = None;
     // `App::new` starts dirty so the first screen renders before any action
     // arrives.
-    draw_if_due(&mut core, theme, terminal, &mut last_draw)?;
+    draw_if_due(
+        &mut core,
+        &mut live_theme,
+        resolve_theme,
+        terminal,
+        &mut last_draw,
+    )?;
 
     while core.step().await == Step::Continue {
-        draw_if_due(&mut core, theme, terminal, &mut last_draw)?;
+        draw_if_due(
+            &mut core,
+            &mut live_theme,
+            resolve_theme,
+            terminal,
+            &mut last_draw,
+        )?;
     }
 
     event_reader_running.store(false, Ordering::Relaxed);
@@ -321,7 +365,8 @@ pub async fn run(
 
 fn draw_if_due(
     core: &mut Core,
-    theme: &Theme,
+    live_theme: &mut LiveTheme,
+    resolve_theme: ThemeResolver,
     terminal: &mut DefaultTerminal,
     last_draw: &mut Option<Instant>,
 ) -> io::Result<()> {
@@ -343,10 +388,24 @@ fn draw_if_due(
             ..
         } = core;
         let state = app.state();
+
+        // A theme switch (currently only `state::palette`'s `ToggleTheme`)
+        // bumps `theme_generation`; notice it here and re-resolve rather
+        // than at the point of the bump, since only this call site knows
+        // which `Theme` is currently on screen. `LayoutKey` already keys on
+        // `theme_generation`, so the stale entries left behind by the old
+        // generation would only ever miss forward and never render wrong —
+        // clearing here just stops them from accumulating as dead weight.
+        if state.theme_generation != live_theme.generation {
+            live_theme.theme = resolve_theme(&state.theme_name);
+            live_theme.generation = state.theme_generation;
+            cache.clear();
+        }
+
         // Every frame replaces the hit map wholesale: it describes the frame
         // now on screen, and a click can only ever mean something against
         // the frame the user was looking at.
-        terminal.draw(|f| *last_hits = tgt_ui::view(state, theme, f, cache))?;
+        terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, cache))?;
         *last_draw = Some(Instant::now());
     }
     Ok(())

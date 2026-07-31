@@ -27,33 +27,15 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The built-in dark theme: a desaturated slate surface with a blue accent.
+    /// The built-in dark theme: a desaturated slate surface with a blue
+    /// accent. Delegates to the `default-dark` entry of the built-in
+    /// catalogue (docs/architecture.md §4.9), so this and
+    /// `loader::builtin("default-dark")` are always the same theme — this
+    /// is just the zero-argument spelling every pre-catalogue call site
+    /// already uses.
     pub fn default_dark() -> Theme {
-        Theme {
-            accent: Color::Rgb(97, 175, 239),
-            accent_dim: Color::Rgb(58, 105, 143),
-            text: Color::Rgb(220, 223, 228),
-            text_muted: Color::Rgb(140, 146, 156),
-            surface: Color::Rgb(24, 26, 32),
-            surface_raised: Color::Rgb(34, 37, 45),
-            success: Color::Rgb(152, 195, 121),
-            warning: Color::Rgb(229, 192, 123),
-            danger: Color::Rgb(224, 108, 117),
-            selection: Color::Rgb(49, 59, 79),
-            rail_own: Color::Rgb(58, 105, 143),
-            rail_other: Color::Rgb(97, 175, 239),
-            border: Color::Rgb(52, 57, 68),
-            sender_palette: [
-                Color::Rgb(224, 108, 117), // red
-                Color::Rgb(209, 154, 102), // orange
-                Color::Rgb(229, 192, 123), // yellow
-                Color::Rgb(152, 195, 121), // green
-                Color::Rgb(86, 182, 194),  // cyan
-                Color::Rgb(97, 175, 239),  // blue
-                Color::Rgb(198, 120, 221), // purple
-                Color::Rgb(224, 130, 170), // pink
-            ],
-        }
+        loader::builtin("default-dark")
+            .expect("\"default-dark\" is always in the built-in catalogue")
     }
 
     /// Same sender → same color across sessions: seed % palette length.
@@ -79,6 +61,46 @@ impl Theme {
             border: degrade(self.border),
             sender_palette: self.sender_palette.map(degrade),
         }
+    }
+}
+
+/// The literal color values behind the `default-dark` built-in and, via
+/// [`loader::parse`], the fallback for any token a *user* theme file leaves
+/// unset. Kept separate from [`Theme::default_dark`] (which now goes
+/// through the catalogue/TOML path) so that path has a non-circular base to
+/// start from: `builtin("default-dark")` parses `themes/default-dark.toml`,
+/// and that parse fills any token the TOML didn't set from this function —
+/// routing that fill through `Theme::default_dark()` instead would call
+/// straight back into `builtin("default-dark")` and never terminate.
+/// `themes/default-dark.toml` sets every token explicitly, so in practice
+/// this function's values and `Theme::default_dark()`'s are identical; this
+/// is the one place that identity is asserted structurally rather than by
+/// eyeballing two files.
+pub(crate) fn base_defaults() -> Theme {
+    Theme {
+        accent: Color::Rgb(97, 175, 239),
+        accent_dim: Color::Rgb(58, 105, 143),
+        text: Color::Rgb(220, 223, 228),
+        text_muted: Color::Rgb(140, 146, 156),
+        surface: Color::Rgb(24, 26, 32),
+        surface_raised: Color::Rgb(34, 37, 45),
+        success: Color::Rgb(152, 195, 121),
+        warning: Color::Rgb(229, 192, 123),
+        danger: Color::Rgb(224, 108, 117),
+        selection: Color::Rgb(49, 59, 79),
+        rail_own: Color::Rgb(58, 105, 143),
+        rail_other: Color::Rgb(97, 175, 239),
+        border: Color::Rgb(52, 57, 68),
+        sender_palette: [
+            Color::Rgb(224, 108, 117), // red
+            Color::Rgb(209, 154, 102), // orange
+            Color::Rgb(229, 192, 123), // yellow
+            Color::Rgb(152, 195, 121), // green
+            Color::Rgb(86, 182, 194),  // cyan
+            Color::Rgb(97, 175, 239),  // blue
+            Color::Rgb(198, 120, 221), // purple
+            Color::Rgb(224, 130, 170), // pink
+        ],
     }
 }
 

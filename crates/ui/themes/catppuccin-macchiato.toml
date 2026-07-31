@@ -1,0 +1,31 @@
+# catppuccin-macchiato — https://github.com/catppuccin/catppuccin (Macchiato).
+#
+# Official Macchiato palette hex values. Same mapping convention as
+# catppuccin-mocha.toml: base -> surface, surface0 -> surface_raised,
+# text -> text, overlay1 -> text_muted, blue -> accent, sapphire ->
+# accent_dim, surface1 -> selection, surface2 -> border.
+
+accent = "#8aadf4"         # Blue
+accent_dim = "#7dc4e4"     # Sapphire
+text = "#cad3f5"           # Text
+text_muted = "#8087a2"     # Overlay1
+surface = "#24273a"        # Base
+surface_raised = "#363a4f" # Surface0
+success = "#a6da95"        # Green
+warning = "#eed49f"        # Yellow
+danger = "#ed8796"         # Red
+selection = "#494d64"      # Surface1
+rail_own = "#7dc4e4"       # Sapphire (= accent_dim)
+rail_other = "#8aadf4"     # Blue (= accent)
+border = "#5b6078"         # Surface2
+
+sender_palette = [
+    "#ed8796", # Red
+    "#f5a97f", # Peach
+    "#eed49f", # Yellow
+    "#a6da95", # Green
+    "#8bd5ca", # Teal
+    "#8aadf4", # Blue
+    "#c6a0f6", # Mauve
+    "#f5bde6", # Pink
+]

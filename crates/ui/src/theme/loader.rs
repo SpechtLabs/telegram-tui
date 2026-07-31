@@ -2,9 +2,12 @@
 //!
 //! Path resolution (`<config_dir>/themes/<name>.toml`) and the
 //! builtin-then-file-then-default fallback chain are the caller's job —
-//! see `crates/app/src/main.rs::resolve_theme`, the sole call site this
-//! task wires. This module only turns bytes into a `Theme` or a reason it
-//! couldn't.
+//! see `crates/app/src/main.rs::resolve_theme`, the one place that chain is
+//! written. `runtime_loop::Core` re-runs it on a live theme switch
+//! (`AppState::theme_generation` bump, T60) rather than duplicating the
+//! chain, so `resolve_theme` stays the single resolution path either way.
+//! This module only turns bytes into a `Theme` or a reason it couldn't, plus
+//! the built-in catalogue itself (`builtin`, `builtin_names`).
 //!
 //! # Parsing rules
 //!
@@ -35,6 +38,7 @@
 //!   or `"sender_palette[i]"` for a bad element).
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use ratatui::style::Color;
 
@@ -70,8 +74,13 @@ impl From<std::io::Error> for ThemeLoadError {
     }
 }
 
-/// The 12 semantic token keys, in `Theme` field order. `sender_palette` is
+/// The 13 semantic token keys, in `Theme` field order. `sender_palette` is
 /// handled separately since it's an array, not a scalar color.
+///
+/// `border` (docs/architecture.md §4.9's render-state-contract amendment)
+/// was added to the `Theme` struct without this list or `set_token` picking
+/// it up — a real gap this task closes: a theme file setting `border`
+/// silently had no effect until now.
 const TOKEN_KEYS: &[&str] = &[
     "accent",
     "accent_dim",
@@ -85,6 +94,7 @@ const TOKEN_KEYS: &[&str] = &[
     "selection",
     "rail_own",
     "rail_other",
+    "border",
 ];
 
 /// Parses a user theme TOML file at `path`. Same token names as `Theme`'s
@@ -95,12 +105,78 @@ pub fn load_theme(path: &Path) -> Result<Theme, ThemeLoadError> {
     parse(&text)
 }
 
+/// The built-in catalogue (docs/design-language.md §7), in display/cycle
+/// order. Each entry's TOML is compiled into the binary with `include_str!`
+/// from `crates/ui/themes/` and parsed through the same [`parse`] path as a
+/// user theme file, so a hand-authored theme can override a built-in by
+/// reusing its name (see `load_theme`'s doc comment and `builtin`'s).
+///
+/// `default-dark` is a verbatim port of the historical
+/// `Theme::default_dark()` literals, so nothing regresses for anyone who
+/// never picks a theme at all.
+const BUILTIN_CATALOGUE: &[(&str, &str)] = &[
+    (
+        "default-dark",
+        include_str!("../../themes/default-dark.toml"),
+    ),
+    (
+        "catppuccin-frappe",
+        include_str!("../../themes/catppuccin-frappe.toml"),
+    ),
+    (
+        "catppuccin-macchiato",
+        include_str!("../../themes/catppuccin-macchiato.toml"),
+    ),
+    (
+        "catppuccin-mocha",
+        include_str!("../../themes/catppuccin-mocha.toml"),
+    ),
+    (
+        "catppuccin-latte",
+        include_str!("../../themes/catppuccin-latte.toml"),
+    ),
+    ("tokyo-night", include_str!("../../themes/tokyo-night.toml")),
+    (
+        "gruvbox-dark",
+        include_str!("../../themes/gruvbox-dark.toml"),
+    ),
+    ("nord", include_str!("../../themes/nord.toml")),
+];
+
 /// A built-in theme by name, or `None` if `name` isn't one telegram-tui
 /// ships — the caller falls through to `load_theme` on `None`.
+///
+/// Names are matched case-insensitively and accept `_` as well as `-` as
+/// the word separator (`catppuccin_frappe` resolves the same entry as
+/// `catppuccin-frappe`), since config files and the palette both pass names
+/// through free-form. `default` and `default_dark` remain accepted aliases
+/// for `default-dark`, matching this function's pre-catalogue behavior.
 pub fn builtin(name: &str) -> Option<Theme> {
-    match name {
-        "default" | "default_dark" => Some(Theme::default_dark()),
-        _ => None,
+    let key = normalize_builtin_name(name);
+    let (_, toml) = BUILTIN_CATALOGUE.iter().find(|(n, _)| *n == key)?;
+    Some(parse(toml).unwrap_or_else(|err| panic!("builtin theme {key:?} failed to parse: {err}")))
+}
+
+/// Catalogue names in the same order as `BUILTIN_CATALOGUE`, for a palette
+/// cycle or a `--list-themes`-style listing. Canonical (hyphenated) form
+/// only — `builtin` accepts underscore variants on lookup, but the
+/// catalogue itself has one spelling per theme.
+pub fn builtin_names() -> &'static [&'static str] {
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| BUILTIN_CATALOGUE.iter().map(|&(name, _)| name).collect())
+        .as_slice()
+}
+
+/// Case-folds and dash/underscore-normalizes a theme name for catalogue
+/// lookup, and folds the two legacy `default*` spellings onto the
+/// catalogue's `default-dark` entry.
+fn normalize_builtin_name(name: &str) -> String {
+    let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+    if normalized == "default" {
+        "default-dark".to_string()
+    } else {
+        normalized
     }
 }
 
@@ -115,7 +191,11 @@ pub fn for_terminal(theme: Theme, truecolor: bool) -> Theme {
 fn parse(text: &str) -> Result<Theme, ThemeLoadError> {
     let root: toml::Table =
         toml::from_str(text).map_err(|err| ThemeLoadError::Parse(err.to_string()))?;
-    let mut theme = Theme::default_dark();
+    // `crate::theme::base_defaults()`, not `Theme::default_dark()`: the
+    // latter now parses `themes/default-dark.toml` through this very
+    // function, and starting the fill-in base there would recurse forever.
+    // See `base_defaults`'s doc comment.
+    let mut theme = crate::theme::base_defaults();
 
     for (key, value) in &root {
         match key.as_str() {
@@ -144,6 +224,7 @@ fn set_token(theme: &mut Theme, key: &str, color: Color) {
         "selection" => theme.selection = color,
         "rail_own" => theme.rail_own = color,
         "rail_other" => theme.rail_other = color,
+        "border" => theme.border = color,
         _ => unreachable!("set_token called with non-token key {key:?}"),
     }
 }
@@ -251,6 +332,7 @@ mod tests {
         selection = "magenta"
         rail_own = "#3a698f"
         rail_other = "bright_cyan"
+        border = "#343944"
 
         sender_palette = [
             "#e06c75",
@@ -265,7 +347,7 @@ mod tests {
     "##;
 
     #[test]
-    fn parses_all_twelve_tokens_plus_palette() {
+    fn parses_all_thirteen_tokens_plus_palette() {
         let theme = parse(FULL_THEME_TOML).expect("fixture must parse");
 
         assert_eq!(theme.accent, Color::Rgb(0x61, 0xaf, 0xef));
@@ -280,6 +362,10 @@ mod tests {
         assert_eq!(theme.selection, Color::Magenta);
         assert_eq!(theme.rail_own, Color::Rgb(0x3a, 0x69, 0x8f));
         assert_eq!(theme.rail_other, Color::LightCyan);
+        // Regression coverage for the gap this task closed: `border` was on
+        // `Theme` but missing from `TOKEN_KEYS`/`set_token`, so a theme file
+        // setting it was silently ignored.
+        assert_eq!(theme.border, Color::Rgb(0x34, 0x39, 0x44));
 
         assert_eq!(
             theme.sender_palette,
@@ -306,6 +392,7 @@ mod tests {
         assert_eq!(theme.accent, Color::Rgb(0xff, 0x00, 0xff));
         assert_eq!(theme.text, default.text);
         assert_eq!(theme.surface, default.surface);
+        assert_eq!(theme.border, default.border);
         assert_eq!(theme.sender_palette, default.sender_palette);
     }
 
@@ -366,6 +453,78 @@ mod tests {
         assert!(builtin("nonexistent-theme").is_none());
     }
 
+    /// T60: the catalogue grew from one entry (`default-dark`) to eight
+    /// (docs/design-language.md §7). Every name `builtin_names()` reports
+    /// must resolve, and — since every builtin TOML is meant to set the
+    /// full token set rather than lean on `base_defaults()` fill-in — no
+    /// token may equal `base_defaults()`'s placeholder value unless the
+    /// theme's own hand-picked color genuinely happens to match it (only
+    /// `default-dark` does, by construction: it's a verbatim port).
+    #[test]
+    fn builtin_catalogue_resolves_every_name_and_defines_every_token() {
+        let names = builtin_names();
+        assert_eq!(
+            names.len(),
+            8,
+            "docs/design-language.md §7 names 8 built-in themes"
+        );
+
+        let placeholder = crate::theme::base_defaults();
+
+        for &name in names {
+            let theme = builtin(name).unwrap_or_else(|| panic!("{name:?} must resolve"));
+
+            if name == "default-dark" {
+                // The one theme that's *supposed* to equal the placeholder
+                // values verbatim (it's the literal port of them).
+                assert_eq!(theme, placeholder);
+                continue;
+            }
+
+            assert_ne!(
+                theme.accent, placeholder.accent,
+                "{name}: accent left at the default-dark placeholder"
+            );
+            assert_ne!(
+                theme.surface, placeholder.surface,
+                "{name}: surface left at the default-dark placeholder"
+            );
+            assert_ne!(
+                theme.text, placeholder.text,
+                "{name}: text left at the default-dark placeholder"
+            );
+            assert_ne!(
+                theme.border, placeholder.border,
+                "{name}: border left at the default-dark placeholder"
+            );
+            assert_ne!(
+                theme.sender_palette, placeholder.sender_palette,
+                "{name}: sender_palette left at the default-dark placeholder"
+            );
+        }
+
+        // Both underscore and hyphen spellings resolve to the same theme.
+        assert_eq!(
+            builtin("catppuccin_frappe"),
+            builtin("catppuccin-frappe"),
+            "underscore and hyphen spellings must be the same catalogue entry"
+        );
+        // Case-insensitive too.
+        assert_eq!(builtin("NORD"), builtin("nord"));
+    }
+
+    /// A snapshot of one theme's full token set, so a future palette edit
+    /// to any built-in shows up as reviewable diff text rather than a
+    /// silent color change. Mocha is picked because it is the catalogue's
+    /// only entry that isn't `default-dark` (already covered by the
+    /// verbatim-port assertion above) and isn't the light theme, keeping
+    /// this snapshot representative of the "normal" dark-theme case.
+    #[test]
+    fn catppuccin_mocha_full_token_set_snapshot() {
+        let theme = builtin("catppuccin-mocha").expect("catppuccin-mocha is in the catalogue");
+        insta::assert_snapshot!(format!("{theme:#?}"));
+    }
+
     #[test]
     fn degraded_maps_rgb_to_nearest_256() {
         let theme = Theme::default_dark();
@@ -381,13 +540,15 @@ mod tests {
         assert_eq!(kept.accent, theme.accent);
     }
 
-    /// The plan names this test `theme_change_bumps_generation_and_clears_cache`,
-    /// but live theme toggling isn't wired yet (see architecture.md §4.9's
-    /// staging note and this task's main.rs wiring, which only picks a
-    /// theme once at startup) — there is no runtime "theme change" event to
-    /// bump anything. What *does* exist, and is exercised here instead: (1)
-    /// two themes loaded from different sources really do differ, so a
-    /// hypothetical generation bump would matter, and (2) `LayoutKey`'s
+    /// The plan names this test `theme_change_bumps_generation_and_clears_cache`.
+    /// T60 wires the actual runtime toggle (`state::palette::CommandId::ToggleTheme`
+    /// bumps `AppState::theme_generation`; `runtime_loop::Core` notices the
+    /// bump and re-resolves the `Theme`, see `crates/core/src/state/palette.rs`
+    /// and `crates/app/src/runtime_loop.rs`), so that end-to-end path is
+    /// covered by `palette.rs`'s own tests instead. What belongs here, at
+    /// the loader/cache layer, is narrower and still worth asserting on its
+    /// own: (1) two themes loaded from different sources really do differ,
+    /// so a generation bump would matter, and (2) `LayoutKey`'s
     /// `theme_generation` field already makes the cache treat different
     /// generations as different entries (the mechanism `theme_generation`
     /// exists to drive), independent of every other key field.

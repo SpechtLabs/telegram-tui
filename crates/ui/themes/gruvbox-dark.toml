@@ -1,0 +1,33 @@
+# gruvbox-dark — https://github.com/morhetz/gruvbox (dark, medium contrast).
+#
+# Official hex values from the palette. Mapping: bg0 -> surface, bg1 ->
+# surface_raised, fg1 -> text, gray -> text_muted, bright blue -> accent,
+# (neutral) blue -> accent_dim, bg2 -> selection, bg3 -> border (darker than
+# gray/text_muted). Gruvbox has no dedicated pink, so the eighth sender hue
+# reuses the non-bright purple, still an official palette value distinct
+# from the bright purple used elsewhere.
+
+accent = "#83a598"         # bright blue
+accent_dim = "#458588"     # blue
+text = "#ebdbb2"           # fg1
+text_muted = "#928374"     # gray
+surface = "#282828"        # bg0
+surface_raised = "#3c3836" # bg1
+success = "#b8bb26"        # bright green
+warning = "#fabd2f"        # bright yellow
+danger = "#fb4934"         # bright red
+selection = "#504945"      # bg2
+rail_own = "#458588"       # blue (= accent_dim)
+rail_other = "#83a598"     # bright blue (= accent)
+border = "#665c54"         # bg3
+
+sender_palette = [
+    "#fb4934", # bright red
+    "#fe8019", # bright orange
+    "#fabd2f", # bright yellow
+    "#b8bb26", # bright green
+    "#8ec07c", # bright aqua
+    "#83a598", # bright blue
+    "#d3869b", # bright purple
+    "#b16286", # purple (stand-in for pink; gruvbox has no pink)
+]
