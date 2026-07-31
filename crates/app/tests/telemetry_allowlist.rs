@@ -759,11 +759,19 @@ async fn exported_attribute_keys_are_subset_of_allowlist() {
         keys::INSTALL_ID,
         keys::SESSION_ID,
         keys::APP_VERSION,
-        keys::OS_VERSION,
         keys::TERM_PROGRAM,
         keys::TERM_GRAPHICS_PROTOCOL,
         keys::TERM_WIDTH_BUCKET,
-    ] {
+    ]
+    .iter()
+    .copied()
+    // `os.version` is macOS-only by design: `otel::os_version` reads
+    // `sw_vers` there and returns `None` elsewhere, because an allowlisted
+    // key whose value has no fixed shape across distributions defeats the
+    // point of the allowlist (see its doc comment). Requiring it on every
+    // platform would fail Linux and Windows for doing the right thing.
+    .chain(cfg!(target_os = "macos").then_some(keys::OS_VERSION))
+    {
         assert!(
             arrived.contains(key),
             "{key:?} never arrived — an exporter that silently stopped \
@@ -1090,8 +1098,12 @@ async fn http_json_transport_is_also_a_subset() {
         keys::HISTORY_PAGE_DEPTH,
         keys::DOWNLOAD_SIZE_BUCKET,
         keys::INSTALL_ID,
-        keys::OS_VERSION,
-    ] {
+    ]
+    .iter()
+    .copied()
+    // macOS-only, same reason as above.
+    .chain(cfg!(target_os = "macos").then_some(keys::OS_VERSION))
+    {
         assert!(
             arrived.contains(key),
             "{key:?} never arrived over OTLP/JSON: {arrived:?}"

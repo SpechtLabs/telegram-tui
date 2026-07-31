@@ -140,6 +140,12 @@ pub(crate) mod tests {
     /// user's actual profile instead of failing loudly.
     macro_rules! env_dir_override {
         ($set:ident, $unset:ident, unix: $unix_var:literal, windows: $win_var:literal) => {
+            // Not every platform uses every directory: the data-dir pair is
+            // only reached from `keychain`'s unix-only mode test, so on
+            // Windows it is dead and `-D warnings` would reject it. Which
+            // helpers are live is a property of each platform's test set, not
+            // a mistake worth failing the build over.
+            #[allow(dead_code)]
             /// # Safety
             /// Caller must be holding [`env_lock`].
             #[cfg(unix)]
@@ -153,6 +159,7 @@ pub(crate) mod tests {
                 unsafe { std::env::set_var($win_var, path) };
             }
 
+            #[allow(dead_code)]
             /// # Safety
             /// Caller must be holding [`env_lock`].
             #[cfg(unix)]
