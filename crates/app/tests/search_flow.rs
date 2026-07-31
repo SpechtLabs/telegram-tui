@@ -275,6 +275,7 @@ fn boot() -> Boot {
         has_credentials: true,
         width: 120,
         height: 40,
+        auto_download_photos: true,
     }
 }
 

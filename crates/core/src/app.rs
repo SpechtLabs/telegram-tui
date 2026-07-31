@@ -82,6 +82,9 @@ pub struct Boot {
     pub has_credentials: bool,
     pub width: u16,
     pub height: u16,
+    /// `[app] auto_download_photos` (config.rs), default on — see
+    /// `state::media`'s "Auto-download" module docs.
+    pub auto_download_photos: bool,
 }
 
 #[derive(Debug)]
@@ -133,7 +136,7 @@ impl App {
             palette: None,
             chat_search: None,
             toasts: ToastState::default(),
-            media: MediaState::default(),
+            media: MediaState::new(boot.auto_download_photos),
             presence: PresenceState::default(),
             width: boot.width,
             height: boot.height,
@@ -885,17 +888,30 @@ impl App {
         effects
     }
 
-    /// Wheel over the conversation viewport: the same anchor step and
-    /// near-top paging trigger as `Up`/`Down` in `conversation::handle_key`,
-    /// claimed independently of focus for the same reason
-    /// [`Self::scroll_chat_list`] is. `conversation::move_anchor` itself is
-    /// private to that module, so this mirrors its stepping logic using the
-    /// `pub(crate)` primitives (`index_of`, `trigger_paging_if_near_top`)
-    /// already exposed there for exactly this kind of reuse, plus the
-    /// `ConversationState` fields it operates on (all `pub`), rather than
-    /// widening `conversation.rs`'s public surface for one more entry point
-    /// that says the same thing `handle_key`'s claim rule already does.
+    /// Wheel over the conversation viewport: extends
+    /// [`Self::scroll_conversation_move`]'s anchor step with T66's
+    /// auto-download trigger — every anchor move, wheel included, changes
+    /// what's near it.
     fn scroll_conversation(&mut self, up: bool) -> Vec<Effect> {
+        let chat_id = self.state.open_chat;
+        let mut effects = self.scroll_conversation_move(up);
+        if let Some(chat_id) = chat_id {
+            effects.extend(media::auto_download_photos(&mut self.state, chat_id));
+        }
+        effects
+    }
+
+    /// The same anchor step and near-top paging trigger as `Up`/`Down` in
+    /// `conversation::handle_key`, claimed independently of focus for the
+    /// same reason [`Self::scroll_chat_list`] is. `conversation::move_anchor`
+    /// itself is private to that module, so this mirrors its stepping logic
+    /// using the `pub(crate)` primitives (`index_of`,
+    /// `trigger_paging_if_near_top`) already exposed there for exactly this
+    /// kind of reuse, plus the `ConversationState` fields it operates on
+    /// (all `pub`), rather than widening `conversation.rs`'s public surface
+    /// for one more entry point that says the same thing `handle_key`'s
+    /// claim rule already does.
+    fn scroll_conversation_move(&mut self, up: bool) -> Vec<Effect> {
         let Some(chat_id) = self.state.open_chat else {
             return Vec::new();
         };
@@ -1230,6 +1246,7 @@ mod tests {
             has_credentials: false,
             width: 120,
             height: 40,
+            auto_download_photos: true,
         }
     }
 

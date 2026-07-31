@@ -51,24 +51,108 @@
 //! (`state/media.rs` + `app.rs` only). [`cancel_effect`] gives T40 the
 //! `CancelDownloadFile` request to fire once a cancel affordance exists;
 //! wiring it to a key/chip is deferred.
+//!
+//! ## Auto-download (T66, design-language §6)
+//!
+//! [`auto_download_photos`] is the "auto-download all images and display
+//! them inline when available" setting: photos only (never video/audio/
+//! documents — a multi-hundred-MB video fetched because it scrolled past is
+//! user-hostile), gated on [`MediaState::auto_download_photos`], scoped to
+//! messages within `history::PAGE_TRIGGER_MESSAGES` of the scroll anchor —
+//! the same proximity proxy `priority_for` already uses. It is called from
+//! every place the visible window can change: `conversation::apply_history_page`,
+//! a `NewMessage` arrival, `conversation::handle_key`'s scroll-anchor moves,
+//! `App::scroll_conversation`'s mouse wheel, and `selection::select` landing
+//! the anchor on a message.
+//!
+//! Every one of those triggers fires repeatedly for the same visible set, so
+//! storm control is the point: [`MediaState::auto_download_requested`]
+//! remembers every file id this function has ever emitted a `DownloadFile`
+//! for, checked *before* consulting the file table — a request already
+//! queued has no `FileSnapshot` yet to prove it, so the file table alone
+//! cannot prevent a duplicate. A genuine failure
+//! ([`handle_td_result`]'s `Err` arm) earns the file one more attempt (via
+//! [`record_auto_download_failure`] clearing the id back out of
+//! `auto_download_requested`) up to [`MAX_AUTO_DOWNLOAD_ATTEMPTS`]; past
+//! that the id is left out of `auto_download_requested` for good and
+//! [`should_auto_request`]'s failure-count check blocks it permanently,
+//! rather than hammering a permanently broken file forever.
+//! [`MAX_AUTO_DOWNLOAD_REQUESTS_PER_TRIGGER`] additionally caps how many
+//! `DownloadFile` effects one call can emit, so a chat opening onto a long
+//! run of undownloaded photos near the anchor cannot turn a single
+//! `update()` call into a storm regardless of how large the loaded window
+//! (up to `conversation::WINDOW_MAX_MESSAGES`) is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::AppState;
 use crate::effect::Effect;
 use crate::model::chips::chips_for;
 use crate::model::ids::{ChatId, FileId, MessageId};
 use crate::model::message::{FileSnapshot, MessageContent, SendState};
-use crate::state::conversation;
+use crate::state::conversation::{self, Scroll};
+use crate::state::history;
 use crate::td::error::TdError;
 use crate::td::request::TdRequest;
 use crate::td::update::TdUpdate;
 
-#[derive(Debug, Default)]
+/// Auto-download only requests photos within this many messages of the
+/// scroll anchor — the same window `history::PAGE_TRIGGER_MESSAGES` uses
+/// elsewhere for "close enough to the anchor to matter" (module docs).
+const AUTO_DOWNLOAD_WINDOW_MESSAGES: usize = history::PAGE_TRIGGER_MESSAGES;
+
+/// Hard ceiling on `DownloadFile` effects one [`auto_download_photos`] call
+/// may emit (module docs' storm-control section).
+const MAX_AUTO_DOWNLOAD_REQUESTS_PER_TRIGGER: usize = 8;
+
+/// How many auto-download attempts a single file id gets (the first request
+/// plus retries after a genuine failure) before [`should_auto_request`]
+/// blocks it for good.
+const MAX_AUTO_DOWNLOAD_ATTEMPTS: u8 = 2;
+
+#[derive(Debug)]
 pub struct MediaState {
     pub files: HashMap<FileId, FileSnapshot>,
     /// Outgoing uploads keyed by the optimistic message id.
     pub uploads: HashMap<MessageId, UploadProgress>,
+    /// Whether [`auto_download_photos`] requests anything at all (config
+    /// `[app] auto_download_photos`, default on). `false` restores the
+    /// pre-T66 behavior: nothing downloads until the user presses `⏎` on a
+    /// message's `Download` chip.
+    pub auto_download_photos: bool,
+    /// Storm control: file ids [`auto_download_photos`] has already
+    /// requested this session, so a trigger firing again for the same
+    /// visible set never re-issues the same `DownloadFile` — including
+    /// before any `updateFile`/`DownloadStarted` answer has landed to prove
+    /// the first request is in flight (module docs).
+    auto_download_requested: HashSet<FileId>,
+    /// Per-file auto-download failure count (module docs).
+    auto_download_failures: HashMap<FileId, u8>,
+}
+
+impl Default for MediaState {
+    fn default() -> Self {
+        MediaState {
+            files: HashMap::new(),
+            uploads: HashMap::new(),
+            auto_download_photos: true,
+            auto_download_requested: HashSet::new(),
+            auto_download_failures: HashMap::new(),
+        }
+    }
+}
+
+impl MediaState {
+    /// `App::new`'s constructor: everything at its default except the
+    /// boot-configured auto-download setting. A free function rather than
+    /// exposing the storm-control fields as `pub` — `App::new` has no
+    /// business setting those, only the config-derived flag.
+    pub fn new(auto_download_photos: bool) -> Self {
+        MediaState {
+            auto_download_photos,
+            ..MediaState::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,6 +206,7 @@ pub fn handle_td_result(
             if let Some(existing) = app.media.files.get_mut(&file_id) {
                 existing.is_downloading = false;
             }
+            record_auto_download_failure(app, file_id);
         }
     }
     Vec::new()
@@ -131,6 +216,105 @@ pub fn handle_td_result(
 /// affordance exists (module docs: `Chip` has no `Cancel` variant yet).
 pub fn cancel_effect(file_id: FileId) -> Effect {
     Effect::Td(TdRequest::CancelDownloadFile { file_id })
+}
+
+/// Auto-downloads photos near `chat_id`'s scroll anchor. See the module
+/// docs' "Auto-download" section for the trigger points, scope and storm
+/// control. A no-op when the setting is off, the chat isn't tracked, or the
+/// anchor doesn't name a message currently in the window (an empty
+/// `Scroll::Bottom`, or a search jump whose page hasn't arrived yet — the
+/// same "nothing loaded is near it yet" case `trigger_paging_if_near_top`
+/// carves out).
+pub fn auto_download_photos(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
+    if !app.media.auto_download_photos {
+        return Vec::new();
+    }
+    let Some(convo) = app.conversations.get(&chat_id) else {
+        return Vec::new();
+    };
+    let anchor_idx = match convo.scroll {
+        Scroll::Bottom => convo.messages.len().checked_sub(1),
+        Scroll::At { message_id, .. } => conversation::index_of(&convo.messages, message_id),
+    };
+    let Some(anchor_idx) = anchor_idx else {
+        return Vec::new();
+    };
+
+    // Collected up front so the borrow of `convo` ends before `app.media`
+    // needs mutating below.
+    let candidates: Vec<(FileId, usize)> = convo
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            // Outgoing photos are never a download target: the sender
+            // already has the file on disk (it's what got uploaded), so
+            // there is nothing for `DownloadFile` to fetch — the optimistic
+            // append of a message the user just sent (this same trigger's
+            // `NewMessage` call site) would otherwise ask for it right back.
+            if msg.is_outgoing {
+                return None;
+            }
+            let distance = idx.abs_diff(anchor_idx);
+            if distance > AUTO_DOWNLOAD_WINDOW_MESSAGES {
+                return None;
+            }
+            match &msg.content {
+                MessageContent::Photo { file_id, .. } => Some((*file_id, distance)),
+                _ => None,
+            }
+        })
+        .collect();
+
+    let mut effects = Vec::new();
+    for (file_id, distance) in candidates {
+        if effects.len() >= MAX_AUTO_DOWNLOAD_REQUESTS_PER_TRIGGER {
+            break;
+        }
+        if !should_auto_request(app, file_id) {
+            continue;
+        }
+        app.media.auto_download_requested.insert(file_id);
+        effects.push(Effect::Td(TdRequest::DownloadFile {
+            file_id,
+            priority: priority_for(distance),
+        }));
+    }
+    effects
+}
+
+/// Whether [`auto_download_photos`] should still ask for `file_id`: not
+/// already requested this session, not permanently blocked by repeated
+/// failure, and not already downloading or complete per the file table.
+fn should_auto_request(app: &AppState, file_id: FileId) -> bool {
+    if app.media.auto_download_requested.contains(&file_id) {
+        return false;
+    }
+    if app
+        .media
+        .auto_download_failures
+        .get(&file_id)
+        .is_some_and(|attempts| *attempts >= MAX_AUTO_DOWNLOAD_ATTEMPTS)
+    {
+        return false;
+    }
+    match app.media.files.get(&file_id) {
+        Some(snapshot) => !(snapshot.is_completed || snapshot.is_downloading),
+        None => true,
+    }
+}
+
+/// Bookkeeping for `auto_download_photos`'s storm control (module docs): a
+/// failure earns the file one more auto-download attempt, by clearing it
+/// out of `auto_download_requested`, unless it has already used up its
+/// attempt budget — at which point it is left out of that set for good and
+/// `should_auto_request`'s failure-count check takes over blocking it.
+fn record_auto_download_failure(app: &mut AppState, file_id: FileId) {
+    let attempts = app.media.auto_download_failures.entry(file_id).or_insert(0);
+    *attempts += 1;
+    if *attempts < MAX_AUTO_DOWNLOAD_ATTEMPTS {
+        app.media.auto_download_requested.remove(&file_id);
+    }
 }
 
 /// Starts tracking an outgoing upload under the optimistic message id
@@ -348,6 +532,203 @@ mod tests {
         app.focus.push(Focus::Selection);
         selection::enter(&mut app);
         app
+    }
+
+    // --- auto_download_photos (T66) ----------------------------------
+
+    fn text_message(id: i64) -> MessageView {
+        MessageView {
+            id: MessageId(id),
+            chat_id: CHAT,
+            sender: Sender::User(UserId(1)),
+            sender_name: "Ada".to_string(),
+            is_outgoing: false,
+            date: 1_700_000_000 + id,
+            content: MessageContent::Text(FormattedText {
+                text: format!("msg {id}"),
+                entities: Vec::new(),
+            }),
+            reply_to: None,
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            caps: MessageCaps::default(),
+            is_edited: false,
+        }
+    }
+
+    fn video_message(id: i64, file_id: FileId) -> MessageView {
+        let mut m = text_message(id);
+        m.content = MessageContent::Video {
+            file_id,
+            file_name: "clip.mp4".to_string(),
+            size: 100_000_000,
+            duration_secs: 30,
+            caption: FormattedText {
+                text: String::new(),
+                entities: Vec::new(),
+            },
+        };
+        m
+    }
+
+    fn document_message(id: i64, file_id: FileId) -> MessageView {
+        let mut m = text_message(id);
+        m.content = MessageContent::Document {
+            file_id,
+            file_name: "report.pdf".to_string(),
+            size: 500_000,
+            caption: FormattedText {
+                text: String::new(),
+                entities: Vec::new(),
+            },
+        };
+        m
+    }
+
+    /// A tracked, opened chat holding `messages` (pushed in order — callers
+    /// keep them in ascending id order like every other window invariant in
+    /// this codebase), anchored at `anchor_id`, paging exhausted so no
+    /// `GetChatHistory` effect is mixed into what these tests assert on.
+    fn app_with_messages(messages: Vec<MessageView>, anchor_id: i64) -> AppState {
+        let mut app = fixture_state();
+        convo_mod::open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for m in messages {
+            convo.messages.push_back(m);
+        }
+        convo.paging = crate::state::history::PagingState::Exhausted;
+        convo.scroll = Scroll::At {
+            message_id: MessageId(anchor_id),
+            line_offset: 0,
+        };
+        app
+    }
+
+    /// Pulls `(file_id, priority)` out of every `DownloadFile` effect,
+    /// dropping anything else so assertions read as plainly as possible.
+    fn download_requests(effects: &[Effect]) -> Vec<(FileId, i8)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Td(TdRequest::DownloadFile { file_id, priority }) => {
+                    Some((*file_id, *priority))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn auto_download_requests_photos_near_the_anchor_only() {
+        const NEAR_AT_ANCHOR: FileId = FileId(101);
+        const NEAR_WITHIN_WINDOW: FileId = FileId(102); // 15 messages away
+        const FAR_OUTSIDE_WINDOW: FileId = FileId(103); // 25 messages away
+
+        let messages: Vec<MessageView> = (1..=50)
+            .map(|id| match id {
+                25 => photo_message(id, NEAR_AT_ANCHOR),
+                40 => photo_message(id, NEAR_WITHIN_WINDOW),
+                50 => photo_message(id, FAR_OUTSIDE_WINDOW),
+                _ => text_message(id),
+            })
+            .collect();
+        let mut app = app_with_messages(messages, 25);
+
+        let effects = auto_download_photos(&mut app, CHAT);
+
+        assert_eq!(
+            download_requests(&effects),
+            vec![(NEAR_AT_ANCHOR, 32), (NEAR_WITHIN_WINDOW, 16)],
+            "the photo 25 messages from the anchor must not be requested"
+        );
+    }
+
+    #[test]
+    fn never_requests_the_same_file_twice() {
+        let mut app = app_with_messages(vec![photo_message(1, FILE)], 1);
+
+        let first = auto_download_photos(&mut app, CHAT);
+        assert_eq!(download_requests(&first), vec![(FILE, 32)]);
+
+        // Every trigger this feature hangs off (history page, new message,
+        // scroll) can fire repeatedly before TDLib ever answers the first
+        // request, so the file table alone (still empty here) cannot be
+        // what prevents a second `DownloadFile` for the same id.
+        assert!(auto_download_photos(&mut app, CHAT).is_empty());
+        assert!(auto_download_photos(&mut app, CHAT).is_empty());
+    }
+
+    #[test]
+    fn failed_download_is_not_retried_forever() {
+        let mut app = app_with_messages(vec![photo_message(1, FILE)], 1);
+
+        let first = auto_download_photos(&mut app, CHAT);
+        assert_eq!(download_requests(&first), vec![(FILE, 32)]);
+
+        handle_td_result(&mut app, FILE, &Err(TdError::NetTimeout));
+        let retry = auto_download_photos(&mut app, CHAT);
+        assert_eq!(
+            download_requests(&retry),
+            vec![(FILE, 32)],
+            "a genuine failure earns one retry"
+        );
+
+        handle_td_result(&mut app, FILE, &Err(TdError::NetTimeout));
+        let after_second_failure = auto_download_photos(&mut app, CHAT);
+        assert!(
+            after_second_failure.is_empty(),
+            "a permanently broken file must not be retried forever"
+        );
+    }
+
+    #[test]
+    fn disabled_setting_emits_nothing() {
+        let mut app = app_with_messages(vec![photo_message(1, FILE)], 1);
+        app.media.auto_download_photos = false;
+
+        assert!(auto_download_photos(&mut app, CHAT).is_empty());
+    }
+
+    #[test]
+    fn videos_and_documents_are_never_auto_downloaded() {
+        let messages = vec![
+            video_message(1, FileId(201)),
+            document_message(2, FileId(202)),
+        ];
+        let mut app = app_with_messages(messages, 2);
+
+        assert!(auto_download_photos(&mut app, CHAT).is_empty());
+    }
+
+    /// An outgoing photo (the local user's own send) already has its file on
+    /// disk — nothing for `DownloadFile` to fetch. This is also what the
+    /// `NewMessage` trigger's optimistic-append call site would otherwise
+    /// hit the instant a photo send goes out (`conversation::handle_td`).
+    #[test]
+    fn outgoing_photos_are_never_auto_downloaded() {
+        let mut outgoing = photo_message(1, FILE);
+        outgoing.is_outgoing = true;
+        let mut app = app_with_messages(vec![outgoing], 1);
+
+        assert!(auto_download_photos(&mut app, CHAT).is_empty());
+    }
+
+    #[test]
+    fn request_count_is_bounded_per_trigger() {
+        // Every message near the anchor is an undownloaded photo with a
+        // unique file id: the worst case for the per-trigger cap.
+        let messages: Vec<MessageView> = (1..=25)
+            .map(|id| photo_message(id, FileId(300 + id as i32)))
+            .collect();
+        let mut app = app_with_messages(messages, 13);
+
+        let effects = auto_download_photos(&mut app, CHAT);
+
+        assert_eq!(
+            effects.len(),
+            MAX_AUTO_DOWNLOAD_REQUESTS_PER_TRIGGER,
+            "a long run of undownloaded photos must not turn one trigger into a storm"
+        );
     }
 
     #[test]
