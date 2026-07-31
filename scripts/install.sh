@@ -35,8 +35,17 @@
 # ## Tone
 #
 # This runs on a stranger's machine with no review. It is boring on purpose:
-# it says what it is about to do, refuses when unsure, and never removes a
-# path it derived rather than was given.
+# it says what it is about to do and refuses when unsure.
+#
+# The dangerous direction is the opposite of the obvious one. The risk is not
+# removing a path this script derived — it is removing the path it was *given*.
+# TGT_INSTALL_ROOT is arbitrary user input, and this script renames the
+# directory at that path and deletes the old copy on success. Pointed at $HOME
+# it would rename and then delete a home directory. So an existing root is
+# never touched without positive evidence that it is a tgt tree: the
+# .tgt-install marker package.sh writes, or a bin/tgt to fall back on for
+# installs that predate it. Absent both, refuse. An unnecessary refusal is a
+# message; a wrong rm -rf is somebody's files.
 
 set -eu
 
@@ -101,6 +110,45 @@ check_linux_runtime() {
     warn "        Fedora:         sudo dnf install libcxx libcxxabi"
     warn "      Installing anyway; fix this before running tgt."
     warn ""
+}
+
+# --- is this directory ours ------------------------------------------------
+
+# Reads a `key=value` out of a .tgt-install marker, empty if absent.
+marker_value() {
+    [ -f "$1/.tgt-install" ] || { printf ''; return 0; }
+    sed -n "s/^$2=//p" "$1/.tgt-install" 2>/dev/null | head -1
+}
+
+# Refuses unless $INSTALL_ROOT is demonstrably a tgt tree. Only called when the
+# directory already exists — creating a fresh one is always fine.
+#
+# Two levels of evidence, and the caller is told which one was used, because
+# "we checked a marker" and "we guessed from a filename" are different claims.
+assert_ours() {
+    root="$1"
+    expected_target="$2"
+
+    if [ -f "$root/.tgt-install" ]; then
+        found="$(marker_value "$root" target)"
+        if [ -n "$found" ] && [ "$found" != "$expected_target" ]; then
+            die "$root holds a $found install, but this machine needs $expected_target.
+Replacing it would leave a binary that cannot load its library.
+Remove it by hand if that is really what you want, or set TGT_INSTALL_ROOT elsewhere."
+        fi
+        say "  existing:  tgt $(marker_value "$root" version) ($found) — verified by marker"
+        return 0
+    fi
+
+    if [ -x "$root/bin/tgt" ]; then
+        say "  existing:  a tgt install with no marker — inferred from bin/tgt"
+        return 0
+    fi
+
+    die "$root already exists and does not look like a tgt install.
+Refusing to replace it: this script renames that directory and deletes the old
+copy once the new one works, so it will not touch anything it cannot identify.
+Remove it by hand, or set TGT_INSTALL_ROOT to a different path."
 }
 
 # --- integrity --------------------------------------------------------------
@@ -211,6 +259,12 @@ Refusing to install. Please report this."
     # Swap the tree in one rename, keeping the old one until the new binary
     # has proved it runs. Both live under the same parent, so the renames are
     # atomic and reversible.
+    # Before anything is renamed or removed. An install into a fresh path
+    # skips this; only an existing directory has to prove itself.
+    if [ -e "$INSTALL_ROOT" ]; then
+        assert_ours "$INSTALL_ROOT" "$target"
+    fi
+
     mkdir -p "$(dirname "$INSTALL_ROOT")" "$BIN_DIR"
     staged="$INSTALL_ROOT.new-$$"
     previous="$INSTALL_ROOT.old-$$"

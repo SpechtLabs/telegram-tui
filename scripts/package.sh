@@ -314,6 +314,22 @@ if [[ ! "$pkg_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "error: could not parse a version from Cargo.toml (got '$pkg_version')" >&2
     exit 1
 fi
+# A marker in the tarball root, so anything that later replaces this tree can
+# prove it is replacing a tgt install rather than inferring it from the shape
+# of the directory. It rides in the tarball, so it reaches every install route
+# at once: the curl installer, a manual extraction, and Homebrew.
+#
+# The target triple is here beside the version because a tree and a download
+# have to agree on it. Replacing an aarch64-apple-darwin tree with an
+# x86_64-unknown-linux-gnu one fails at dyld load, which is the unrecoverable
+# shape: the binary that would repair it can no longer start.
+cat >"$dist_dir/.tgt-install" <<EOF
+# Written by scripts/package.sh. Read by scripts/install.sh and \`tgt update\`
+# to confirm a directory is a tgt tree before replacing it.
+version=$pkg_version
+target=$target
+EOF
+
 tarball="dist/${bin_name}-${pkg_version}-${target}.tar.gz"
 
 echo "==> Creating tarball: $tarball"
