@@ -6,13 +6,13 @@ expression: "render(140, 40, &state)"
  CHATS                        │ telegram-tui                                                                                                
                               ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Main · Folder 1 · Folder 2   │                                                                                                             
+                              │                                                                                                             
    Archived  12               │                                                                                                             
  ▏ Alice Müller             2 │                                                                                                             
    Boss                       │                                                                                                             
  ──────────────────────────── │                                                                                                             
    Team Rust                9 │                                                                                                             
    Mom                        │                                                                                                             
-                              │                                                                                                             
                               │                                                                                                             
                               │                                                                                                             
                               │                                                                                                             

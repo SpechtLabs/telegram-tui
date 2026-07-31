@@ -1,5 +1,6 @@
 ---
 source: crates/ui/src/view/chat_list.rs
+assertion_line: 794
 expression: rendered
 ---
 CHATS                                                                                                                   
@@ -10,5 +11,3 @@ Main · Folder 1 · Folder 2
 ▏ Alice                                                                                                                2
   Boss                                                                                                                  
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Team Rust                                                                                                            9
-  Mom

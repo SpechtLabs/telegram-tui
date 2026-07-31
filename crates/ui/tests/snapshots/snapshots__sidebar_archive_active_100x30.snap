@@ -6,8 +6,8 @@ expression: "render(100, 30, &state)"
  ARCHIVE                      │ telegram-tui                                                        
                               ├─────────────────────────────────────────────────────────────────────
  esc/a  back                  │                                                                     
- ▏ Old Chat                12 │                                                                     
                               │                                                                     
+ ▏ Old Chat                12 │                                                                     
                               │                                                                     
                               │                                                                     
                               │                                                                     

@@ -57,6 +57,32 @@
 //!   can't land on it.
 //! - A dim horizontal rule between the pinned and unpinned groups, only
 //!   when both are non-empty within the current `visible_rows` result.
+//!
+//! ### Vertical rhythm (T75)
+//!
+//! With an archive hint, tabs, or a filter line on screen, the last header
+//! line used to sit directly above row 0 of the list. Nothing told the eye
+//! where the chrome ended and the rows began, so a folder tab strip read as
+//! just another row and a pinned chat under it looked glued to the tabs.
+//! `draw` now inserts one blank row after that header block — but only when
+//! the block has grown past the bare `label, blank` pair, so the common case
+//! (no tabs, not filtering, not in Archive) still costs the same two rows it
+//! always did. That single blank is the whole fix: it is spent once, between
+//! chrome and the list, not per optional line and not again in front of the
+//! archive pseudo-row.
+//!
+//! The archive pseudo-row does *not* get its own separating blank before the
+//! chat rows below it. It is deliberately laid out like a row (`archive_row_line`
+//! shares `chat_row_line`'s two-column left inset) because it *is* one — the
+//! top entry of the same list, just non-selectable — and splitting it off
+//! with another blank would both cost a row we can't spare on a short
+//! terminal and misrepresent it as chrome, which it isn't.
+//!
+//! The dim pinned/unpinned rule stays. It answers a different question than
+//! the new blank row does — not "where does the list start" but "where do
+//! pinned chats end" — and a blank line can't carry the same meaning inside
+//! a list of otherwise-identical rows the way it can between chrome and
+//! content. It's the one place in this view a rule still earns its keep.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -97,7 +123,11 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
     let show_folder_tabs = !is_archive && folders.len() > 1;
 
     // Section label, then a blank row, then whichever of the three header
-    // lines apply, then the rows themselves.
+    // lines apply, then — only when at least one of those optional lines is
+    // present — one more blank row before the rows themselves (see the
+    // module docs' "Vertical rhythm" section for why that row is
+    // conditional).
+    let has_extra_header_lines = is_archive || show_folder_tabs || list.filter.is_some();
     let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
     if is_archive {
         constraints.push(Constraint::Length(1));
@@ -106,6 +136,9 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
         constraints.push(Constraint::Length(1));
     }
     if list.filter.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    if has_extra_header_lines {
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Min(0));
@@ -124,6 +157,9 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
     if let Some(filter) = &list.filter {
         draw_filter_input(areas[next], filter, theme, f);
         next += 1;
+    }
+    if has_extra_header_lines {
+        next += 1; // the blank row separating chrome from the rows below
     }
     let rows_area = areas[next];
 
@@ -737,6 +773,35 @@ mod tests {
         assert!(rendered.contains("Folder 1"));
         assert!(rendered.contains("Folder 2"));
         insta::assert_snapshot!(rendered);
+    }
+
+    /// A cramped sidebar (T75): with tabs, the archive row and two pinned
+    /// chats all wanting space, an 8-row pane only has room for a handful of
+    /// rows below the new rhythm blank. This must not overflow the area or
+    /// panic — `Layout::vertical`'s `Min(0)` for the row list is what keeps
+    /// it from doing so — and the selected row must still land inside the
+    /// pane.
+    #[test]
+    fn cramped_height_with_tabs_does_not_overflow_120x8() {
+        let state = fixture_state(sidebar_organization_chat_list());
+        let rendered = render_to_string(120, 8, &state);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 8);
+        assert!(rendered.contains("Main · Folder 1 · Folder 2"));
+        // Header (label, blank, tabs, blank) plus at least the archive row
+        // and the selected pinned chat must fit.
+        assert!(rendered.contains("Alice"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// A pane shorter than the header block itself (label + blank + tabs +
+    /// blank is 4 rows) must still render without panicking; `ratatui`
+    /// shrinks the `Length` constraints rather than overflowing.
+    #[test]
+    fn height_shorter_than_header_does_not_panic_120x2() {
+        let state = fixture_state(sidebar_organization_chat_list());
+        let rendered = render_to_string(120, 2, &state);
+        assert_eq!(rendered.lines().count(), 2);
     }
 
     #[test]
