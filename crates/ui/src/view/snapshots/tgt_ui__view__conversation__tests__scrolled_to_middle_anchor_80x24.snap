@@ -2,27 +2,27 @@
 source: crates/ui/src/view/conversation.rs
 expression: rendered
 ---
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│Alice · 22:13                                                                 │
-│▏ hey, did you see the PR?                                                    │
-│▏ also CI is red on main                                                      │
-│                                                                              │
-│                                                                 You · 22:15  │
-│                                                      yeah, reviewing it now ▏│
-│                                                                             ✓│
-│                                                                              │
-│Alice · 22:18                                                                 │
-│▏ ↳ yeah, reviewing it now                                                    │
-│▏ take your time, no rush                                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+▏ Alice · 22:13                                                                 
+▏ hey, did you see the PR?                                                      
+▏ also CI is red on main                                                        
+                                                                                
+                                                                   You · 22:15 ▏
+                                                      yeah, reviewing it now ✓ ▏
+                                                                                
+▏ Alice · 22:18                                                                 
+▏ ↳ yeah, reviewing it now                                                      
+▏ take your time, no rush

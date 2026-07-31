@@ -2,7 +2,7 @@
 source: crates/ui/src/render/message_layout.rs
 expression: rendered(&lines)
 ---
-Alice · 22:13
+▏ Alice · 22:13
 ▏ bold italic underline strike spoiler code link url
 ▏ mention hashtag
 ▏ ── rust ──
