@@ -141,6 +141,8 @@ Two assertions here could not fail under any input, and one had been passing sin
 
 The heuristic that separates them: a function that is fully implemented, documented, and already honouring a subtle contract, with zero callers, is implausible on its face. Dead code that careful usually means the search was wrong. And **a comment explaining why something does nothing is a decision, not a defect** — read for the rationale before concluding a mechanism is missing.
 
+A third flavor of "green proves nothing": tests correct about the paths they construct, wrong about which paths occur in practice. `tgt update`'s install classification passed every unit test in 0.1.5 while being unable to update a single real install, because `std::env::current_exe` does not resolve symlinks on macOS — Linux reads the already-resolved `/proc/self/exe`, macOS returns the path as invoked — and every real install is reached through a symlink (`install.sh`'s `~/.local/bin/tgt`, Homebrew's Cellar link). The tests built target directories directly and asserted on those; none ever went through a symlinked entry point, so green proved the logic right about inputs no user's binary would ever produce.
+
 This matters here specifically because the codebase does contain genuinely unwired mechanisms, from tasks whose call site belonged to a later task that drifted. The claim is plausible enough to act on without checking, which is what makes the false ones expensive.
 
 ## Releasing and installing
@@ -148,7 +150,7 @@ This matters here specifically because the codebase does contain genuinely unwir
 The release pipeline had four independent faults, each hidden behind the one before it, and none of them in the build. If a release misbehaves, suspect plumbing before code.
 
 - **A reusable workflow inherits its caller's `github.workflow`.** `release.yaml` calls `ci.yml`, so `ci.yml`'s concurrency expression evaluated to the group its own parent held, and GitHub cancelled every release run as a deadlock. The literal `ci` segment in that group is load-bearing.
-- **`workflow_dispatch` repairs need their own concurrency group.** With `cancel-in-progress: false` GitHub keeps one *pending* run per group, so pushes to main evicted queued repairs — precisely when repairs are wanted, since main is busy with the fix. The group keys on `inputs.tag` for dispatch runs.
+- **`cancel-in-progress: false` does not mean a run cannot be evicted.** GitHub keeps only one *pending* run per concurrency group — a newer run supersedes a waiting one regardless of the cancellation setting. This bit twice. First, a `workflow_dispatch` repair queued behind a push to main was evicted before it ran a single job — fixed by keying the group on `inputs.tag` for dispatch runs, so a repair and a push never share one. Second, and worse: v0.1.5 published as a tag with zero assets, because release-please had already created the tag when a later push evicted the run that would have built it. A push evicting a push, after the tag already exists, is the failure mode to design against — a stuck repair can be re-dispatched by hand; a tag with no build run behind it just sits there looking released.
 - **The `checksums` job never checks the repository out**, so `gh` has no remote to infer from and needs `GH_REPO`. v0.1.4 shipped eight assets and no `SHA256SUMS` before this was found.
 - **Windows is advisory** (`continue-on-error`). It ships no artifact, and being slowest made it the job a superseding push always cancelled. The failure mode to watch for is subtler than "nobody fixes it": an advisory job makes real failures look like environment noise, so "fails only on Windows" reads as "the test is wrong" and the natural fix launders a genuine bug into a `#[cfg]`. That already happened once, with a startup regression.
 
@@ -157,6 +159,10 @@ The release pipeline had four independent faults, each hidden behind the one bef
 **One install layout, everywhere**: a private tree at `$XDG_DATA_HOME/tgt/{bin,lib}` with the binary symlinked to `~/.local/bin/tgt`, matching what the Homebrew formula does with `libexec`. `bin/` and `lib/` must stay siblings because the runpath resolves relative to the executable. Scattering them into a shared prefix makes the tree unswappable: there is no atomic multi-rename, and a half-replaced pair fails at dyld load, in a binary that can no longer start to repair itself.
 
 `package.sh` writes `.tgt-install` into the tarball root carrying the version and the target triple, so anything replacing a tree can prove it is replacing a tgt install rather than inferring it. **Require positive evidence before renaming or deleting a directory a user pointed you at.** The tempting inverse test — "does it contain only `bin` and `lib`?" — also describes a fresh `~/.local`, and would have renamed home directories for the users least likely to notice.
+
+**Homebrew stages an archive one directory flatter than you'd expect** — it strips the top-level folder before `install` runs. See `scripts/brew-formula.sh`'s `install` method for what that broke (v0.1.4 shipped a dangling `bin` symlink and no reported failure) and why the dotfile glob is separate.
+
+**A broken updater cannot fix itself.** `tgt update` is run *by the binary being replaced*, so shipping the fix in the next release does nothing for anyone already on the broken one — they have no path to the fix except one that isn't `tgt update`. Triage an updater bug as "everyone affected needs a different way in," not "fixed going forward."
 
 ## Gotchas
 
