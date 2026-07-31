@@ -102,6 +102,78 @@ jobs:
         with:
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-type "simple" bumps Cargo.toml's `[workspace.package]`
+      # version through `extra-files`' generic marker-comment replace
+      # (`# x-release-please-version`, see Cargo.toml), but has no idea
+      # Cargo.lock exists — it is a generated file and cannot carry that
+      # marker — so nothing keeps the two in sync. Left alone, every release
+      # dirties Cargo.lock for the next clone until someone notices and
+      # regenerates it by hand (1572d33, and it will recur).
+      #
+      # release-please's own "rust" strategy looks like the fix and was
+      # checked against its source rather than assumed: its Cargo.toml
+      # updater requires a `[package]` table and throws
+      # ("might be a cargo workspace") on a virtual manifest like this
+      # repo's root Cargo.toml, which has only `[workspace.package]`. Making
+      # it work would mean reconfiguring every crate as its own
+      # release-please package plus the cargo-workspace plugin — and that
+      # plugin's own updater writes a literal `package.version` string,
+      # which on a crate using `version.workspace = true` (every crate here)
+      # would silently replace the inheritance with a hardcoded version
+      # instead of leaving it alone. Both risks are worse than a dirty lock
+      # file, so this stays release-type "simple" and gets a regeneration
+      # step instead — the honest fix when a generated file cannot carry the
+      # annotation the "correct" mechanism needs.
+      #
+      # `cargo update --workspace` cannot touch anything outside the three
+      # workspace members: every other dependency in this repo is pinned
+      # exactly (`=x.y.z` throughout the three Cargo.toml files), which
+      # forces cargo to that exact resolution regardless of what a plain
+      # `update` would otherwise prefer. So this step's only possible effect
+      # is syncing tgt-core/tgt-ui/tgt-app's own Cargo.lock entries to the
+      # version release-please just wrote above them.
+      #
+      # Pushing straight to the PR branch with the default GITHUB_TOKEN
+      # rather than opening a second PR: release-please already owns this
+      # branch, and a bot-authored push to it does not re-trigger ci.yml's
+      # `pull_request` job (GitHub does not fire `synchronize` for
+      # GITHUB_TOKEN pushes, to prevent workflow loops) — acceptable here
+      # since a lock-file sync following an already-checked version bump
+      # cannot change what fmt/lint/test would report.
+      - name: Extract the release PR's branch
+        id: release-branch
+        if: steps.release-please.outputs.prs_created == 'true'
+        run: echo "name=$(jq -r '.headBranchName' <<< '${{ steps.release-please.outputs.pr }}')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the release PR branch
+        if: steps.release-please.outputs.prs_created == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release-branch.outputs.name }}
+
+      - name: Install mise
+        if: steps.release-please.outputs.prs_created == 'true'
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          version: 2026.6.10
+          install: true
+          cache: true
+
+      - name: Sync Cargo.lock with the version bump
+        if: steps.release-please.outputs.prs_created == 'true'
+        run: |
+          set -euo pipefail
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync; nothing to push."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'chore: sync Cargo.lock with the version bump above'
+          git push origin "HEAD:${{ steps.release-branch.outputs.name }}"
     outputs:
       release_created: ${{ steps.release-please.outputs.release_created }}
       tag_name: ${{ steps.release-please.outputs.tag_name }}

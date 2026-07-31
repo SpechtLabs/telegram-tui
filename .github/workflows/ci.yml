@@ -37,8 +37,29 @@ permissions:
 # said. Keeping a segment that the caller cannot collide with is what stops
 # it recurring; it also keeps a called run from fighting the standalone run
 # of the same commit.
+#
+# That fixed the deadlock and moved the collision one level down rather than
+# removing it: every called run still shared `github.ref` too, so any two
+# push-triggered release runs' nested CI calls landed in the identical group
+# `Release-ci-refs/heads/main` regardless of which commit each was for. With
+# only one *pending* run kept per group, a second push's nested CI evicted
+# the first's before it started — run 30669666816 was cancelled with zero
+# jobs run this way. `github.sha` is unique per commit, so keying on it for
+# anything that is not a `pull_request` gives every push's nested CI call its
+# own group, the same way release.yaml's own top-level group already does
+# for pushes. `pull_request` keeps `github.ref`: re-pushing to the same PR
+# branch is *supposed* to supersede the run already checking that branch,
+# which is exactly what `cancel-in-progress` below does for it.
+#
+# This does not chase the tag-repair case release.yaml's own group handles
+# (`inputs.tag`, so two repairs of the same tag collide with each other by
+# design, not by accident): a `workflow_dispatch` repair only reaches this
+# nested call after release.yaml's own group has already let it through, so
+# two repairs of the same tag never have their nested CI calls running
+# concurrently in the first place — there is nothing left here for `sha` to
+# get wrong for that case.
 concurrency:
-  group: ${{ github.workflow }}-ci-${{ github.ref }}
+  group: ${{ github.workflow }}-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
