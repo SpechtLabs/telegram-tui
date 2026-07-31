@@ -2058,6 +2058,66 @@ on later tasks):
 
 ---
 
+## 7.5 Mouse support (post-plan QoL, T57/T58 — 2026-07-31)
+
+Purity constraint: `update()` cannot resolve coordinates (rows, pane rects
+and scroll offsets are view-side facts), so hit-testing happens at the
+boundary and core sees only semantic actions.
+
+```rust
+// core/src/model/hit.rs — plain data, no ratatui types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HitTarget {
+    ChatRow(ChatId),
+    ArchiveRow,
+    FolderTab(ChatListId),
+    Message(MessageId),
+    Composer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClickButton { Left, Right }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollArea { ChatList, Conversation }
+
+// core/src/action.rs gains:
+//   Click { target: HitTarget, button: ClickButton },
+//   Scroll { area: ScrollArea, up: bool },
+```
+
+```rust
+// ui/src/render/hit.rs — built fresh on every draw; view() returns it.
+pub struct HitMap { /* Vec<(Rect, HitTarget)> + Vec<(Rect, ScrollArea)> */ }
+impl HitMap {
+    pub fn push(&mut self, rect: Rect, target: HitTarget);
+    pub fn push_area(&mut self, rect: Rect, area: ScrollArea);
+    pub fn target_at(&self, x: u16, y: u16) -> Option<HitTarget>;   // last-pushed wins
+    pub fn area_at(&self, x: u16, y: u16) -> Option<ScrollArea>;
+}
+// view signature becomes:
+pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) -> HitMap;
+```
+
+- The runtime loop keeps the latest frame's `HitMap`; crossterm
+  `MouseEvent::Down(Left|Right)` → `target_at` → `Action::Click`;
+  `ScrollUp/Down` → `area_at` → `Action::Scroll`. Unresolved coordinates
+  produce no action.
+- Core routing: left-click `ChatRow` selects + opens (the Enter path);
+  `FolderTab` switches lists; `ArchiveRow` toggles archive; `Composer`
+  focuses the composer; right-click `Message` enters selection mode on that
+  message (`selection::enter_at`, new alongside `enter`); left-click
+  `Message` is a no-op in v1. While a modal, the palette, or help is
+  focused, all clicks and scrolls are ignored (overlays are keyboard-only
+  for now). `Scroll` maps to the pane's existing Up/Down semantics
+  (chat-list selection movement; conversation anchor movement — which keeps
+  the paging trigger working from the wheel).
+- App: `[app] mouse = true` config key (default on; unknown-key-tolerant
+  parsers make this backward-safe). Mouse capture is enabled with the
+  alternate screen and released in BOTH the normal teardown and the panic
+  hook's restore. Native terminal text selection requires shift while
+  capture is on — the config toggle is the escape hatch.
+
 ## 8. Decisions the spec delegated
 
 | Decision | Choice | Rationale |
