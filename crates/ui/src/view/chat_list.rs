@@ -1,4 +1,5 @@
-//! Chat list sidebar (spec §6.1 sidebar mock, §7.2 theme tokens).
+//! Chat list sidebar (spec §6.1 sidebar mock, §7.2 theme tokens, §11 sidebar
+//! organization).
 //!
 //! `draw` fills the `CHATS` block's interior with rows from
 //! `tgt_core::state::chat_list::visible_rows`. `crates/ui/src/view/root.rs`
@@ -18,6 +19,36 @@
 //! so the window never runs past the end of the list). This is a pure
 //! function of `(row count, viewport height, selected index)`, so it needs
 //! no persisted scroll state and always agrees with the current selection.
+//!
+//! ## Sidebar organization (T43, spec §11)
+//!
+//! Three header lines above the row list, each drawn only when relevant, in
+//! this fixed order:
+//!
+//! 1. An "esc/a  back" hint, only while `active_list == Archive` (the block
+//!    title also becomes `ARCHIVE` in that state).
+//! 2. A folder tab strip (`Main · Folder 1 · Folder 2`, active one in
+//!    accent), only when `folder_cycle` has more than just `Main` and the
+//!    list isn't the archive. There is no folder *name* anywhere in the
+//!    model (`ChatListId::Folder` is a bare `i32`), so tabs are labelled by
+//!    id; a future task that projects `ChatFolderInfo` titles can replace
+//!    `folder_label` without touching layout.
+//! 3. The existing `/` filter input line (T15/T22), unchanged.
+//!
+//! Below those, the row list itself is `visible_rows` (already pinned-first,
+//! see `state::chat_list`'s docs) with two additions folded into the same
+//! scroll window so selection math stays a single pure function of `(row
+//! count, height, selected index)`:
+//!
+//! - A non-selectable archive pseudo-row at the very top, when
+//!   `active_list == Main` and `archive_visible`. It shows the summed
+//!   unread count across archived chats and is reachable only by the `a`
+//!   key (core's `handle_key_chat_list`), never by `↑`/`↓` — `selected_idx`
+//!   is computed by locating the selected `ChatId` in the combined row list,
+//!   which never includes `DisplayRow::Archive`, so arrow-key navigation
+//!   can't land on it.
+//! - A dim horizontal rule between the pinned and unpinned groups, only
+//!   when both are non-empty within the current `visible_rows` result.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,39 +56,105 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
-use tgt_core::model::chat::ChatView;
+use tgt_core::model::chat::{ChatListId, ChatView};
 use tgt_core::model::ids::ChatId;
 use tgt_core::state::auth::InputField;
-use tgt_core::state::chat_list::{ChatListState, visible_rows};
+use tgt_core::state::chat_list::{
+    ChatListState, archive_unread_total, archive_visible, folder_cycle, visible_rows,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
 
+/// One line in the combined, scroll-windowed row list: the real chat rows
+/// plus the two synthetic rows this task adds (see the module docs).
+enum DisplayRow {
+    Archive(u32),
+    PinnedSeparator,
+    Chat(ChatId),
+}
+
 pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
+    let list = &state.chat_list;
+    let is_archive = list.active_list == ChatListId::Archive;
+
     let block = Block::bordered()
-        .title("CHATS")
+        .title(if is_archive { "ARCHIVE" } else { "CHATS" })
         .title_style(Style::new().fg(theme.text))
         .border_style(Style::new().fg(theme.text_muted));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let list = &state.chat_list;
-    let rows_area = match &list.filter {
-        Some(filter) => {
-            let [filter_area, rows_area] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-            draw_filter_input(filter_area, filter, theme, f);
-            rows_area
-        }
-        None => inner,
-    };
+    let folders = folder_cycle(list);
+    let show_folder_tabs = !is_archive && folders.len() > 1;
+
+    let mut constraints = Vec::new();
+    if is_archive {
+        constraints.push(Constraint::Length(1));
+    }
+    if show_folder_tabs {
+        constraints.push(Constraint::Length(1));
+    }
+    if list.filter.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(0));
+
+    let areas = Layout::vertical(constraints).split(inner);
+    let mut next = 0usize;
+    if is_archive {
+        draw_archive_hint(areas[next], theme, f);
+        next += 1;
+    }
+    if show_folder_tabs {
+        draw_folder_tabs(areas[next], &folders, list.active_list, theme, f);
+        next += 1;
+    }
+    if let Some(filter) = &list.filter {
+        draw_filter_input(areas[next], filter, theme, f);
+        next += 1;
+    }
+    let rows_area = areas[next];
 
     let rows = visible_rows(list);
-    if rows.is_empty() {
+    let show_archive_row = list.active_list == ChatListId::Main && archive_visible(list);
+    let display = build_display_rows(&rows, list, show_archive_row);
+    if display.is_empty() {
         draw_empty(rows_area, theme, f);
         return;
     }
-    draw_rows(rows_area, &rows, list, theme, f);
+    draw_display_rows(rows_area, &display, list, theme, f);
+}
+
+/// `visible_rows` is already pinned-first (see `state::chat_list`); this
+/// only finds the boundary (via the same `is_pinned` predicate `visible_rows`
+/// partitions on) to place the separator and, optionally, prepends the
+/// archive pseudo-row.
+fn build_display_rows(
+    rows: &[ChatId],
+    list: &ChatListState,
+    show_archive_row: bool,
+) -> Vec<DisplayRow> {
+    let mut display = Vec::with_capacity(rows.len() + 2);
+    if show_archive_row {
+        display.push(DisplayRow::Archive(archive_unread_total(list)));
+    }
+    let pinned_count = rows.iter().take_while(|id| is_pinned(list, **id)).count();
+    for (i, id) in rows.iter().enumerate() {
+        if i == pinned_count && pinned_count > 0 && pinned_count < rows.len() {
+            display.push(DisplayRow::PinnedSeparator);
+        }
+        display.push(DisplayRow::Chat(*id));
+    }
+    display
+}
+
+fn is_pinned(list: &ChatListState, id: ChatId) -> bool {
+    list.chats
+        .get(&id)
+        .and_then(|c| c.positions.iter().find(|p| p.list == list.active_list))
+        .map(|p| p.is_pinned)
+        .unwrap_or(false)
 }
 
 /// Renders the `/`-prefixed filter line with a reverse-video cursor cell,
@@ -98,27 +195,116 @@ fn draw_empty(area: Rect, theme: &Theme, f: &mut Frame) {
     );
 }
 
-fn draw_rows(area: Rect, rows: &[ChatId], list: &ChatListState, theme: &Theme, f: &mut Frame) {
+fn draw_display_rows(
+    area: Rect,
+    display: &[DisplayRow],
+    list: &ChatListState,
+    theme: &Theme,
+    f: &mut Frame,
+) {
     let height = area.height as usize;
     if height == 0 {
         return;
     }
-    let selected_idx = list
-        .selected
-        .and_then(|sel| rows.iter().position(|&r| r == sel));
-    let offset = scroll_offset(rows.len(), height, selected_idx);
+    // Only `DisplayRow::Chat` participates in selection, so the archive
+    // pseudo-row and the separator are never a scroll anchor — they just
+    // ride along in whatever window a real chat's selection produces.
+    let selected_idx = list.selected.and_then(|sel| {
+        display
+            .iter()
+            .position(|row| matches!(row, DisplayRow::Chat(id) if *id == sel))
+    });
+    let offset = scroll_offset(display.len(), height, selected_idx);
 
-    let lines: Vec<Line<'static>> = rows
+    let lines: Vec<Line<'static>> = display
         .iter()
         .skip(offset)
         .take(height)
-        .filter_map(|chat_id| {
-            let chat = list.chats.get(chat_id)?;
-            let selected = list.selected == Some(*chat_id);
-            Some(chat_row_line(chat, selected, area.width, theme))
+        .map(|row| match row {
+            DisplayRow::Archive(unread) => archive_row_line(*unread, theme),
+            DisplayRow::PinnedSeparator => separator_line(area.width, theme),
+            DisplayRow::Chat(chat_id) => match list.chats.get(chat_id) {
+                Some(chat) => {
+                    let selected = list.selected == Some(*chat_id);
+                    chat_row_line(chat, selected, area.width, theme)
+                }
+                // `visible_rows` only yields ids present in `list.chats`, so
+                // this is unreachable in practice; an empty line rather than
+                // a panic keeps a stale id from crashing the render.
+                None => Line::default(),
+            },
         })
         .collect();
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// "  Archived  N" per the spec §6.1 mock's `Archived  12` row, muted since
+/// it's an info row rather than a chat. Omits the count when it's zero
+/// (archived chats can all be read).
+fn archive_row_line(unread: u32, theme: &Theme) -> Line<'static> {
+    let text = if unread > 0 {
+        format!("  Archived  {unread}")
+    } else {
+        "  Archived".to_string()
+    };
+    Line::from(Span::styled(text, Style::new().fg(theme.text_muted)))
+}
+
+/// Dim rule marking the pinned/unpinned boundary (spec §11: "pinned chats
+/// above the list"). Deliberately unlabelled — the position alone conveys
+/// the split without repeating "pinned" on every render.
+fn separator_line(width: u16, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width as usize),
+        Style::new().fg(theme.text_muted),
+    ))
+}
+
+fn draw_archive_hint(area: Rect, theme: &Theme, f: &mut Frame) {
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "esc/a  back",
+            Style::new().fg(theme.text_muted),
+        ))),
+        area,
+    );
+}
+
+/// `Main · Folder 1 · Folder 2`, active entry in accent+bold. `folders` is
+/// `folder_cycle`'s output, already ordered and Archive-free.
+fn draw_folder_tabs(
+    area: Rect,
+    folders: &[ChatListId],
+    active: ChatListId,
+    theme: &Theme,
+    f: &mut Frame,
+) {
+    let mut spans = Vec::with_capacity(folders.len() * 2);
+    for (i, id) in folders.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().fg(theme.text_muted)));
+        }
+        let style = if *id == active {
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.text_muted)
+        };
+        spans.push(Span::styled(folder_label(*id), style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// See the module docs: there is no folder title anywhere in the model yet,
+/// so folders are labelled by id.
+fn folder_label(id: ChatListId) -> String {
+    match id {
+        ChatListId::Main => "Main".to_string(),
+        ChatListId::Folder(n) => format!("Folder {n}"),
+        // `folder_cycle` never yields this; kept exhaustive rather than
+        // `unreachable!()` so a future change to that invariant degrades
+        // instead of panicking mid-render.
+        ChatListId::Archive => "Archive".to_string(),
+    }
 }
 
 /// See the module docs' "Scroll window" section for the invariant this
@@ -401,6 +587,100 @@ mod tests {
         let state = fixture_state(ChatListState::default());
         let rendered = render_to_string(120, 40, &state);
         assert!(rendered.contains("no chats"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// A chat with a position in an arbitrary list, pinned or not — the
+    /// general form `chat` (Main-only, unpinned) is built on top of.
+    fn chat_in(
+        id: i64,
+        title: &str,
+        list: ChatListId,
+        order: i64,
+        pinned: bool,
+        unread: u32,
+    ) -> ChatView {
+        ChatView {
+            id: ChatId(id),
+            kind: ChatKind::Private,
+            title: title.to_string(),
+            positions: vec![ChatPositionEntry {
+                list,
+                order,
+                is_pinned: pinned,
+            }],
+            unread_count: unread,
+            unread_mention_count: 0,
+            last_message: None,
+            is_muted: false,
+        }
+    }
+
+    /// Two pinned + two unpinned Main chats (exercising the pinned section
+    /// and its separator), one archived chat (the pseudo-row + its unread
+    /// total), and two folders (the tab strip) — everything T43 adds, all
+    /// visible at once since `active_list == Main`.
+    fn sidebar_organization_chat_list() -> ChatListState {
+        let seed = [
+            chat_in(1, "Alice", ChatListId::Main, 900, true, 2),
+            chat_in(2, "Boss", ChatListId::Main, 890, true, 0),
+            chat_in(3, "Team Rust", ChatListId::Main, 800, false, 9),
+            chat_in(4, "Mom", ChatListId::Main, 790, false, 0),
+            chat_in(5, "Old Chat", ChatListId::Archive, 500, false, 12),
+            chat_in(6, "Work Chat", ChatListId::Folder(1), 700, false, 0),
+            chat_in(7, "News Chat", ChatListId::Folder(2), 600, false, 3),
+        ];
+        let mut chats = HashMap::new();
+        let mut orders: HashMap<ChatListId, BTreeSet<ChatOrderKey>> = HashMap::new();
+        for chat in seed {
+            let position = chat.positions[0];
+            orders
+                .entry(position.list)
+                .or_default()
+                .insert(ChatOrderKey {
+                    order: position.order,
+                    chat_id: chat.id,
+                });
+            chats.insert(chat.id, chat);
+        }
+        ChatListState {
+            chats,
+            orders,
+            active_list: ChatListId::Main,
+            selected: Some(ChatId(1)),
+            filter: None,
+            scroll_offset: 0,
+            load: ChatLoadPhase::Complete,
+        }
+    }
+
+    #[test]
+    fn sidebar_pinned_archive_and_folder_tabs_120x40() {
+        let state = fixture_state(sidebar_organization_chat_list());
+        let rendered = render_to_string(120, 40, &state);
+        // Pinned chats, the archive row and its total, and the folder tabs
+        // are all present.
+        assert!(rendered.contains("Alice"));
+        assert!(rendered.contains("Boss"));
+        assert!(rendered.contains("Archived  12"));
+        assert!(rendered.contains("Folder 1"));
+        assert!(rendered.contains("Folder 2"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn archive_active_list_shows_archive_title_and_back_hint_120x40() {
+        let mut list = sidebar_organization_chat_list();
+        list.active_list = ChatListId::Archive;
+        list.selected = Some(ChatId(5));
+        let state = fixture_state(list);
+        let rendered = render_to_string(120, 40, &state);
+        assert!(rendered.contains("ARCHIVE"));
+        assert!(rendered.contains("esc/a"));
+        assert!(rendered.contains("Old Chat"));
+        // The folder tab strip and the Main-list archive pseudo-row are both
+        // archive-mode-only exclusions.
+        assert!(!rendered.contains("Folder 1"));
         insta::assert_snapshot!(rendered);
     }
 

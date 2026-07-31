@@ -213,11 +213,16 @@ fn reconcile_selection(app: &mut AppState) {
 }
 
 /// Walks the active list's order set (already sorted by TDLib order; never
-/// reordered here) and keeps rows whose title matches the filter
-/// case-insensitively.
+/// reordered here), keeps rows whose title matches the filter
+/// case-insensitively, then stable-partitions the result so every pinned
+/// chat (per its `ChatPositionEntry.is_pinned` in the *active* list) precedes
+/// every unpinned one (spec §11). This is a partition, not a fresh sort: it
+/// never invents an ordering within a group that TDLib didn't already give
+/// us, it only pulls the pinned subsequence forward.
 pub fn visible_rows(list: &ChatListState) -> Vec<ChatId> {
     let filter_lower = list.filter.as_ref().map(|f| f.text.to_lowercase());
-    list.orders
+    let matches: Vec<ChatId> = list
+        .orders
         .get(&list.active_list)
         .into_iter()
         .flatten()
@@ -229,7 +234,103 @@ pub fn visible_rows(list: &ChatListState) -> Vec<ChatId> {
             };
             visible.then_some(key.chat_id)
         })
-        .collect()
+        .collect();
+
+    let mut pinned: Vec<ChatId> = matches
+        .iter()
+        .copied()
+        .filter(|id| is_pinned_in_active_list(list, *id))
+        .collect();
+    let unpinned = matches
+        .into_iter()
+        .filter(|id| !is_pinned_in_active_list(list, *id));
+    pinned.extend(unpinned);
+    pinned
+}
+
+fn is_pinned_in_active_list(list: &ChatListState, id: ChatId) -> bool {
+    list.chats
+        .get(&id)
+        .and_then(|c| c.positions.iter().find(|p| p.list == list.active_list))
+        .map(|p| p.is_pinned)
+        .unwrap_or(false)
+}
+
+/// True when any chat currently holds a position in `ChatListId::Archive`
+/// (spec §11: the archive is surfaced as a pseudo-row, not a switchable list
+/// item, so its visibility is derived rather than tracked separately).
+pub fn archive_visible(list: &ChatListState) -> bool {
+    list.orders
+        .get(&ChatListId::Archive)
+        .is_some_and(|set| !set.is_empty())
+}
+
+/// Sum of `unread_count` across every chat with an `Archive` position — the
+/// number the archive pseudo-row shows (`"Archived  N"`, spec §11 mock).
+pub fn archive_unread_total(list: &ChatListState) -> u32 {
+    list.orders
+        .get(&ChatListId::Archive)
+        .into_iter()
+        .flatten()
+        .filter_map(|key| list.chats.get(&key.chat_id))
+        .map(|chat| chat.unread_count)
+        .sum()
+}
+
+/// Switches `active_list` between `Main` and `Archive`. Selection resets to
+/// the new list's first visible row (or `None` if it has none) rather than
+/// trying to preserve a selection that belongs to the other list. The
+/// archive is a pseudo-row activated only by this toggle (the `a` key), not
+/// a `visible_rows` entry — see the module docs on `handle_key_chat_list`.
+pub fn toggle_archive(app: &mut AppState) {
+    app.chat_list.active_list = match app.chat_list.active_list {
+        ChatListId::Archive => ChatListId::Main,
+        _ => ChatListId::Archive,
+    };
+    reset_selection_to_first_visible(app);
+}
+
+/// `[Main, Folder(id), ...]` in ascending folder-id order, restricted to
+/// folders that currently hold at least one chat. `Archive` is deliberately
+/// excluded (spec §11 / this task's resolution note: the archive is reached
+/// only via the pseudo-row / `toggle_archive`, never by folder cycling).
+pub fn folder_cycle(list: &ChatListState) -> Vec<ChatListId> {
+    let mut folder_ids: Vec<i32> = list
+        .orders
+        .iter()
+        .filter_map(|(id, set)| match id {
+            ChatListId::Folder(n) if !set.is_empty() => Some(*n),
+            _ => None,
+        })
+        .collect();
+    folder_ids.sort_unstable();
+
+    let mut cycle = vec![ChatListId::Main];
+    cycle.extend(folder_ids.into_iter().map(ChatListId::Folder));
+    cycle
+}
+
+/// Cycles `active_list` forward or backward through `folder_cycle`, wrapping
+/// at both ends. A no-op when `active_list` isn't currently in the cycle
+/// (i.e. it's `Archive`): folder cycling and the archive toggle are separate
+/// axes, and pressing `[`/`]` while archived doesn't leave the archive.
+pub fn cycle_folder(app: &mut AppState, forward: bool) {
+    let cycle = folder_cycle(&app.chat_list);
+    if cycle.len() <= 1 {
+        return;
+    }
+    let Some(pos) = cycle.iter().position(|&id| id == app.chat_list.active_list) else {
+        return;
+    };
+    let len = cycle.len() as i32;
+    let delta = if forward { 1 } else { -1 };
+    let new_idx = (pos as i32 + delta).rem_euclid(len) as usize;
+    app.chat_list.active_list = cycle[new_idx];
+    reset_selection_to_first_visible(app);
+}
+
+fn reset_selection_to_first_visible(app: &mut AppState) {
+    app.chat_list.selected = visible_rows(&app.chat_list).first().copied();
 }
 
 /// Active while focus is `ChatList` or `ChatFilter` (spec §6.2 routing:
@@ -242,6 +343,20 @@ pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
     }
 }
 
+/// Owns `↑`/`↓`/`⏎`/`/` (T15) plus this task's sidebar-organization keys:
+/// `a` toggles the archive pseudo-row (`toggle_archive`), `]`/`[` cycle
+/// Telegram folders forward/back (`cycle_folder`). `Left`/`Right` are pane
+/// movement (spec §6.2) and `Tab` cycles panes, so folder cycling
+/// deliberately does not sit on either — see this task's report for the
+/// resolution note.
+///
+/// `Esc` is claimed here only while `active_list == Archive`, to back out of
+/// the archive pseudo-mode into `Main` before the generic one-level-pop rule
+/// (architecture §4.5) would otherwise apply. NOTE for T45: `App::dispatch_key`
+/// currently intercepts `Key::Esc` at step 3, *above* `route_pane_key` (step
+/// 4), so this arm is unreachable until the router special-cases
+/// `Focus::ChatList` with `active_list == Archive` ahead of its generic Esc
+/// handling — see this task's final report.
 fn handle_key_chat_list(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
     match key {
         Key::Up => {
@@ -256,6 +371,22 @@ fn handle_key_chat_list(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
         Key::Char('/') => {
             app.chat_list.filter = Some(InputField::default());
             app.focus.push(Focus::ChatFilter);
+            Some(Vec::new())
+        }
+        Key::Char('a') => {
+            toggle_archive(app);
+            Some(Vec::new())
+        }
+        Key::Char(']') => {
+            cycle_folder(app, true);
+            Some(Vec::new())
+        }
+        Key::Char('[') => {
+            cycle_folder(app, false);
+            Some(Vec::new())
+        }
+        Key::Esc if app.chat_list.active_list == ChatListId::Archive => {
+            toggle_archive(app);
             Some(Vec::new())
         }
         _ => None,
@@ -670,5 +801,142 @@ mod tests {
         // Selection lands on a surviving row rather than becoming invalid.
         let selected = app.chat_list.selected.expect("a surviving row is picked");
         assert!(visible_rows(&app.chat_list).contains(&selected));
+    }
+
+    fn new_chat_with_position(
+        id: i64,
+        title: &str,
+        list: ChatListId,
+        order: i64,
+        is_pinned: bool,
+    ) -> TdUpdate {
+        let mut c = chat(id, title);
+        c.positions = vec![ChatPositionEntry {
+            list,
+            order,
+            is_pinned,
+        }];
+        TdUpdate::NewChat(c)
+    }
+
+    #[test]
+    fn pinned_section_precedes_unpinned_preserving_tdlib_order_within() {
+        let mut app = fixture_state();
+        // Raw TDLib order (order DESC, chat_id DESC): B(50) C(30) A(10) D(5).
+        handle_td(
+            &mut app,
+            &new_chat_with_position(1, "A", ChatListId::Main, 10, false),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(2, "B", ChatListId::Main, 50, true),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(3, "C", ChatListId::Main, 30, true),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(4, "D", ChatListId::Main, 5, false),
+        );
+
+        // Pinned (B, C) precede unpinned (A, D), each group in the TDLib
+        // order it already had.
+        assert_eq!(
+            visible_rows(&app.chat_list),
+            vec![ChatId(2), ChatId(3), ChatId(1), ChatId(4)]
+        );
+    }
+
+    #[test]
+    fn archive_row_switches_active_list() {
+        let mut app = fixture_state();
+        handle_td(
+            &mut app,
+            &new_chat_with_position(1, "Alice", ChatListId::Main, 10, false),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(2, "Old", ChatListId::Archive, 5, false),
+        );
+        app.chat_list.selected = Some(ChatId(1));
+
+        assert!(archive_visible(&app.chat_list));
+        assert_eq!(archive_unread_total(&app.chat_list), 0);
+
+        // The `a` key toggles Main -> Archive and resets selection to the
+        // new list's first row.
+        let effects = handle_key(&mut app, Key::Char('a')).expect("chat list claims 'a'");
+        assert!(effects.is_empty());
+        assert_eq!(app.chat_list.active_list, ChatListId::Archive);
+        assert_eq!(app.chat_list.selected, Some(ChatId(2)));
+
+        // Esc backs out of the archive (claimed here per this task's report
+        // note — see `handle_key_chat_list`'s docs for the router caveat).
+        let effects = handle_key(&mut app, Key::Esc).expect("chat list claims Esc while archived");
+        assert!(effects.is_empty());
+        assert_eq!(app.chat_list.active_list, ChatListId::Main);
+        assert_eq!(app.chat_list.selected, Some(ChatId(1)));
+
+        // The underlying function works the same way directly.
+        toggle_archive(&mut app);
+        assert_eq!(app.chat_list.active_list, ChatListId::Archive);
+    }
+
+    #[test]
+    fn folder_switch_swaps_order_set() {
+        let mut app = fixture_state();
+        handle_td(
+            &mut app,
+            &new_chat_with_position(1, "Main Chat", ChatListId::Main, 10, false),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(2, "Work Chat", ChatListId::Folder(1), 20, false),
+        );
+        handle_td(
+            &mut app,
+            &new_chat_with_position(3, "News Chat", ChatListId::Folder(2), 30, false),
+        );
+
+        assert_eq!(
+            folder_cycle(&app.chat_list),
+            vec![
+                ChatListId::Main,
+                ChatListId::Folder(1),
+                ChatListId::Folder(2)
+            ]
+        );
+
+        // Forward: Main -> Folder(1) -> Folder(2) -> Main, wrapping, with
+        // selection landing on each list's own order set.
+        cycle_folder(&mut app, true);
+        assert_eq!(app.chat_list.active_list, ChatListId::Folder(1));
+        assert_eq!(app.chat_list.selected, Some(ChatId(2)));
+
+        cycle_folder(&mut app, true);
+        assert_eq!(app.chat_list.active_list, ChatListId::Folder(2));
+        assert_eq!(app.chat_list.selected, Some(ChatId(3)));
+
+        cycle_folder(&mut app, true);
+        assert_eq!(app.chat_list.active_list, ChatListId::Main);
+
+        // Backward wraps the other way.
+        cycle_folder(&mut app, false);
+        assert_eq!(app.chat_list.active_list, ChatListId::Folder(2));
+
+        // The `]` / `[` keys drive the same transitions.
+        let effects = handle_key(&mut app, Key::Char(']')).expect("chat list claims ']'");
+        assert!(effects.is_empty());
+        assert_eq!(app.chat_list.active_list, ChatListId::Main);
+        handle_key(&mut app, Key::Char('['));
+        assert_eq!(app.chat_list.active_list, ChatListId::Folder(2));
+
+        // Archive is not part of the cycle: switching to it makes folder
+        // cycling a no-op until the archive is left again.
+        toggle_archive(&mut app);
+        assert_eq!(app.chat_list.active_list, ChatListId::Archive);
+        cycle_folder(&mut app, true);
+        assert_eq!(app.chat_list.active_list, ChatListId::Archive);
     }
 }
