@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use crate::action::Action;
+use crate::action::{Action, TdResult};
 use crate::effect::{Effect, TelemetryMode};
 use crate::model::ids::ChatId;
-use crate::model::key::KeyBindings;
+use crate::model::key::{Key, KeyBindings};
 use crate::model::time::Millis;
-use crate::state::auth::{AuthField, AuthState, InputField};
+use crate::state::auth::{self, AuthField, AuthState, InputField};
 use crate::state::chat_list::ChatListState;
 use crate::state::composer::ComposerState;
 use crate::state::consent::{ConsentChoice, ConsentState};
@@ -19,7 +19,7 @@ use crate::state::palette::PaletteState;
 use crate::state::presence::PresenceState;
 use crate::state::search::ChatSearchState;
 use crate::state::toasts::ToastState;
-use crate::td::update::{AuthPhase, ConnectionPhase};
+use crate::td::update::{AuthPhase, ConnectionPhase, TdUpdate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -100,7 +100,14 @@ impl App {
                 phone: InputField::default(),
                 code: InputField::default(),
                 password: InputField::default(),
-                active_field: AuthField::Phone,
+                // The credentials-wizard contract (state/auth.rs module
+                // docs): the wizard has no flag of its own, it is entirely
+                // driven by `active_field` starting on `ApiId`.
+                active_field: if boot.has_credentials {
+                    AuthField::Phone
+                } else {
+                    AuthField::ApiId
+                },
                 field_error: None,
                 flood_wait_until: None,
                 in_flight: false,
@@ -132,10 +139,15 @@ impl App {
     pub fn update(&mut self, action: Action) -> Vec<Effect> {
         match action {
             Action::Tick { now } => {
-                // Caching the clock is not itself render-worthy: dirty stays
-                // whatever later handlers (e.g. TTL sweeps) leave it as.
+                // Caching the clock is not itself render-worthy: only a
+                // handler that actually changed something sets dirty.
                 self.state.now = now;
-                Vec::new()
+                let flood_wait_before = self.state.auth.flood_wait_until;
+                let effects = auth::handle_tick(&mut self.state, now);
+                if self.state.auth.flood_wait_until != flood_wait_before {
+                    self.dirty = true;
+                }
+                effects
             }
             Action::Resize { width, height } => {
                 self.state.width = width;
@@ -143,11 +155,60 @@ impl App {
                 self.dirty = true;
                 Vec::new()
             }
-            Action::Key(k) if k == self.state.bindings.quit => vec![Effect::Quit],
-            // Key routing (modal → focused pane → global), Paste, Td,
-            // TdResult, and Io dispatch are wired in by later tasks
-            // (T11, T15, T25-T27, T28, ...). Left as a deliberate no-op so
-            // `update` stays total over `Action` from day one.
+            Action::Key(key) => self.route_key(key),
+            Action::Td(update) => self.route_td(&update),
+            Action::TdResult(TdResult::AuthRequestDone { outcome }) => {
+                // Always render-worthy: at minimum the in-flight spinner
+                // clears, and usually an inline error or countdown appears.
+                self.dirty = true;
+                auth::handle_td_result(&mut self.state, &outcome)
+            }
+            // Paste, the remaining `TdResult` completions and `Io` land with
+            // the tasks that own their state (T15, T16, T25-T27, ...). Left
+            // as a deliberate no-op so `update` stays total over `Action`.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Spec §6.2's routing order: modal → focused pane → global, first
+    /// claimant wins.
+    ///
+    /// The quit binding is checked ahead of all of it, deliberately. A pane
+    /// claims every key it is shown for — the auth wizard is a full-screen
+    /// text form, so `state::auth::handle_key` returns `Some` for anything
+    /// while `Screen::Auth` is up — and routing `ctrl+c` through it first
+    /// would leave a half-finished login unquittable. The interrupt key is
+    /// reserved, not routable.
+    fn route_key(&mut self, key: Key) -> Vec<Effect> {
+        if key == self.state.bindings.quit {
+            return vec![Effect::Quit];
+        }
+
+        // M2 has exactly one pane: the auth screen. Modals (T27), the chat
+        // list, composer and selection panes (T28) slot in above and below
+        // this arm as their tasks land.
+        if let Some(effects) = auth::handle_key(&mut self.state, key) {
+            self.dirty = true;
+            return effects;
+        }
+
+        Vec::new()
+    }
+
+    fn route_td(&mut self, update: &TdUpdate) -> Vec<Effect> {
+        match update {
+            TdUpdate::Auth(_) => {
+                self.dirty = true;
+                auth::handle_td(&mut self.state, update)
+            }
+            TdUpdate::Connection(phase) => {
+                if self.state.connection != *phase {
+                    self.state.connection = *phase;
+                    self.dirty = true;
+                }
+                Vec::new()
+            }
+            // Chat, message, file and presence updates arrive with M3+.
             _ => Vec::new(),
         }
     }
@@ -167,7 +228,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::key::Key;
+    use crate::td::error::TdError;
+    use crate::td::request::TdRequest;
 
     fn boot_fixture() -> Boot {
         Boot {
@@ -201,6 +263,87 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(app.state().now, Millis(1_234));
         assert!(!app.take_dirty());
+    }
+
+    #[test]
+    fn boot_without_credentials_starts_the_wizard_on_api_id() {
+        let app = App::new(boot_fixture());
+        assert_eq!(app.state().auth.active_field, AuthField::ApiId);
+
+        let app = App::new(Boot {
+            has_credentials: true,
+            ..boot_fixture()
+        });
+        assert_eq!(app.state().auth.active_field, AuthField::Phone);
+    }
+
+    #[test]
+    fn auth_screen_claims_keys_but_never_the_quit_binding() {
+        let mut app = App::new(Boot {
+            has_credentials: true,
+            ..boot_fixture()
+        });
+        app.update(Action::Td(TdUpdate::Auth(AuthPhase::WaitCode {
+            delivery_hint: "SMS".to_string(),
+            length: 5,
+        })));
+
+        assert!(app.update(Action::Key(Key::Char('7'))).is_empty());
+        assert_eq!(app.state().auth.code.text, "7");
+
+        let effects = app.update(Action::Key(Key::Ctrl('c')));
+        assert!(matches!(effects.as_slice(), [Effect::Quit]));
+        // The quit key never reached the field.
+        assert_eq!(app.state().auth.code.text, "7");
+    }
+
+    #[test]
+    fn ready_update_switches_to_main_and_loads_chats() {
+        let mut app = App::new(Boot {
+            has_credentials: true,
+            ..boot_fixture()
+        });
+        let effects = app.update(Action::Td(TdUpdate::Auth(AuthPhase::Ready)));
+
+        assert_eq!(app.state().screen, Screen::Main);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Td(TdRequest::LoadChats { .. })]
+        ));
+        assert!(app.take_dirty());
+    }
+
+    #[test]
+    fn connection_update_is_stored_and_only_dirties_on_change() {
+        let mut app = App::new(boot_fixture());
+        app.take_dirty();
+
+        app.update(Action::Td(TdUpdate::Connection(ConnectionPhase::Ready)));
+        assert_eq!(app.state().connection, ConnectionPhase::Ready);
+        assert!(app.take_dirty());
+
+        app.update(Action::Td(TdUpdate::Connection(ConnectionPhase::Ready)));
+        assert!(!app.take_dirty());
+    }
+
+    #[test]
+    fn expiring_flood_wait_on_tick_dirties_once() {
+        let mut app = App::new(Boot {
+            has_credentials: true,
+            ..boot_fixture()
+        });
+        app.update(Action::TdResult(TdResult::AuthRequestDone {
+            outcome: Err(TdError::FloodWait { seconds: 1 }),
+        }));
+        app.take_dirty();
+        assert_eq!(app.state().auth.flood_wait_until, Some(Millis(1_000)));
+
+        app.update(Action::Tick { now: Millis(500) });
+        assert!(!app.take_dirty());
+
+        app.update(Action::Tick { now: Millis(1_000) });
+        assert_eq!(app.state().auth.flood_wait_until, None);
+        assert!(app.take_dirty());
     }
 
     #[test]

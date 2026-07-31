@@ -35,16 +35,6 @@
 //! patched in place), which is the simplest way to guarantee the file stays
 //! well-formed and keeps its comments after edits made only through
 //! `apply_patch`.
-//!
-//! `tgt-app` has no library target, so `main.rs`/`runtime_loop.rs` are the
-//! only possible reachability roots for a `pub` item here; T13 (this file)
-//! lands ahead of the task that wires `config::load`/`apply_patch`/`save`
-//! into boot and the `SaveConfig` effect (docs/plan.md T14), so until then
-//! the crate-level dead-code lint has nothing to consider these reachable
-//! from. `#![allow(dead_code)]` below is scoped to that gap, not a blanket
-//! excuse — every item it covers is exercised by this module's own tests.
-
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 

@@ -1,0 +1,6 @@
+{"Emit":{"Auth":"WaitTdlibParameters"}}
+{"Await":{"expect":{"Kind":"SetTdlibParameters"},"respond":{"Ok":"Ok"}}}
+{"Emit":{"Auth":"WaitPhoneNumber"}}
+{"Await":{"expect":{"Kind":"RequestQrCodeAuthentication"},"respond":{"Ok":"Ok"}}}
+{"Emit":{"Auth":{"WaitOtherDeviceConfirmation":{"link":"tg://login?token=AAEBAgMEBQYHCAkKCwwNDg8Q"}}}}
+{"Emit":{"Auth":"Ready"}}

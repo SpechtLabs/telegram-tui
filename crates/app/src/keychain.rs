@@ -1,14 +1,6 @@
 //! TDLib database encryption key, stored in the macOS Keychain via the
 //! `keyring` crate; generated on first run and never written to disk in
 //! plaintext (spec §9.3). Also the TDLib database directory itself.
-//!
-//! `tgt-app` has no library target, so `db_key`/`td_database_dir` have no
-//! reachability root until the task that wires TDLib startup (docs/plan.md
-//! T14+) calls them from `main.rs`/`td_runtime.rs`. `#![allow(dead_code)]`
-//! covers that gap; every item it silences is exercised by this module's
-//! own tests.
-
-#![allow(dead_code)]
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;

@@ -6,7 +6,7 @@ pub mod theme;
 pub mod view;
 
 use ratatui::Frame;
-use tgt_core::app::AppState;
+use tgt_core::app::{AppState, Screen};
 
 use crate::theme::Theme;
 
@@ -14,7 +14,15 @@ use crate::theme::Theme;
 // architecture.md §4.9's staging note calls for this exact arity until then.
 // T21/T23 add `cache: &mut LayoutCache` together with the real type.
 pub fn view(state: &AppState, theme: &Theme, f: &mut Frame) {
-    view::root::draw(state, theme, f);
+    match state.screen {
+        // The auth wizard owns the whole frame; it is a screen, not a pane.
+        Screen::Auth => view::auth::draw(state, theme, f),
+        // TODO(T50): `Screen::Consent` gets `view::consent::draw`. Until the
+        // consent screen exists nothing ever sets that screen (main.rs boots
+        // with `consent_needed: false`), so falling through to the shell is
+        // unreachable rather than wrong.
+        Screen::Consent | Screen::Main => view::root::draw(state, theme, f),
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +103,27 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn auth_screen_replaces_the_shell_entirely() {
+        let mut state = fixture_state();
+        state.screen = Screen::Auth;
+        state.auth.phase = AuthPhase::WaitTdlibParameters;
+        let theme = Theme::default_dark();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|f| view(&state, &theme, f)).unwrap();
+
+        let rendered = render_to_string(&terminal);
+        assert!(
+            rendered.contains("Starting Telegram client"),
+            "expected the auth wizard, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("CHATS"),
+            "the two-pane shell must not render behind the wizard:\n{rendered}"
+        );
     }
 
     #[test]
