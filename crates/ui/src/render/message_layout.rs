@@ -20,21 +20,39 @@
 //! Both callees contain their hazard; what lives here is the composition
 //! around them.
 //!
-//! ## Rails and alignment (spec §7.1)
+//! ## Rails and alignment (design-language §3)
 //!
 //! Incoming messages carry the rail `▏` in the sender's deterministic accent
-//! color as a left prefix on every body line, followed by one space, so the
-//! body occupies `width - 2` columns. Own (outgoing) messages are right
-//! aligned with a dim `rail_own` rail on the *right*: each wrapped line is
+//! color as a left prefix on **every** line of the block — header, reply
+//! quote, body, and every wrapped continuation — followed by one space, so
+//! the text occupies `width - 2` columns. Own (outgoing) messages are right
+//! aligned with a dim `rail_own` rail on the *right*: each line is
 //! left-padded so that `pad + text + " " + "▏"` fills exactly `width`
-//! columns. Headers carry no rail; an own message's header is right aligned
-//! to the body's right text edge (`width - 2`) so the two line up.
+//! columns. The rail is therefore an unbroken vertical bar down one side of
+//! the whole group, which is what tells one block from the next now that
+//! nothing is boxed.
 //!
 //! Below three columns there is no room for a rail, its space, and a column
 //! of text; such widths still lay out without panicking, but the lines can
 //! exceed the requested width. So can a single grapheme wider than the inner
 //! width (`wrap_spans` gives it a line of its own) — there is no narrower way
 //! to render either.
+//!
+//! ## The receipt gutter
+//!
+//! A read receipt renders *inline*, appended to the last line of an own
+//! message (design-language §3: it never gets a row of its own and never
+//! forms a column of ticks at the pane edge). The marker is live state that
+//! `LayoutKey` does not cover, so the view appends it per frame with
+//! [`append_marker_inline`] — but the room it needs has to exist in the
+//! cached line already, or the row would grow past the pane.
+//!
+//! Hence [`RECEIPT_COLS`]: an own message wraps its text three columns
+//! narrower than an incoming one (one separating space plus the widest
+//! marker, `✓✓`), while [`place`] still right-aligns to the full inner
+//! width. The reserved columns show up as padding on the left of the row
+//! until the view spends them on the marker, so nothing about the alignment
+//! changes when a receipt does or doesn't apply.
 //!
 //! ## Grouping
 //!
@@ -109,37 +127,35 @@
 //! task; until then messages render with spoilers hidden regardless of
 //! `ConversationState`, matching today's (pre-T33) on-screen behavior.
 //!
-//! ## File cards: the static/dynamic split (T37)
+//! ## Attachments are one line, rendered per frame (T62)
 //!
 //! [`layout_message`]'s output is cached (`render::cache`) keyed on
 //! `(message_id, width, theme_generation, spoilers_revealed)`. Download and
 //! upload progress change none of those, so a card that baked "34%" into the
 //! cached lines would freeze at whatever percentage was on screen the first
-//! time that message got laid out — the exact same staleness hazard the
-//! module docs above already call out for reactions and read receipts (see
-//! `view::conversation::append_reactions`), solved the same way: split the
-//! content into a cacheable part and a per-frame part.
+//! time that message got laid out.
 //!
-//! - [`file_card`] (private, called from [`body`]) renders only what
-//!   `(message_id, width, theme_generation)` can never invalidate: the kind
-//!   icon, the file name, and the size. This is what ends up in the cached
-//!   lines. It carries no download affordance and no progress — as of T37 a
-//!   file message's cached row reads `📎 name · 2.4 MB`, not `📎 name · 2.4
-//!   MB · ⏎ download` (that line used to include the affordance; see the
-//!   T37 commit for the exact test/snapshot deltas this caused).
-//! - [`file_card_line`] and [`file_card_upload_line`] are pure functions of
-//!   `(content, live file/upload state, theme)` — no cache involved. They
-//!   render the *complete* card line (icon, name, size or progress bar, and
-//!   the `⏎ download` / `⏎ open` affordance) fresh from whatever
-//!   `MediaState` holds right now. They are not called from anywhere in this
-//!   module or from the cache-filling path; they exist for the view layer to
-//!   call once per frame, the same way `append_reactions` re-derives its row
-//!   every frame instead of trusting the cache.
+//! T37 solved that by splitting the card in two: a cached identity line plus
+//! a per-frame status line. Both named the file, so a photo rendered as two
+//! rows saying nearly the same thing, and users read it as a bug.
+//! design-language §4 settles it — **one line per attachment, never two** —
+//! and since the live affordance is the part no cache key covers, that one
+//! line is the per-frame one.
 //!
-//! `view::conversation` calls them (T40), appending the live line under the
-//! cached identity line rather than replacing it — so a file message renders
-//! as two rows. That module's "File cards: two lines, on purpose" records
-//! why, and what it would take to collapse them into one.
+//! So [`body`] contributes **no** file-identity line at all: a file-bearing
+//! message's cached lines are its header, its reply quote, and its caption,
+//! nothing else. [`file_card_line`] and [`file_card_upload_line`] are the
+//! single source for the attachment row — pure functions of `(content, live
+//! file/upload state, theme)` rendering icon, name, size or dimensions, and
+//! the `⏎ download` / `⏎ open` / progress-bar affordance fresh from whatever
+//! `MediaState` holds right now. Neither is called from this module or from
+//! the cache-filling path; `view::conversation` calls one of them once per
+//! frame and rails the result with [`place_row`].
+//!
+//! A downloaded photo's line is where an inline image later replaces the
+//! text outright (design-language §6). That seam lives in
+//! `view::conversation`, because an `ImageArea` has to outlive the frame
+//! that draws it and nothing in this pure module can hold one.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -158,11 +174,16 @@ use crate::theme::Theme;
 /// same-sender messages within this window share one header line.
 pub const GROUP_WINDOW_SECS: i64 = 300;
 
-/// The accent rail (U+258F LEFT ONE EIGHTH BLOCK), spec §7.1.
+/// The accent rail (U+258F LEFT ONE EIGHTH BLOCK), design-language §3.
 const RAIL: &str = "▏";
 
-/// Columns the rail and its adjoining space take on every body line.
+/// Columns the rail and its adjoining space take on every line of a block.
 const RAIL_COLS: u16 = 2;
+
+/// Columns an own message keeps free at the end of every line so the view can
+/// append a read receipt inline: one separating space plus the widest marker
+/// (`✓✓`). See the module docs' "The receipt gutter".
+pub const RECEIPT_COLS: u16 = 3;
 
 /// Per-call rendering choices [`layout_message_opts`] cannot infer from
 /// `(msg, width, theme)` alone. See the module docs' "Reveal state and the
@@ -230,22 +251,26 @@ fn layout(
     with_header: bool,
     spoilers_revealed: bool,
 ) -> Vec<Line<'static>> {
-    // Every body line reserves the rail column plus its separating space, so
-    // the text block is `width - 2` wide. `wrap_spans` treats 0 as 1, but the
+    // Every line reserves the rail column plus its separating space, so the
+    // text block is `width - 2` wide. `wrap_spans` treats 0 as 1, but the
     // padding arithmetic below reads more clearly with the floor applied here.
     let inner = width.saturating_sub(RAIL_COLS).max(1);
     let own = msg.is_outgoing;
-    let rail_style = if own {
-        Style::new().fg(theme.rail_own)
+    // Own lines wrap narrower still, leaving the view room to append a
+    // receipt inline (module docs: "The receipt gutter"). Alignment is
+    // unaffected — `place` right-aligns to `inner` either way.
+    let text_width = if own {
+        inner.saturating_sub(RECEIPT_COLS).max(1)
     } else {
-        Style::new().fg(theme.sender_color(msg.sender.color_seed()))
+        inner
     };
+    let rail = rail_style(msg, theme);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if with_header {
-        for line in wrap_paragraphs(header_spans(msg, theme), inner) {
-            lines.push(place(line, inner, own, None));
+        for line in wrap_paragraphs(header_spans(msg, theme), text_width) {
+            lines.push(place(line, inner, own, Some(rail)));
         }
     }
 
@@ -261,20 +286,114 @@ fn layout(
         )];
         // Pre-truncated upstream to a single line; wrapping and keeping the
         // first line enforces that at this width too.
-        if let Some(line) = wrap_spans(spans, inner).into_iter().next() {
-            lines.push(place(line, inner, own, Some(rail_style)));
+        if let Some(line) = wrap_spans(spans, text_width).into_iter().next() {
+            lines.push(place(line, inner, own, Some(rail)));
         }
     }
 
-    for line in body(msg, inner, theme, spoilers_revealed) {
-        lines.push(place(line, inner, own, Some(rail_style)));
+    for line in body(msg, text_width, theme, spoilers_revealed) {
+        lines.push(place(line, inner, own, Some(rail)));
     }
 
     lines
 }
 
-/// "Sender · HH:MM" plus a dim " (edited)" marker. The sender takes its
-/// deterministic accent color; separator and time are muted.
+/// The rail color for `msg`'s block: the sender's deterministic hue for an
+/// incoming message, the dim `rail_own` for an own one (design-language §3:
+/// an own rail is never brighter than the body it borders).
+///
+/// Public because the view draws per-frame rows — the attachment line, the
+/// reaction row — that have to carry the same rail as the cached lines they
+/// sit under, or the bar breaks halfway down a block.
+pub fn rail_style(msg: &MessageView, theme: &Theme) -> Style {
+    if msg.is_outgoing {
+        Style::new().fg(theme.rail_own)
+    } else {
+        Style::new().fg(theme.sender_color(msg.sender.color_seed()))
+    }
+}
+
+/// Rail and align one row of per-frame content (the attachment line, a
+/// reaction row) exactly as [`layout_message`] does its cached lines, so a
+/// block's rail is one unbroken bar regardless of which half of the
+/// static/dynamic split drew any given row.
+///
+/// `width` is the pane width, not the inner text width — the same number the
+/// cached layout was built at.
+pub fn place_row(content: Vec<Span<'static>>, width: u16, own: bool, rail: Style) -> Line<'static> {
+    let inner = width.saturating_sub(RAIL_COLS).max(1);
+    place(Line::from(content), inner, own, Some(rail))
+}
+
+/// Append `marker` to the end of `line`'s text, inside `width` — never past
+/// it, and never as a row of its own (design-language §3: receipts are
+/// inline; a column of ticks at the pane edge is the thing this replaces).
+///
+/// On an own (right-railed) row the marker goes *before* the trailing rail,
+/// so the rail keeps the last column, and the space it needs comes out of
+/// the row's left padding — the gutter [`RECEIPT_COLS`] reserved when the
+/// text was wrapped. On any other row the marker is simply appended.
+///
+/// The row therefore keeps its exact width. The one case that cannot be
+/// honored is a line already at or past `width` (a single grapheme wider
+/// than the pane, which `wrap_spans` cannot break); the marker is appended
+/// anyway there and the pane clips it, which is still preferable to giving
+/// it a row.
+pub fn append_marker_inline(line: &mut Line<'static>, marker: Span<'static>, width: u16) {
+    let mut spans = std::mem::take(&mut line.spans);
+
+    // An own row ends with `" "` + rail; the marker belongs ahead of that pair.
+    let rail_suffix = if spans.len() >= 2 && spans[spans.len() - 1].content.as_ref() == RAIL {
+        Some(spans.split_off(spans.len() - 2))
+    } else {
+        None
+    };
+
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 4);
+    if let Some(rail) = rail_suffix {
+        // `place` emits right-alignment padding as one leading unstyled span
+        // of spaces. Drop it and recompute: the marker is paid for out of
+        // that padding rather than by growing the row.
+        if spans.first().is_some_and(is_padding_span) {
+            spans.remove(0);
+        }
+        let content_cols: u16 = spans.iter().map(|s| s.content.width() as u16).sum();
+        let marker_cols = marker.content.width() as u16;
+        let pad = width.saturating_sub(content_cols + marker_cols + 1 + RAIL_COLS);
+        if pad > 0 {
+            out.push(Span::raw(" ".repeat(pad as usize)));
+        }
+        out.extend(spans);
+        out.push(Span::raw(" "));
+        out.push(marker);
+        out.extend(rail);
+    } else {
+        out.extend(spans);
+        out.push(Span::raw(" "));
+        out.push(marker);
+    }
+
+    line.spans = out;
+}
+
+/// Whether `span` is alignment padding [`place`] inserted: unstyled, and
+/// nothing but spaces. A blockquote's `▎ ` prefix is styled and so never
+/// matches; a `pre` block's unstyled indent only ever follows the padding
+/// span on an own row, since the reserved gutter guarantees one.
+fn is_padding_span(span: &Span<'static>) -> bool {
+    span.style == Style::default()
+        && !span.content.is_empty()
+        && span.content.chars().all(|c| c == ' ')
+}
+
+/// "Sender · HH:MM" plus a dim " (edited)" marker.
+///
+/// design-language §2's three weights, on one line: the sender is secondary
+/// (its deterministic color, **bold**), the separator and the time are
+/// tertiary (`text_muted`). A timestamp that reads as loudly as the message
+/// under it is what makes a chat pane look like log output, so the bold on
+/// the name is doing real work here — it is the contrast that pushes the
+/// time back.
 ///
 /// A grouped message has no header, so it shows no edited marker either — a
 /// consequence of grouping rather than an oversight.
@@ -282,7 +401,9 @@ fn header_spans(msg: &MessageView, theme: &Theme) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
             msg.sender_name.clone(),
-            Style::new().fg(theme.sender_color(msg.sender.color_seed())),
+            Style::new()
+                .fg(theme.sender_color(msg.sender.color_seed()))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", Style::new().fg(theme.text_muted)),
         Span::styled(format_time_utc(msg.date), Style::new().fg(theme.text_muted)),
@@ -305,6 +426,12 @@ fn format_time_utc(unix_secs: i64) -> String {
 
 /// Content-dependent body lines, wrapped to `inner` columns but not yet
 /// railed or aligned.
+///
+/// File-bearing content contributes **only its caption** here: the
+/// attachment's own line is the view's per-frame [`file_card_line`] /
+/// [`file_card_upload_line`], never a cached one (module docs:
+/// "Attachments are one line, rendered per frame"). An audio message, which
+/// has no caption in the model, therefore contributes nothing at all.
 fn body(
     msg: &MessageView,
     inner: u16,
@@ -318,17 +445,9 @@ fn body(
         MessageContent::Photo { caption, .. }
         | MessageContent::Video { caption, .. }
         | MessageContent::Document { caption, .. } => {
-            let (icon, name, size) =
-                file_card_identity(&msg.content).expect("Photo/Video/Document have a file card");
-            let mut lines = file_card(icon, &name, size, inner, theme);
-            lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
-            lines
+            text_lines(caption, base, inner, theme, spoilers_revealed)
         }
-        MessageContent::Audio { .. } => {
-            let (icon, name, size) =
-                file_card_identity(&msg.content).expect("Audio has a file card");
-            file_card(icon, &name, size, inner, theme)
-        }
+        MessageContent::Audio { .. } => Vec::new(),
         MessageContent::Sticker { emoji } => {
             wrap_paragraphs(vec![Span::styled(emoji.clone(), base)], inner)
         }
@@ -596,35 +715,7 @@ fn blockquote_lines(
     .collect()
 }
 
-/// The **cacheable** half of a file card (see the module docs' "File cards:
-/// the static/dynamic split"): icon, name, and size, with no download
-/// affordance and no progress. `size` is `None` for content with no size in
-/// the model (`Photo`); everything else always has one. One line at any sane
-/// width. Wraps to `inner` like any other body content, though a file name
-/// long enough to need it would be unusual.
-///
-/// This is deliberately *not* `📎 name · 2.4 MB · ⏎ download` any more — the
-/// affordance moved to [`file_card_line`], which a caller re-derives every
-/// frame instead of trusting the cache. See the module docs for why.
-fn file_card(
-    icon: &str,
-    name: &str,
-    size: Option<u64>,
-    inner: u16,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut label = format!("{icon} {name}");
-    if let Some(size) = size {
-        label.push_str(" · ");
-        label.push_str(&format_size(size));
-    }
-    wrap_paragraphs(
-        vec![Span::styled(label, Style::new().fg(theme.text))],
-        inner,
-    )
-}
-
-/// Binary-prefix size for the file card, one decimal above a kilobyte.
+/// Binary-prefix size for the attachment line, one decimal above a kilobyte.
 fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -641,34 +732,36 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// The kind icon, display name, and size (`None` for content with no size in
-/// the model) for a file-bearing message — `None` for content with no file
-/// card at all (`Text`, `Sticker`, `Unsupported`). Shared by the cached
-/// static card ([`file_card`], via [`body`]) and the dynamic
-/// [`file_card_line`] / [`file_card_upload_line`] so the two renderings can
-/// never disagree on what a message's name or icon is.
+/// The kind icon, display name, and middle detail of a file-bearing
+/// message's one attachment line — `None` for content that has no attachment
+/// (`Text`, `Sticker`, `Unsupported`).
+///
+/// The detail is the humanized size for anything the model gives a size, and
+/// a photo's `323×94` dimensions otherwise (design-language §4 shows both
+/// forms). Shared by [`file_card_line`] and [`file_card_upload_line`] so the
+/// download and upload renderings can never disagree on a message's name.
 ///
 /// Icons: 📎 document, 🖼 photo, 🎞 video, 🎵 audio (spec §7.1 uses 📎 for
 /// the one example it shows; the others are this task's addition).
-fn file_card_identity(content: &MessageContent) -> Option<(&'static str, String, Option<u64>)> {
+fn file_card_identity(content: &MessageContent) -> Option<(&'static str, String, Option<String>)> {
     match content {
         MessageContent::Text(_)
         | MessageContent::Sticker { .. }
         | MessageContent::Unsupported { .. } => None,
         // A photo has no file name or size in the model; its dimensions are
-        // the useful identifier until T38 renders it inline.
+        // the useful detail until a graphics protocol renders it inline.
         MessageContent::Photo { width, height, .. } => {
-            Some(("🖼", format!("photo {width}×{height}"), None))
+            Some(("🖼", "photo".to_string(), Some(format!("{width}×{height}"))))
         }
         MessageContent::Video {
             file_name, size, ..
-        } => Some(("🎞", file_name.clone(), Some(*size))),
+        } => Some(("🎞", file_name.clone(), Some(format_size(*size)))),
         MessageContent::Audio {
             file_name, size, ..
-        } => Some(("🎵", file_name.clone(), Some(*size))),
+        } => Some(("🎵", file_name.clone(), Some(format_size(*size)))),
         MessageContent::Document {
             file_name, size, ..
-        } => Some(("📎", file_name.clone(), Some(*size))),
+        } => Some(("📎", file_name.clone(), Some(format_size(*size)))),
     }
 }
 
@@ -708,59 +801,54 @@ fn download_affordance_span(theme: &Theme) -> Span<'static> {
     Span::styled("⏎ download", Style::new().fg(theme.text_muted))
 }
 
-/// Dynamic, per-frame companion to the cached [`file_card`] line — see the
-/// module docs' "File cards: the static/dynamic split". Not called from
-/// [`layout_message`] or the cache-filling path; a caller (the conversation
-/// view, T40) re-derives this every frame from live `MediaState`, the same
-/// way `view::conversation::append_reactions` re-derives its row instead of
-/// trusting the cache.
+/// **The** attachment line (design-language §4: one line per attachment,
+/// never two), rendered fresh every frame from live `MediaState`. Not called
+/// from [`layout_message`] or the cache-filling path — see the module docs'
+/// "Attachments are one line, rendered per frame" for why the cached layout
+/// contributes nothing here.
 ///
-/// Returns `None` for message content with no file card (`Text`, `Sticker`,
+/// Returns `None` for message content with no attachment (`Text`, `Sticker`,
 /// `Unsupported`) — nothing to render.
 ///
 /// `file` reflects [`FileSnapshot`] lookup by the content's `file_id`,
 /// performed by the caller (this function has no access to `MediaState`):
 ///
-/// - `None` (no download ever started): `📎 name · 2.4 MB · ⏎ download`.
-/// - `Some(f)` with `f.is_downloading`: `📎 name · ▓▓▓░░░░░░░ 34%`
+/// - `None` (no download ever started): `📎 spec.pdf · 2.4 MB · ⏎ download`.
+/// - `Some(f)` with `f.is_downloading`: `📎 spec.pdf · 2.4 MB · ▓▓▓░░░░░░░ 34%`
 ///   (10-cell bar from `downloaded_size / expected_size`; `expected_size ==
 ///   0` renders the indeterminate `…` in place of the bar and percentage).
-/// - `Some(f)` with `f.is_completed`: `📎 name · 2.4 MB · ⏎ open`, the
+/// - `Some(f)` with `f.is_completed`: `📎 spec.pdf · 2.4 MB · ⏎ open`, the
 ///   affordance in `theme.accent`.
 /// - `Some(f)` otherwise (a snapshot exists — e.g. a cancelled download —
 ///   but is neither downloading nor complete): falls back to the "not
 ///   downloaded" `⏎ download` rendering.
+///
+/// A photo's middle detail is its `323×94` dimensions rather than a size,
+/// which the model does not carry for photos.
 pub fn file_card_line(
     content: &MessageContent,
     file: Option<&FileSnapshot>,
     theme: &Theme,
 ) -> Option<Line<'static>> {
-    let (icon, name, size) = file_card_identity(content)?;
+    let (icon, name, detail) = file_card_identity(content)?;
     let text_style = Style::new().fg(theme.text);
     let muted_style = Style::new().fg(theme.text_muted);
 
     let mut spans = vec![Span::styled(format!("{icon} {name}"), text_style)];
+    if let Some(detail) = detail {
+        spans.push(Span::styled(" · ", muted_style));
+        spans.push(Span::styled(detail, muted_style));
+    }
+    spans.push(Span::styled(" · ", muted_style));
 
     if let Some(file) = file
         && file.is_downloading
     {
-        spans.push(Span::styled(" · ", muted_style));
         spans.push(Span::styled(
             progress_bar_text(file.downloaded_size, file.expected_size),
             text_style,
         ));
-        return Some(Line::from(spans));
-    }
-
-    if let Some(size) = size {
-        spans.push(Span::styled(
-            format!(" · {}", format_size(size)),
-            text_style,
-        ));
-    }
-    spans.push(Span::styled(" · ", muted_style));
-
-    if file.is_some_and(|f| f.is_completed) {
+    } else if file.is_some_and(|f| f.is_completed) {
         spans.push(Span::styled("⏎ open", Style::new().fg(theme.accent)));
     } else {
         spans.push(download_affordance_span(theme));
@@ -779,13 +867,13 @@ pub fn file_card_line(
 /// distinction. Uses the same 10-cell bar as [`file_card_line`] so the two
 /// look alike; `progress.total == 0` renders the indeterminate `…`.
 ///
-/// Returns `None` for content with no file card, like [`file_card_line`].
+/// Returns `None` for content with no attachment, like [`file_card_line`].
 pub fn file_card_upload_line(
     content: &MessageContent,
     progress: &UploadProgress,
     theme: &Theme,
 ) -> Option<Line<'static>> {
-    let (_icon, name, _size) = file_card_identity(content)?;
+    let (_icon, name, _detail) = file_card_identity(content)?;
     let text_style = Style::new().fg(theme.text);
     let muted_style = Style::new().fg(theme.text_muted);
 
@@ -1051,6 +1139,8 @@ mod tests {
     }
 
     /// The text of every span carrying `modifier`, flattened across lines.
+    /// Callers pass `&lines[1..]` when they mean "the body", since the
+    /// header's sender name is bold by design (design-language §2).
     fn spans_with_modifier(lines: &[Line<'static>], modifier: Modifier) -> Vec<String> {
         lines
             .iter()
@@ -1072,7 +1162,8 @@ mod tests {
         // Width 20 leaves 18 columns of text.
         let lines = layout_message(&msg, 20, &theme);
 
-        assert_eq!(line_text(&lines[0]), "Alice · 22:13");
+        // The rail runs the whole block, header included (design-language §3).
+        assert_eq!(line_text(&lines[0]), "▏ Alice · 22:13");
         assert!(lines.len() > 2, "expected the body to wrap: {lines:#?}");
 
         let sender_style = Style::new().fg(theme.sender_color(3));
@@ -1112,7 +1203,10 @@ mod tests {
         );
         let lines = layout_message(&msg, 80, &theme());
 
-        assert_eq!(spans_with_modifier(&lines, Modifier::BOLD), vec!["bold"]);
+        assert_eq!(
+            spans_with_modifier(&lines[1..], Modifier::BOLD),
+            vec!["bold"]
+        );
         assert_eq!(without_rail(&lines[1]), "🙂 hello bold world");
     }
 
@@ -1126,9 +1220,10 @@ mod tests {
         let width = 40;
         let lines = layout_message(&msg, width, &theme);
 
-        // The header ends at the body's right text edge, width - 2.
-        assert_eq!(lines[0].width(), width as usize - 2);
-        assert!(line_text(&lines[0]).ends_with("You · 22:13"));
+        // Header and body both end flush against the right rail, so the rail
+        // is one unbroken bar down the block.
+        assert_eq!(lines[0].width(), width as usize);
+        assert!(line_text(&lines[0]).ends_with("You · 22:13 ▏"));
 
         let body = &lines[1];
         assert_eq!(body.width(), width as usize);
@@ -1170,8 +1265,8 @@ mod tests {
         let lines = layout_message(&msg, 40, &theme());
 
         assert_eq!(without_rail(&lines[1]), "short");
-        assert!(spans_with_modifier(&lines, Modifier::BOLD).is_empty());
-        assert!(spans_with_modifier(&lines, Modifier::ITALIC).is_empty());
+        assert!(spans_with_modifier(&lines[1..], Modifier::BOLD).is_empty());
+        assert!(spans_with_modifier(&lines[1..], Modifier::ITALIC).is_empty());
     }
 
     /// An entity endpoint inside a surrogate pair (offsets.rs row 8) must take
@@ -1188,7 +1283,7 @@ mod tests {
         );
         let lines = layout_message(&msg, 40, &theme());
 
-        assert!(spans_with_modifier(&lines, Modifier::BOLD).is_empty());
+        assert!(spans_with_modifier(&lines[1..], Modifier::BOLD).is_empty());
         assert_eq!(without_rail(&lines[1]), "🙂 hi");
     }
 
@@ -1289,16 +1384,16 @@ mod tests {
         assert_eq!(line_text(&lines[1]), "▏ ↳ …");
     }
 
-    // T37: the cached card line lost its `⏎ download` affordance (it moved
-    // to `file_card_line`, recomputed per frame — see the module docs' "File
-    // cards: the static/dynamic split"). These three assertions changed
-    // shape from pre-T37 accordingly: `document_renders_a_file_card_line`
-    // and `document_caption_follows_the_card` dropped the trailing
-    // `· ⏎ download`, and `photo_card_shows_dimensions` additionally picked
-    // up the 🖼 icon (photos previously shared the document's 📎).
+    // T62: the cached layout carries **no** file-identity line at all. The
+    // whole attachment is one per-frame row (`file_card_line`), because the
+    // affordance and progress it has to show are live state no `LayoutKey`
+    // covers — see the module docs' "Attachments are one line, rendered per
+    // frame". Pre-T62 these three tests asserted a cached `📎 name · size`
+    // row; they now assert its absence, which is the property that keeps a
+    // file from being named twice on screen.
 
     #[test]
-    fn document_renders_a_file_card_line() {
+    fn cached_layout_has_no_file_identity_line() {
         let msg = message(MessageContent::Document {
             file_id: FileId(7),
             file_name: "architecture.pdf".to_string(),
@@ -1310,12 +1405,12 @@ mod tests {
         });
         let lines = layout_message(&msg, 60, &theme());
 
-        assert_eq!(lines.len(), 2);
-        assert_eq!(line_text(&lines[1]), "▏ 📎 architecture.pdf · 2.4 MB");
+        assert_eq!(lines.len(), 1, "only the header: {:#?}", rendered(&lines));
+        assert_eq!(line_text(&lines[0]), "▏ Alice · 22:13");
     }
 
     #[test]
-    fn document_caption_follows_the_card() {
+    fn document_caption_is_the_only_cached_body_line() {
         let msg = message(MessageContent::Document {
             file_id: FileId(7),
             file_name: "notes.txt".to_string(),
@@ -1327,13 +1422,20 @@ mod tests {
         });
         let lines = layout_message(&msg, 60, &theme());
 
-        assert_eq!(line_text(&lines[1]), "▏ 📎 notes.txt · 512 B");
-        assert_eq!(line_text(&lines[2]), "▏ have a look");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[1]), "▏ have a look");
+        assert!(
+            !rendered(&lines).contains("notes.txt"),
+            "the file name belongs to the per-frame row alone: {:#?}",
+            rendered(&lines)
+        );
     }
 
+    /// A photo's dimensions are its middle detail on the one attachment
+    /// line (design-language §4's `🖼 photo · 323×94`), never a cached row.
     #[test]
-    fn photo_card_shows_dimensions() {
-        let msg = message(MessageContent::Photo {
+    fn photo_line_shows_dimensions_as_its_detail() {
+        let content = MessageContent::Photo {
             file_id: FileId(8),
             width: 800,
             height: 600,
@@ -1341,9 +1443,14 @@ mod tests {
                 text: String::new(),
                 entities: Vec::new(),
             },
-        });
-        let lines = layout_message(&msg, 60, &theme());
-        assert_eq!(line_text(&lines[1]), "▏ 🖼 photo 800×600");
+        };
+        assert_eq!(
+            layout_message(&message(content.clone()), 60, &theme()).len(),
+            1
+        );
+
+        let line = file_card_line(&content, None, &theme()).expect("photos have an attachment");
+        assert_eq!(line_text(&line), "🖼 photo · 800×600 · ⏎ download");
     }
 
     #[test]
@@ -1834,7 +1941,7 @@ mod tests {
         msg.is_edited = true;
         let lines = layout_message(&msg, 40, &theme());
 
-        assert_eq!(line_text(&lines[0]), "Alice · 22:13 (edited)");
+        assert_eq!(line_text(&lines[0]), "▏ Alice · 22:13 (edited)");
     }
 
     #[test]
@@ -1843,8 +1950,34 @@ mod tests {
         let msg = text_message("x", vec![]);
         assert_eq!(
             line_text(&layout_message(&msg, 40, &theme())[0]),
-            "Alice · 22:13"
+            "▏ Alice · 22:13"
         );
+    }
+
+    /// design-language §2: the sender is secondary (its color, bold), the
+    /// separator and time tertiary (`text_muted`). Bolding the name is what
+    /// pushes the timestamp back into the background.
+    #[test]
+    fn header_sender_is_bold_and_the_time_is_muted() {
+        let theme = theme();
+        let lines = layout_message(&text_message("x", vec![]), 40, &theme);
+        let header = &lines[0];
+
+        let name = header
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "Alice")
+            .expect("no sender span");
+        assert_eq!(name.style.fg, Some(theme.sender_color(3)));
+        assert!(name.style.add_modifier.contains(Modifier::BOLD));
+
+        for span in header
+            .spans
+            .iter()
+            .filter(|s| matches!(s.content.as_ref(), " · " | "22:13"))
+        {
+            assert_eq!(span.style, Style::new().fg(theme.text_muted));
+        }
     }
 
     #[test]
@@ -1853,7 +1986,7 @@ mod tests {
         msg.date = i64::MIN;
         assert_eq!(
             line_text(&layout_message(&msg, 40, &theme())[0]),
-            "Alice · --:--"
+            "▏ Alice · --:--"
         );
     }
 
@@ -2000,7 +2133,7 @@ mod tests {
         let file = file_snapshot(0, 0, true, false);
         let line =
             file_card_line(&content, Some(&file), &theme()).expect("document has a file card");
-        assert_eq!(line_text(&line), "📎 architecture.pdf · …");
+        assert_eq!(line_text(&line), "📎 architecture.pdf · 2.4 MB · …");
     }
 
     #[test]
@@ -2061,6 +2194,75 @@ mod tests {
         assert!(line_text(&file_card_line(&video, None, &theme).unwrap()).starts_with("🎞 "));
         assert!(line_text(&file_card_line(&audio, None, &theme).unwrap()).starts_with("🎵 "));
         assert!(line_text(&file_card_line(&photo, None, &theme).unwrap()).starts_with("🖼 "));
+    }
+
+    // --- inline markers and per-frame rows (T62) --------------------------
+
+    /// The receipt is paid for out of the gutter `RECEIPT_COLS` reserved
+    /// when the own message was wrapped, so the row keeps its exact width
+    /// and the rail keeps the last column.
+    #[test]
+    fn inline_marker_spends_the_gutter_and_keeps_the_width() {
+        let theme = theme();
+        let mut msg = text_message("done", vec![]);
+        msg.is_outgoing = true;
+        msg.sender_name = "You".to_string();
+
+        for width in [24u16, 40, 80, 140] {
+            let mut lines = layout_message(&msg, width, &theme);
+            let before = lines.last().unwrap().width();
+            append_marker_inline(
+                lines.last_mut().unwrap(),
+                Span::styled("✓✓", Style::new().fg(theme.text_muted)),
+                width,
+            );
+            let last = lines.last().unwrap();
+            assert_eq!(
+                last.width(),
+                before,
+                "width {width}: the marker grew the row"
+            );
+            assert_eq!(line_text(last).trim_start(), "done ✓✓ ▏");
+            assert_eq!(
+                last.spans.last().unwrap().content.as_ref(),
+                RAIL,
+                "the rail keeps the last column"
+            );
+        }
+    }
+
+    /// A left-aligned (incoming) row has no gutter and no rail to preserve,
+    /// so the marker simply follows the text.
+    #[test]
+    fn inline_marker_on_an_incoming_row_appends_at_the_end() {
+        let theme = theme();
+        let mut lines = layout_message(&text_message("hi", vec![]), 40, &theme);
+        append_marker_inline(
+            lines.last_mut().unwrap(),
+            Span::styled("✗", Style::new().fg(theme.danger)),
+            40,
+        );
+        assert_eq!(line_text(lines.last().unwrap()), "▏ hi ✗");
+    }
+
+    /// `place_row` gives a per-frame row the same rail and alignment the
+    /// cached lines carry, so a block's rail never breaks mid-way down.
+    #[test]
+    fn place_row_matches_the_cached_rail_and_alignment() {
+        let theme = theme();
+        let content = || {
+            vec![Span::styled(
+                "👍 3".to_string(),
+                Style::new().fg(theme.accent),
+            )]
+        };
+
+        let incoming = place_row(content(), 40, false, Style::new().fg(theme.rail_other));
+        assert_eq!(line_text(&incoming), "▏ 👍 3");
+
+        let own = place_row(content(), 40, true, Style::new().fg(theme.rail_own));
+        assert_eq!(own.width(), 40);
+        assert!(line_text(&own).ends_with("👍 3 ▏"));
     }
 
     #[test]

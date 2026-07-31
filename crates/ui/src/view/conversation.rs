@@ -51,38 +51,32 @@
 //!    the real content still sits at the bottom of the pane instead of the
 //!    top.
 //!
-//! ## File cards: two lines, on purpose
+//! ## The per-frame half of a block (T62)
 //!
-//! A file-bearing message renders two rows, not one (T40's v1 look):
+//! `LayoutKey` is `(message_id, width, theme_generation, spoilers_revealed)`.
+//! Three things a message shows change without touching any of those, so
+//! none of them may live in a cached line: its reactions, its read receipt,
+//! and an attachment's download state. All three are drawn here instead,
+//! once per frame, on top of the block the cache handed back.
 //!
-//! ```text
-//! 📎 spec.pdf · 2.4 MB          ← cached identity line (message_layout::file_card)
-//! 📎 spec.pdf · ⏎ download      ← per-frame status line (file_card_line)
-//! ```
+//! - **Attachments** are exactly one row (design-language §4). The cached
+//!   layout contributes no file-identity line at all now, so
+//!   [`append_attachment`] is the only thing that draws one and there is
+//!   nothing to render twice. It slots in above the caption, where the media
+//!   belongs, and carries the block's rail like every other row.
+//! - **Reactions** get their own row under the block ([`append_reactions`]).
+//! - **Receipts** never get a row. [`append_receipt`] appends the marker to
+//!   the last row the block already has, spending the gutter
+//!   `message_layout::RECEIPT_COLS` reserved for exactly this (see that
+//!   module's "The receipt gutter"). A column of ticks down the pane edge is
+//!   the defect this replaced.
 //!
-//! The cached line can never carry the affordance or a progress bar:
-//! `LayoutKey` is `(message_id, width, theme_generation, spoilers_revealed)`
-//! and download progress changes none of them, so anything live baked into
-//! it would freeze at whatever it read the first time that message was laid
-//! out (`render::message_layout`'s "File cards: the static/dynamic split").
-//! Suppressing the cached line instead would mean re-laying-out the whole
-//! message every frame — the one thing the cache exists to avoid. So the
-//! live line is appended below it, like reactions and receipts, and the
-//! name is repeated. A single-line card needs the cache key to grow a
-//! "has a live suffix" notion; that is `cache.rs`'s to add, not this file's.
-//!
-//! Inline images (T38's `render::image::ImageArea`) are not wired here:
-//! `ImageArea` is per-message mutable state that has to outlive a frame, and
-//! this view owns nothing that lives that long — only the `LayoutCache` it
-//! is handed does. Photos therefore render as placeholder cards, which spec
-//! §8.3 requires to always work anyway. See the `T55/polish` marker below.
-//!
-//! ## Deferred seams
-//!
-//! Selection highlighting (T26) is still out of scope for this milestone:
-//! [`apply_selection_highlight`] stays an identity function, called from the
-//! one place each content row is built, ready for a later task to fill in
-//! without re-deriving the walk.
+//! Inline images (T38's `render::image::ImageArea`) are still not wired
+//! here: `ImageArea` is per-message mutable state that has to outlive a
+//! frame, and this view owns nothing that lives that long — only the
+//! `LayoutCache` it is handed does. A downloaded photo therefore renders as
+//! its §4 line, which spec §8.3 requires to always work anyway. The seam
+//! where the image replaces that line is marked in [`append_attachment`].
 //!
 //! ## Search-hit highlighting (T47)
 //!
@@ -119,12 +113,12 @@ use tgt_core::state::conversation::{ConversationState, Scroll};
 use tgt_core::state::focus::Focus;
 use tgt_core::state::media::MediaState;
 use tgt_core::state::search::ChatSearchState;
-use unicode_width::UnicodeWidthStr;
 
 use crate::render::cache::{LayoutCache, LayoutKey};
 use crate::render::hit::HitMap;
 use crate::render::message_layout::{
-    LayoutOptions, file_card_line, file_card_upload_line, groups_with, layout_message_opts,
+    LayoutOptions, append_marker_inline, file_card_line, file_card_upload_line, groups_with,
+    layout_message_opts, place_row, rail_style,
 };
 use crate::theme::Theme;
 
@@ -339,23 +333,24 @@ fn build_window(
             msg_lines.truncate(keep);
         }
 
-        // Reactions and receipts are appended here, per frame, after the
-        // cache lookup — never folded into the cached lines themselves.
-        // Both can change (a reaction toggled, `last_read_outbox` advancing)
+        // The attachment line, reactions, and the receipt are drawn here,
+        // per frame, on top of what the cache handed back — never folded
+        // into the cached lines themselves. All three change (a download
+        // progresses, a reaction is toggled, `last_read_outbox` advances)
         // without `message_id` or `width` changing, which are the only
         // things that invalidate a `LayoutKey` entry; caching them would
-        // leave stale reaction counts and checkmarks on screen. See the
-        // module docs' "Grouped-cache resolution" for the same reasoning
-        // applied to grouping.
-        // T55/polish: wire `render::image::ImageArea` here for a downloaded
-        // photo when the terminal has a graphics protocol (see the module
-        // docs for why it can't live in this frame-local walk today).
-        append_file_card(&mut msg_lines, msg, media, width, theme);
+        // leave stale percentages, counts, and checkmarks on screen. See
+        // the module docs' "The per-frame half of a block".
+        append_attachment(&mut msg_lines, msg, grouped, media, width, theme);
         append_reactions(&mut msg_lines, msg, width, theme);
         if msg.is_outgoing {
             append_receipt(&mut msg_lines, msg, convo.last_read_outbox, width, theme);
         }
 
+        let selected = convo
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.message_id == msg.id);
         let hit_kind = search_hit_kind(convo, chat_search, msg.id);
         let mut block: Vec<WindowRow> = Vec::with_capacity(msg_lines.len() + 1);
         if idx > 0 && !grouped {
@@ -371,7 +366,7 @@ fn build_window(
                 .map(|(i, line)| WindowRow {
                     message_id: Some(msg.id),
                     line: apply_search_highlight(
-                        apply_selection_highlight(line, msg.id),
+                        apply_selection_highlight(line, selected, width, theme),
                         hit_kind,
                         i == 0,
                         theme,
@@ -404,11 +399,39 @@ fn build_window(
     rows
 }
 
-/// Selection-mode highlight seam (T26). A no-op today: returns `line`
-/// unmodified. Wire the real highlight in here once `state/selection.rs`
-/// exists, rather than threading selection state through the whole walk.
-fn apply_selection_highlight(line: Line<'static>, _message_id: MessageId) -> Line<'static> {
-    line
+/// Selection highlight (design-language §5): a `surface_raised` background
+/// across every line of the selected message, and nothing else — no border,
+/// no full-width inverse block, no color change to the body text. The row is
+/// first padded out to `width` so the background reads as a band rather than
+/// stopping wherever the text happens to end.
+///
+/// Style-only apart from that trailing pad, so no wrapping decision the
+/// cached layout made is disturbed.
+fn apply_selection_highlight(
+    line: Line<'static>,
+    selected: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    if !selected {
+        return line;
+    }
+    let pad = width.saturating_sub(line.width() as u16);
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let style = span.style.bg(theme.surface_raised);
+            Span::styled(span.content, style)
+        })
+        .collect();
+    if pad > 0 {
+        spans.push(Span::styled(
+            " ".repeat(pad as usize),
+            Style::new().bg(theme.surface_raised),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Where `msg_id` sits relative to the open chat's search hits (module docs'
@@ -556,51 +579,47 @@ fn slice_grouped(full: &[Line<'static>]) -> Vec<Line<'static>> {
 /// a no-op otherwise, so a message without reactions costs nothing (same
 /// discipline as an absent caption in `message_layout`). A reaction the
 /// viewer chose (`chosen_by_me`) is bolded in the accent color; the rest are
-/// muted. The row aligns with the message's side: right for own messages
-/// (flush with the pane's right edge, like the rail), left with a two-column
-/// indent for incoming ones (matching the rail-plus-space inset the cached
-/// body lines carry).
+/// muted. The row carries the block's rail, so a reacted-to message still
+/// reads as one unbroken block.
 fn append_reactions(lines: &mut Vec<Line<'static>>, msg: &MessageView, width: u16, theme: &Theme) {
     if msg.reactions.is_empty() {
         return;
     }
-    lines.push(aligned_row(
+    lines.push(place_row(
         reaction_spans(&msg.reactions, theme),
-        msg.is_outgoing,
         width,
+        msg.is_outgoing,
+        rail_style(msg, theme),
     ));
 }
 
-/// A per-frame row under a message's cached block, aligned to the message's
-/// own side: flush right for own messages (like the rail), indented two
-/// columns for incoming ones (matching the rail-plus-space inset the cached
-/// body lines carry).
-fn aligned_row(content: Vec<Span<'static>>, is_outgoing: bool, width: u16) -> Line<'static> {
-    let mut spans = Vec::with_capacity(content.len() + 1);
-    if is_outgoing {
-        let used = Line::from(content.clone()).width() as u16;
-        spans.push(Span::raw(" ".repeat(width.saturating_sub(used) as usize)));
-    } else {
-        spans.push(Span::raw("  "));
-    }
-    spans.extend(content);
-    Line::from(spans)
-}
-
-/// Pushes the live status row for a file-bearing message — the per-frame half
-/// of the two-line card described in the module docs. A message with no file
-/// costs nothing here.
+/// Inserts the one attachment row (design-language §4) for a file-bearing
+/// message. A message with no attachment costs nothing here.
+///
+/// The row goes *above* the caption — media first, words about it after —
+/// and below the header and reply quote, which is what
+/// [`attachment_index`] computes. It is railed like every cached line, so
+/// the block reads as one unit.
 ///
 /// An outgoing message with an upload still tracked under its id shows the
 /// upload bar instead of the download affordance: until the send completes
 /// there is no downloadable file on the other end to offer.
-fn append_file_card(
+fn append_attachment(
     lines: &mut Vec<Line<'static>>,
     msg: &MessageView,
+    grouped: bool,
     media: &MediaState,
     width: u16,
     theme: &Theme,
 ) {
+    // SEAM (inline images, design-language §6): when the terminal has a
+    // graphics protocol and this is a *downloaded* photo, the line built
+    // below is replaced outright by `render::image::ImageArea`, bounded to
+    // MAX_IMAGE_ROWS and inset to the rail column. Everything else about
+    // this function stays as it is — the §4 line remains the fallback for
+    // every other terminal and every not-yet-downloaded photo. Wiring it
+    // needs somewhere to keep an `ImageArea` alive between frames, which
+    // this walk does not have (see the module docs).
     let line = match media.uploads.get(&msg.id) {
         Some(progress) => file_card_upload_line(&msg.content, progress, theme),
         None => {
@@ -608,9 +627,24 @@ fn append_file_card(
             file_card_line(&msg.content, file, theme)
         }
     };
-    if let Some(line) = line {
-        lines.push(aligned_row(line.spans, msg.is_outgoing, width));
-    }
+    let Some(line) = line else {
+        return;
+    };
+    let row = place_row(line.spans, width, msg.is_outgoing, rail_style(msg, theme));
+    let at = attachment_index(msg, grouped).min(lines.len());
+    lines.insert(at, row);
+}
+
+/// How many rows of `msg`'s cached block precede its attachment: the header
+/// (absent when the message groups under the one above) and the reply quote.
+/// Everything after that is caption text, which the attachment belongs
+/// above.
+///
+/// This mirrors `message_layout::layout`'s composition order, and shares its
+/// one assumption — that a header occupies a single row — with
+/// [`slice_grouped`] and the module docs' "Grouped-cache resolution".
+fn attachment_index(msg: &MessageView, grouped: bool) -> usize {
+    usize::from(!grouped) + usize::from(msg.reply_to.is_some())
 }
 
 /// The file a message's content carries, if any (mirrors the private helpers
@@ -646,15 +680,18 @@ fn reaction_spans(reactions: &[ReactionView], theme: &Theme) -> Vec<Span<'static
     spans
 }
 
-/// Pushes this own message's read-receipt marker: `⋯` while sending, `✗` on
-/// failure (danger), else `✓`/`✓✓` from `last_read_outbox` (spec: "Sent" vs
-/// "read"). Only called for `msg.is_outgoing` messages — incoming messages
-/// have no receipt of our own to show.
+/// Appends this own message's read-receipt marker **inline**, to the last
+/// row the block already has: `⋯` while sending, `✗` on failure (danger),
+/// else `✓`/`✓✓` from `last_read_outbox` (spec: "Sent" vs "read"). Only
+/// called for `msg.is_outgoing` messages — incoming messages have no receipt
+/// of our own to show.
 ///
-/// Tries to tack the marker onto the trailing blank space of `lines`' last
-/// row first (own message rows are usually padded flush to `width` already,
-/// so this rarely fires — see the module docs on cache/uncached rows); when
-/// there is no room it gets a row of its own, right-aligned the same way.
+/// design-language §3 is explicit that this never occupies a row of its own,
+/// and `message_layout::append_marker_inline` guarantees it never widens one
+/// either: an own message wraps `RECEIPT_COLS` narrower than the pane
+/// precisely so the marker has somewhere to go. A message with no rows at
+/// all (impossible: every own message has at least a header) is skipped
+/// rather than given one.
 fn append_receipt(
     lines: &mut Vec<Line<'static>>,
     msg: &MessageView,
@@ -662,27 +699,11 @@ fn append_receipt(
     width: u16,
     theme: &Theme,
 ) {
+    let Some(last) = lines.last_mut() else {
+        return;
+    };
     let (marker, style) = receipt_marker(msg, last_read_outbox, theme);
-    let marker_cols = marker.width() as u16;
-
-    let fits_on_last_row = lines
-        .last()
-        .map(|last| last.width() as u16 + 1 + marker_cols <= width)
-        .unwrap_or(false);
-
-    if fits_on_last_row {
-        let last = lines.last_mut().expect("checked above");
-        let used = last.width() as u16;
-        let pad = width.saturating_sub(used + marker_cols);
-        last.spans.push(Span::raw(" ".repeat(pad as usize)));
-        last.spans.push(Span::styled(marker, style));
-    } else {
-        let pad = width.saturating_sub(marker_cols);
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(pad as usize)),
-            Span::styled(marker, style),
-        ]));
-    }
+    append_marker_inline(last, Span::styled(marker, style), width);
 }
 
 fn receipt_marker(
@@ -1250,6 +1271,120 @@ mod tests {
         );
     }
 
+    /// A file message renders exactly one attachment row, above its
+    /// caption, and the file is named once (the T62 defect: a cached
+    /// identity line plus a per-frame status line named it twice).
+    #[test]
+    fn attachment_is_one_row_above_the_caption() {
+        let mut msg = doc_msg(1, Sender::User(UserId(2)), "Bob", 0, "spec.pdf", 2_400);
+        if let MessageContent::Document { caption, .. } = &mut msg.content {
+            *caption = FormattedText {
+                text: "have a look".to_string(),
+                entities: Vec::new(),
+            };
+        }
+        let convo = conversation(vec![msg], Scroll::Bottom);
+        let mut cache = LayoutCache::new();
+
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            60,
+            10,
+            &theme(),
+            &mut cache,
+            None,
+        );
+        let texts: Vec<String> = rows
+            .iter()
+            .filter(|r| r.message_id.is_some())
+            .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("spec.pdf")).count(),
+            1,
+            "the file must be named exactly once: {texts:#?}"
+        );
+        let attachment = texts
+            .iter()
+            .position(|t| t.contains("spec.pdf"))
+            .expect("no attachment row");
+        let caption = texts
+            .iter()
+            .position(|t| t.contains("have a look"))
+            .expect("no caption row");
+        assert!(
+            attachment < caption,
+            "the attachment belongs above its caption: {texts:#?}"
+        );
+        assert!(
+            texts[attachment].starts_with("▏ "),
+            "the attachment row carries the block's rail: {:?}",
+            texts[attachment]
+        );
+    }
+
+    /// design-language §5: the selected message gets a `surface_raised`
+    /// band across every one of its rows, and nothing else — no border, no
+    /// inverse block, no change to the body's foreground.
+    #[test]
+    fn selected_message_gets_a_raised_background_band() {
+        let alice = Sender::User(UserId(1));
+        let mut convo = conversation(
+            vec![
+                text_msg(1, alice, "Alice", false, 0, "first", None),
+                text_msg(
+                    2,
+                    Sender::User(UserId(2)),
+                    "Bob",
+                    false,
+                    400,
+                    "second",
+                    None,
+                ),
+            ],
+            Scroll::Bottom,
+        );
+        convo.selection = Some(tgt_core::state::selection::SelectionState {
+            message_id: MessageId(2),
+            chips: Vec::new(),
+            chip_cursor: 0,
+            chip_scroll: 0,
+        });
+        let mut cache = LayoutCache::new();
+
+        let width = 40;
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            width,
+            10,
+            &theme(),
+            &mut cache,
+            None,
+        );
+
+        for row in rows.iter().filter(|r| r.message_id == Some(MessageId(2))) {
+            assert_eq!(
+                row.line.width(),
+                width as usize,
+                "the band spans the row: {:?}",
+                row.line
+            );
+            for span in &row.line.spans {
+                assert_eq!(span.style.bg, Some(theme().surface_raised));
+            }
+        }
+        for row in rows.iter().filter(|r| r.message_id == Some(MessageId(1))) {
+            for span in &row.line.spans {
+                assert_ne!(span.style.bg, Some(theme().surface_raised));
+            }
+        }
+    }
+
     // --- bottom-up fill (unit) --------------------------------------------
 
     #[test]
@@ -1490,6 +1625,95 @@ mod tests {
         assert!(!others.style.add_modifier.contains(Modifier::BOLD));
     }
 
+    /// design-language §3: a receipt is appended to the last line of its
+    /// message, never given a row. The regression this replaces put every
+    /// tick on its own row, so the pane edge grew a column of them.
+    #[test]
+    fn receipts_render_inline_on_the_message_row() {
+        let me = Sender::User(UserId(3));
+        let convo = conversation(
+            vec![text_msg(1, me, "You", true, 0, "on it", None)],
+            Scroll::Bottom,
+        );
+        let mut cache = LayoutCache::new();
+
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            40,
+            10,
+            &theme(),
+            &mut cache,
+            None,
+        );
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(
+            texts.iter().any(|t| t.contains("on it ✓ ▏")),
+            "the tick belongs on the text's own row, ahead of the rail: {texts:#?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.trim().starts_with('✓')),
+            "no row may consist of a receipt alone: {texts:#?}"
+        );
+        for (row, text) in rows.iter().zip(&texts) {
+            assert!(
+                row.line.width() <= 40,
+                "the receipt widened a row past the pane: {text:?} ({} columns)",
+                row.line.width()
+            );
+        }
+    }
+
+    /// The inline marker still fits when the message's last line is long
+    /// enough to be wrapped: the reserved `RECEIPT_COLS` gutter is what
+    /// guarantees it, at 80 and at 140 columns alike.
+    #[test]
+    fn receipt_fits_within_the_pane_at_every_width() {
+        let me = Sender::User(UserId(3));
+        // Deliberately unbroken-ish filler so the wrap lands near the edge.
+        let body = "status update ".repeat(20);
+        let convo = conversation(
+            vec![text_msg(1, me, "You", true, 0, body.trim(), None)],
+            Scroll::Bottom,
+        );
+        let mut cache = LayoutCache::new();
+
+        for width in [40u16, 80, 140] {
+            let rows = build_window(
+                &convo,
+                &MediaState::default(),
+                0,
+                width,
+                20,
+                &theme(),
+                &mut cache,
+                None,
+            );
+            let marker_rows = rows
+                .iter()
+                .filter(|r| {
+                    r.line
+                        .spans
+                        .iter()
+                        .any(|s| s.content.as_ref() == "✓" || s.content.as_ref() == "✓✓")
+                })
+                .count();
+            assert_eq!(marker_rows, 1, "exactly one row carries the receipt");
+            for row in &rows {
+                assert!(
+                    row.line.width() <= width as usize,
+                    "width {width}: row overflows at {} columns",
+                    row.line.width()
+                );
+            }
+        }
+    }
+
     /// Two own messages straddling `last_read_outbox`: the older one was
     /// read (`✓✓`), the newer one has only been sent so far (`✓`).
     #[test]
@@ -1516,21 +1740,19 @@ mod tests {
             .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
 
-        let read_row = texts
-            .iter()
-            .find(|t| t.trim_end().ends_with("✓✓"))
-            .expect("read message must show ✓✓");
-        assert!(
-            !texts
-                .iter()
-                .any(|t| t != read_row && t.trim_end().ends_with("✓✓")),
-            "only the read message should show ✓✓: {texts:#?}"
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("on it ✓✓ ▏")).count(),
+            1,
+            "the read message shows ✓✓ inline: {texts:#?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("done ✓ ▏")).count(),
+            1,
+            "the unread-by-peer message shows a single ✓ inline: {texts:#?}"
         );
         assert!(
-            texts
-                .iter()
-                .any(|t| t.trim_end().ends_with('✓') && !t.trim_end().ends_with("✓✓")),
-            "the unread-by-peer message must show a single ✓: {texts:#?}"
+            !texts.iter().any(|t| t.contains("done ✓✓")),
+            "only the read message should show ✓✓: {texts:#?}"
         );
     }
 
