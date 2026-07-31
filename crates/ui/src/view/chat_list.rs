@@ -46,6 +46,25 @@
 //! height, wheel-derived offset, selected index)` — so nothing here needs
 //! per-frame mutable state beyond what `AppState` already carries.
 //!
+//! ## Loading vs. empty
+//!
+//! An empty `display` means either "genuinely no chats" or "TDLib's initial
+//! `loadChats` round hasn't reported `Complete` yet" (chats stream in via
+//! `NewChat`/`ChatPosition` pushes ahead of that signal, so an empty list
+//! and a not-yet-populated one look identical to `visible_rows`). `draw`
+//! tells them apart with `list.load != ChatLoadPhase::Complete`, which is a
+//! reliable "still loading" signal specifically *here* — this view only
+//! ever runs once `state.screen == Screen::Main`, and that transition and
+//! the `LoadChats` request fire together (`state::auth`'s `AuthPhase::Ready`
+//! arm), so every `Idle` this function sees was mid-flight, never
+//! "never asked." A filter narrowing an already-loaded list to zero matches
+//! is a different empty case and keeps the plain "no chats" message
+//! regardless of `load` — see `draw_empty`'s `still_loading` guard.
+//!
+//! The distinction is static text only ("no chats" vs. "loading chats"), no
+//! spinner: an animated indicator would need `Action::Tick`, which is a
+//! core concern this view doesn't have a hook into.
+//!
 //! ## Sidebar organization (T43, spec §11)
 //!
 //! Three header lines above the row list, each drawn only when relevant, in
@@ -112,7 +131,7 @@ use tgt_core::model::hit::HitTarget;
 use tgt_core::model::ids::ChatId;
 use tgt_core::state::auth::InputField;
 use tgt_core::state::chat_list::{
-    ChatListState, archive_unread_total, archive_visible, folder_cycle, visible_rows,
+    ChatListState, ChatLoadPhase, archive_unread_total, archive_visible, folder_cycle, visible_rows,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -184,7 +203,14 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
     let show_archive_row = list.active_list == ChatListId::Main && archive_visible(list);
     let display = build_display_rows(&rows, list, show_archive_row);
     if display.is_empty() {
-        draw_empty(rows_area, theme, f);
+        // Not "genuinely no chats" if the initial `loadChats` round hasn't
+        // reported done yet — see this fn's own doc comment for why
+        // `load != Complete` is a reliable loading signal here specifically
+        // (it would not be in every screen). A filter narrowing an
+        // already-loaded list to zero matches is a different empty case and
+        // keeps the plain message regardless of `load`.
+        let still_loading = list.filter.is_none() && list.load != ChatLoadPhase::Complete;
+        draw_empty(rows_area, still_loading, theme, f);
         return;
     }
     draw_display_rows(rows_area, &display, list, theme, f, hits);
@@ -266,10 +292,21 @@ fn draw_filter_input(area: Rect, filter: &InputField, theme: &Theme, f: &mut Fra
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_empty(area: Rect, theme: &Theme, f: &mut Frame) {
+/// `still_loading` picks between "no chats" (the list finished loading and
+/// is genuinely empty) and "loading chats" (TDLib's initial `loadChats`
+/// round hasn't reported `Complete` yet, so an empty `display` doesn't mean
+/// an empty account — see the module docs' "Loading vs. empty" section).
+/// Static text only: an animated/spinner distinction would need
+/// `Action::Tick`, which is core's concern, not this view's.
+fn draw_empty(area: Rect, still_loading: bool, theme: &Theme, f: &mut Frame) {
+    let text = if still_loading {
+        "loading chats"
+    } else {
+        "no chats"
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "no chats",
+            text,
             Style::new().fg(theme.text_muted),
         ))),
         area,
@@ -600,7 +637,6 @@ mod tests {
     use tgt_core::model::key::KeyBindings;
     use tgt_core::model::time::Millis;
     use tgt_core::state::auth::{AuthField, AuthState, LoginMethod};
-    use tgt_core::state::chat_list::ChatLoadPhase;
     use tgt_core::state::composer::ComposerState;
     use tgt_core::state::consent::{ConsentChoice, ConsentState};
     use tgt_core::state::focus::{Focus, FocusStack};
@@ -774,12 +810,57 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    /// A genuinely empty account: `load` has already reported `Complete`
+    /// with zero chats. Distinct from [`loading_state_before_chats_arrive_120x40`]
+    /// below, which is empty for the opposite reason — the fixture used to
+    /// be `ChatListState::default()` (whose `load` defaults to `Idle`), which
+    /// happened to render "no chats" only because nothing distinguished the
+    /// two cases; now that something does, this test says explicitly which
+    /// empty case it means.
     #[test]
     fn empty_state_120x40() {
-        let state = fixture_state(ChatListState::default());
+        let list = ChatListState {
+            load: ChatLoadPhase::Complete,
+            ..ChatListState::default()
+        };
+        let state = fixture_state(list);
         let rendered = render_to_string(120, 40, &state);
         assert!(rendered.contains("no chats"));
+        assert!(!rendered.contains("loading"));
         insta::assert_snapshot!(rendered);
+    }
+
+    /// The bug this task fixes: before `load` reaches `Complete`, an empty
+    /// `display` must not read as "no chats" — TDLib is still streaming
+    /// `NewChat` pushes in and the account may not be empty at all. This is
+    /// the state a cold start actually renders in for however long the
+    /// initial `loadChats` round takes.
+    #[test]
+    fn loading_state_before_chats_arrive_120x40() {
+        let state = fixture_state(ChatListState::default()); // load: Idle
+        let rendered = render_to_string(120, 40, &state);
+        assert!(rendered.contains("loading chats"));
+        assert!(!rendered.contains("no chats"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// A filter that matches nothing is a different empty case from either
+    /// of the above — the list is loaded, the filter just excluded
+    /// everything — so it keeps "no chats" even while `load` is not yet
+    /// `Complete`.
+    #[test]
+    fn filtered_to_nothing_shows_no_chats_even_while_still_loading_120x40() {
+        let list = ChatListState {
+            filter: Some(InputField {
+                text: "nonexistent".to_string(),
+                cursor: 11,
+            }),
+            ..ChatListState::default() // load: Idle
+        };
+        let state = fixture_state(list);
+        let rendered = render_to_string(120, 40, &state);
+        assert!(rendered.contains("no chats"));
+        assert!(!rendered.contains("loading"));
     }
 
     /// A chat with a position in an arbitrary list, pinned or not — the

@@ -1,0 +1,8 @@
+---
+source: crates/ui/src/view/chat_list.rs
+assertion_line: 841
+expression: rendered
+---
+CHATS                                                                                                                   
+                                                                                                                        
+loading chats
