@@ -1888,6 +1888,7 @@ qrcode = "=0.14.1"
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "=0.25.10"
 jiff = "=0.2.35"
+nucleo = "=0.5.0"
 serde = { workspace = true }
 toml = "=1.1.4"
 tracing = { workspace = true }
