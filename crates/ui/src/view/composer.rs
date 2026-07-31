@@ -27,11 +27,23 @@
 //! itself renders as a manually painted reverse-video cell (same convention
 //! as `view::auth`'s `field_line`), not the terminal's hardware cursor.
 //!
-//! ## Upload progress — seam
+//! ## Upload progress is not drawn here
 //!
-//! File/media send progress (T39/T40) has no representation here yet. When
-//! it lands, it is another banner line alongside the reply/edit/pending ones
-//! below, keyed off `AppState.media` for the chat's in-flight upload.
+//! An earlier note in this module promised a banner line for file-send
+//! progress, "keyed off `AppState.media` for the chat's in-flight upload".
+//! That was wrong about where it belongs and it sent a later audit looking
+//! in this file for something that already exists elsewhere.
+//!
+//! Spec §10: "Uploads render as a pending message with a progress bar and
+//! are cancellable" — on the message, not on the composer. It is built and
+//! wired: `view/conversation.rs` calls `message_layout::file_card_upload_line`
+//! for any message with a `MediaState::uploads` entry, per-frame and outside
+//! the layout cache, beside the download line it mirrors.
+//!
+//! Do not add a second, composer-side rendering of the same fact. The
+//! composer's banners are about what the *composer* is holding — a reply
+//! target, an edit, an unsent draft — and an upload in flight is a property
+//! of the message it belongs to.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -70,7 +82,6 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
     if composer.pending_send.is_some() {
         banners.push(banner_line("sending…".to_string(), theme.text_muted));
     }
-    // Upload progress line goes here once T39/T40 land (see module docs).
 
     let banner_height = banners.len() as u16;
     let [banner_area, box_area] =
