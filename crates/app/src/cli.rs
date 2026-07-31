@@ -37,6 +37,22 @@ pub enum Command {
         /// signature was checked when none was.
         #[arg(long)]
         require_signature: bool,
+
+        /// Install the latest release even if it is the version already
+        /// running.
+        ///
+        /// This is a repair: a tree with a partial extraction or a missing
+        /// library is otherwise unfixable except by reinstalling by hand,
+        /// and reporting "already the latest release" to someone whose
+        /// install is broken is unhelpful.
+        ///
+        /// It changes only the decision to proceed. The download, both
+        /// verification steps, the `sh -n` check, the swap, the probe and
+        /// the rollback are the same ones the ordinary path runs — a
+        /// `--force` that skipped any of them would stop being an exercise
+        /// of the ordinary path, which is the other reason it exists.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -58,7 +74,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Update {
-                require_signature: false
+                require_signature: false,
+                force: false
             })
         ));
 
@@ -66,7 +83,33 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Update {
-                require_signature: true
+                require_signature: true,
+                force: false
+            })
+        ));
+    }
+
+    /// The two are independent, and the combination is the point: a verified
+    /// download followed by a real swap is the only way to exercise the
+    /// rename/probe/rollback sequence without waiting for a release newer
+    /// than the one installed.
+    #[test]
+    fn force_and_require_signature_compose() {
+        let cli = Cli::try_parse_from(["tgt", "update", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                require_signature: false,
+                force: true
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tgt", "update", "--force", "--require-signature"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                require_signature: true,
+                force: true
             })
         ));
     }

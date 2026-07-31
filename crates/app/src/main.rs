@@ -53,8 +53,12 @@ fn main() -> eyre::Result<()> {
 
 fn dispatch_cli(cli: Cli) -> eyre::Result<()> {
     // Like `telemetry show`, this never starts the TUI, so stdout is free.
-    if let Some(Command::Update { require_signature }) = &cli.command {
-        return update::run(*require_signature);
+    if let Some(Command::Update {
+        require_signature,
+        force,
+    }) = &cli.command
+    {
+        return update::run(*require_signature, *force);
     }
 
     if let Some(Command::Telemetry { action }) = &cli.command {

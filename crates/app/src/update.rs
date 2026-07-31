@@ -55,6 +55,7 @@
 //! remains is a release that ships a subtly broken installer, which is a
 //! release-process failure rather than an update-mechanism one.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -458,7 +459,7 @@ fn fetch_optional(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u
 }
 
 /// `tgt update`. Runs entirely on stdout; the TUI is never started.
-pub fn run(require_signature: bool) -> eyre::Result<()> {
+pub fn run(require_signature: bool, force: bool) -> eyre::Result<()> {
     let install = resolve()?;
     let root = match install {
         Install::Private { root } => root,
@@ -506,16 +507,38 @@ pub fn run(require_signature: bool) -> eyre::Result<()> {
     }
 
     let version = tag.trim_start_matches('v');
-    if version == env!("CARGO_PKG_VERSION") {
-        println!("tgt {version} is already the latest release.");
-        return Ok(());
-    }
+    // `force` is spent entirely in this decision. Nothing below reads it,
+    // which is what makes it an exercise of the ordinary path rather than a
+    // second, laxer one: same download, same verification, same `sh -n`,
+    // same swap, same probe, same rollback.
+    let lines = match decide(version, env!("CARGO_PKG_VERSION"), force) {
+        Decision::UpToDate(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        Decision::Refuse(message) => {
+            return Err(human_errors::user(
+                message,
+                // Reversed; see the note on the checksum advice above.
+                &[
+                    "Run `tgt update --force` to install it anyway.",
+                    "Nothing has been changed.",
+                ],
+            )
+            .into());
+        }
+        Decision::Proceed(lines) => lines,
+    };
 
     let target = target_triple();
     let asset = format!("tgt-{version}-{target}.tar.gz");
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
 
-    println!("updating tgt {} -> {version}", env!("CARGO_PKG_VERSION"));
+    for line in lines {
+        println!("{line}");
+    }
     println!("  tree:     {}", root.display());
     println!("  platform: {target}");
 
@@ -577,6 +600,85 @@ pub fn run(require_signature: bool) -> eyre::Result<()> {
 }
 
 /// Pulls the digest for `asset` out of a `SHA256SUMS` body.
+/// What [`run`] should do about the release it found, and what to say first.
+///
+/// Separated from `run` because `run` needs the network and a real install
+/// tree, so every branch here would otherwise only be reachable by building
+/// a binary with a doctored version and pointing it at a real release. That
+/// is exactly the shape of thing that ships broken.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// Nothing to do. Print these and exit successfully.
+    UpToDate(Vec<String>),
+    /// Refuse, with this message.
+    Refuse(String),
+    /// Go ahead, after printing these.
+    Proceed(Vec<String>),
+}
+
+/// Decides whether to install `latest` over `installed`.
+///
+/// A downgrade is refused rather than announced when `force` is not given,
+/// because that case is not opt-in: an ordinary `tgt update` that replaced a
+/// newer build with an older one would be the least expected thing this
+/// command could do. Under `--force` it proceeds and names itself, since a
+/// developer running a local build on a broken tree needs a way back to the
+/// published release — that repair being what the flag is for.
+fn decide(latest: &str, installed: &str, force: bool) -> Decision {
+    let order = compare_versions(latest, installed);
+    let same = latest == installed || order == Some(Ordering::Equal);
+
+    if same && !force {
+        return Decision::UpToDate(vec![
+            format!("tgt {latest} is already the latest release."),
+            "  Run `tgt update --force` to download and reinstall it anyway.".to_string(),
+        ]);
+    }
+    if order == Some(Ordering::Less) && !force {
+        return Decision::Refuse(format!(
+            "The latest published release is {latest}, which is older than the {installed} you are running."
+        ));
+    }
+
+    Decision::Proceed(match (same, order) {
+        (true, _) => vec![format!("reinstalling tgt {latest}")],
+        (_, Some(Ordering::Less)) => vec![
+            format!("downgrading tgt {installed} -> {latest}"),
+            "  the latest published release is older than what you are running".to_string(),
+        ],
+        (_, Some(Ordering::Greater)) => vec![format!("updating tgt {installed} -> {latest}")],
+        // Neither side parsed as major.minor.patch, so the direction is
+        // genuinely unknown and is not guessed at.
+        _ => vec![format!("installing tgt {latest} over {installed}")],
+    })
+}
+
+/// Orders two versions by their numeric `major.minor.patch`, or `None` when
+/// either is not that shape.
+///
+/// A pre-release suffix is dropped before comparing, so `0.1.7-dev` and
+/// `0.1.7` compare equal. That is deliberately not semver, where the
+/// pre-release sorts first: the only question asked here is which release
+/// the user would end up with, and answering it "equal" makes the command
+/// offer a reinstall rather than a silent downgrade.
+///
+/// `None` means the direction is unknown, and the caller says so rather than
+/// guessing — a locally built binary can carry any version string at all.
+fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
+    fn triple(v: &str) -> Option<(u64, u64, u64)> {
+        let core = v.split(['-', '+']).next()?;
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((major, minor, patch))
+    }
+    Some(triple(a)?.cmp(&triple(b)?))
+}
+
 fn sha_for(sums: &str, asset: &str) -> Option<String> {
     sums.lines()
         .find(|line| line.ends_with(asset))
@@ -653,6 +755,79 @@ mod tests {
         std::os::unix::fs::symlink(cellar.join("tgt"), &link).unwrap();
 
         assert_eq!(classify(&link), Install::Homebrew);
+    }
+
+    /// The whole decision table, including the branches that need a release
+    /// older than the running binary — a state no test could otherwise reach
+    /// without publishing one.
+    #[test]
+    fn the_update_decision_covers_every_direction() {
+        // Newer: update, with or without --force.
+        assert_eq!(
+            decide("0.1.6", "0.1.5", false),
+            Decision::Proceed(vec!["updating tgt 0.1.5 -> 0.1.6".to_string()])
+        );
+        assert_eq!(
+            decide("0.1.6", "0.1.5", true),
+            Decision::Proceed(vec!["updating tgt 0.1.5 -> 0.1.6".to_string()])
+        );
+
+        // Same: stop, and say how to reinstall anyway.
+        let Decision::UpToDate(lines) = decide("0.1.5", "0.1.5", false) else {
+            panic!("the same version must not download anything without --force");
+        };
+        assert_eq!(lines[0], "tgt 0.1.5 is already the latest release.");
+        assert!(lines[1].contains("--force"), "{lines:?}");
+
+        // Same, forced: the reinstall that makes the swap exercisable.
+        assert_eq!(
+            decide("0.1.5", "0.1.5", true),
+            Decision::Proceed(vec!["reinstalling tgt 0.1.5".to_string()])
+        );
+
+        // Older: refused unless asked for explicitly.
+        let Decision::Refuse(message) = decide("0.1.5", "0.1.7", false) else {
+            panic!("an ordinary update must never walk a version backwards");
+        };
+        assert!(message.contains("0.1.5"), "{message}");
+        assert!(message.contains("older"), "{message}");
+
+        // Older, forced: proceeds, and names itself a downgrade rather than
+        // reporting it as an update.
+        let Decision::Proceed(lines) = decide("0.1.5", "0.1.7", true) else {
+            panic!("--force must allow the deliberate downgrade");
+        };
+        assert!(lines[0].starts_with("downgrading"), "{lines:?}");
+
+        // Unorderable: proceeds, and claims no direction it cannot justify.
+        let Decision::Proceed(lines) = decide("0.1.5", "nightly", false) else {
+            panic!("an unparseable local version must not block updating");
+        };
+        assert_eq!(lines, vec!["installing tgt 0.1.5 over nightly".to_string()]);
+    }
+
+    /// The comparison `--force` rests on. Getting `Less` wrong in either
+    /// direction is the expensive case: reported as `Greater` it downgrades
+    /// someone silently, reported as `Less` it refuses a real update.
+    #[test]
+    fn versions_order_by_number_and_admit_when_they_cannot() {
+        assert_eq!(compare_versions("0.1.6", "0.1.5"), Some(Ordering::Greater));
+        assert_eq!(compare_versions("0.1.5", "0.1.6"), Some(Ordering::Less));
+        assert_eq!(compare_versions("0.1.5", "0.1.5"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("0.2.0", "0.1.99"), Some(Ordering::Greater));
+        assert_eq!(compare_versions("0.10.0", "0.9.0"), Some(Ordering::Greater));
+
+        // A pre-release suffix compares as its release, so a local 0.1.7-dev
+        // is offered a reinstall of 0.1.7 rather than a downgrade to it.
+        assert_eq!(
+            compare_versions("0.1.7", "0.1.7-dev"),
+            Some(Ordering::Equal)
+        );
+
+        // Not major.minor.patch: unknown, and the caller says so.
+        assert_eq!(compare_versions("0.1", "0.1.5"), None);
+        assert_eq!(compare_versions("nightly", "0.1.5"), None);
+        assert_eq!(compare_versions("0.1.5.1", "0.1.5"), None);
     }
 
     #[test]

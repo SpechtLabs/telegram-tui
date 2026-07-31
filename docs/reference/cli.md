@@ -115,7 +115,12 @@ Replaces this install with the latest published release. Like the telemetry subc
 ```shell
 tgt update
 tgt update --require-signature
+tgt update --force
 ```
+
+`--force` installs the latest release even when it is the version already running. It is the repair for a tree that is intact enough to start but broken otherwise — a partial extraction, a missing library — which otherwise has no fix short of reinstalling by hand. It changes only the decision to proceed: the download, both verification steps, the swap, the probe and the rollback are the ones the ordinary path runs, so it is also how that sequence gets exercised without waiting for a newer release to exist.
+
+If the latest published release is *older* than the version you are running, an ordinary `tgt update` refuses and says so rather than silently going backwards. `--force` installs it anyway and names it as a downgrade while it does.
 
 It refuses rather than guessing. A Homebrew install is left to `brew upgrade`, because brew tracks its files in a manifest an in-place overwrite would desynchronise. Anything that isn't a private `bin/` + `lib/` tree it can identify — a legacy shared-prefix install, or a `cargo` target directory — is refused with the reinstall command, since replacing a directory it cannot identify would mean renaming and deleting whatever is there.
 
