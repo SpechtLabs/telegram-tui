@@ -24,9 +24,9 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use tgt_core::app::AppState;
 use tgt_core::model::chat::ChatKind;
 use tgt_core::model::ids::{ChatId, UserId};
@@ -37,21 +37,26 @@ use crate::theme::Theme;
 
 const TITLE: &str = "telegram-tui";
 
+/// One line, no box: `view::root` hands over an area that is already padded
+/// and already has the header's blank breathing row above it, and puts the
+/// single horizontal rule the design language allows underneath
+/// (docs/design-language.md §1). The title is the pane's primary text; every
+/// status label to its right is tertiary, apart from the two the user is
+/// waiting on (a reconnect, someone typing).
 pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
-    let block = Block::bordered().border_style(Style::new().fg(theme.text_muted));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let title = open_chat_title(state).unwrap_or(TITLE);
-    let mut spans = vec![Span::styled(title.to_string(), Style::new().fg(theme.text))];
+    let mut spans = vec![Span::styled(
+        title.to_string(),
+        Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
+    )];
     if let Some((label, style)) = right_indicator(state, theme) {
         let used = title.width() + label.width();
-        let pad = (inner.width as usize).saturating_sub(used);
+        let pad = (area.width as usize).saturating_sub(used);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(label, style));
     }
 
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn open_chat_title(state: &AppState) -> Option<&str> {
@@ -85,14 +90,18 @@ fn right_indicator(state: &AppState, theme: &Theme) -> Option<(String, Style)> {
 
     let chat_id = state.open_chat?;
     if let Some(label) = search_hit_count_label(state, chat_id) {
-        return Some((label, Style::new().fg(theme.warning)));
+        return Some((label, Style::new().fg(theme.text_muted)));
     }
     if is_typing_in(state, chat_id) {
         return Some(("typing…".to_string(), Style::new().fg(theme.accent)));
     }
 
+    // Presence is tertiary (design language §2): it is ambient status, and a
+    // header that shouts "online" competes with the conversation below it.
     match other_party_presence(state, chat_id) {
-        Some(PresenceStatus::Online) => Some(("online".to_string(), Style::new().fg(theme.accent))),
+        Some(PresenceStatus::Online) => {
+            Some(("online".to_string(), Style::new().fg(theme.text_muted)))
+        }
         Some(PresenceStatus::Recently) => {
             Some(("recently".to_string(), Style::new().fg(theme.text_muted)))
         }

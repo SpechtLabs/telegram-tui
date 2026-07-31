@@ -19,6 +19,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tgt_core::state::focus::Focus;
 
@@ -60,12 +61,46 @@ pub fn draw(area: Rect, theme: &Theme, f: &mut Frame) {
 
 /// Renders whatever [`hint_for`] yields for `focus`; draws nothing on
 /// `None`.
+///
+/// No rule above it and no box around it (design language §1): the blank row
+/// `view::root` reserves is the whole separation. Each entry is split into
+/// its key (in `accent`, so the eye can scan the row for a key rather than
+/// reading it as a sentence) and its description (`text_muted`), leaving the
+/// rendered characters byte-identical to the constants above — the frame
+/// tests assert on those strings appearing verbatim in the buffer.
 pub fn draw_for(area: Rect, focus: &Focus, theme: &Theme, f: &mut Frame) {
     let Some(text) = hint_for(focus) else {
         return;
     };
-    let hint = Paragraph::new(text).style(Style::new().fg(theme.text_muted));
-    f.render_widget(hint, area);
+    f.render_widget(Paragraph::new(hint_line(text, theme)), area);
+}
+
+/// Columns between two entries in a hint string. Wide enough that entries
+/// read as separate items without a `·` or a `|` between them.
+const ENTRY_GAP: &str = "   ";
+
+/// Splits a hint into `key`/`description` spans. An entry is everything up
+/// to the next [`ENTRY_GAP`]; its key is the first whitespace-delimited
+/// word, which is exactly how every constant above is written.
+fn hint_line(text: &'static str, theme: &Theme) -> Line<'static> {
+    let key_style = Style::new().fg(theme.accent);
+    let desc_style = Style::new().fg(theme.text_muted);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, entry) in text.split(ENTRY_GAP).enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(ENTRY_GAP, desc_style));
+        }
+        match entry.split_once(' ') {
+            Some((key, desc)) => {
+                spans.push(Span::styled(key, key_style));
+                spans.push(Span::styled(" ", desc_style));
+                spans.push(Span::styled(desc, desc_style));
+            }
+            None => spans.push(Span::styled(entry, key_style)),
+        }
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]

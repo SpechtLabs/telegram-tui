@@ -1,12 +1,20 @@
 //! Chat list sidebar (spec §6.1 sidebar mock, §7.2 theme tokens, §11 sidebar
-//! organization).
+//! organization; docs/design-language.md §1/§5 for its chrome).
 //!
-//! `draw` fills the `CHATS` block's interior with rows from
-//! `tgt_core::state::chat_list::visible_rows`. `crates/ui/src/view/root.rs`
-//! currently draws a placeholder (empty) `CHATS` block itself and is owned by
-//! another task; wiring `root::draw_sidebar` to call `chat_list::draw` is
-//! left for the task that owns `root.rs` (T24 per docs/plan.md). This module
-//! is exercised directly by its own tests in the meantime.
+//! `draw` fills the area `view::root` hands it — already padded, never
+//! bordered — with a dim `CHATS` (or `ARCHIVE`) section label over rows from
+//! `tgt_core::state::chat_list::visible_rows`. The sidebar is a region, not
+//! a widget: it draws no box, and the only line anywhere near it is the
+//! vertical rule `root` puts between it and the conversation.
+//!
+//! ## Selection and badges (design language §5)
+//!
+//! The selected row is a `▏` bar in `accent` at the left edge plus a
+//! `surface_raised` background across the row — never inverse video, which
+//! reads as a solid block of noise and drowns the row's own hierarchy.
+//! Unselected rows reserve the same two columns so titles stay aligned.
+//! Unread counts are `accent` bold, mentions `warning`, right-aligned and
+//! unbracketed; muted chats drop to `text_muted` entirely.
 //!
 //! ## Scroll window
 //!
@@ -25,8 +33,8 @@
 //! Three header lines above the row list, each drawn only when relevant, in
 //! this fixed order:
 //!
-//! 1. An "esc/a  back" hint, only while `active_list == Archive` (the block
-//!    title also becomes `ARCHIVE` in that state).
+//! 1. An "esc/a  back" hint, only while `active_list == Archive` (the section
+//!    label also becomes `ARCHIVE` in that state).
 //! 2. A folder tab strip (`Main · Folder 1 · Folder 2`, active one in
 //!    accent), only when `folder_cycle` has more than just `Main` and the
 //!    list isn't the archive. There is no folder *name* anywhere in the
@@ -54,7 +62,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use tgt_core::app::AppState;
 use tgt_core::model::chat::{ChatListId, ChatView};
 use tgt_core::model::hit::HitTarget;
@@ -76,21 +84,21 @@ enum DisplayRow {
     Chat(ChatId),
 }
 
+/// Columns the selection bar and its trailing space occupy. Reserved on
+/// every row, selected or not, so titles never shift sideways as the
+/// selection moves.
+const MARKER_WIDTH: usize = 2;
+
 pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &mut HitMap) {
     let list = &state.chat_list;
     let is_archive = list.active_list == ChatListId::Archive;
 
-    let block = Block::bordered()
-        .title(if is_archive { "ARCHIVE" } else { "CHATS" })
-        .title_style(Style::new().fg(theme.text))
-        .border_style(Style::new().fg(theme.text_muted));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let folders = folder_cycle(list);
     let show_folder_tabs = !is_archive && folders.len() > 1;
 
-    let mut constraints = Vec::new();
+    // Section label, then a blank row, then whichever of the three header
+    // lines apply, then the rows themselves.
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
     if is_archive {
         constraints.push(Constraint::Length(1));
     }
@@ -102,8 +110,9 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
     }
     constraints.push(Constraint::Min(0));
 
-    let areas = Layout::vertical(constraints).split(inner);
-    let mut next = 0usize;
+    let areas = Layout::vertical(constraints).split(area);
+    draw_section_label(areas[0], is_archive, theme, f);
+    let mut next = 2usize;
     if is_archive {
         draw_archive_hint(areas[next], theme, f);
         next += 1;
@@ -126,6 +135,23 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, hits: &m
         return;
     }
     draw_display_rows(rows_area, &display, list, theme, f, hits);
+}
+
+/// `CHATS` / `ARCHIVE` as a dim uppercase section label. It replaces the
+/// bordered block's title: a label carries the same "this is the chat list"
+/// meaning as a box did, at the cost of one row instead of four columns and
+/// two rows of chrome (design language §1).
+fn draw_section_label(area: Rect, is_archive: bool, theme: &Theme, f: &mut Frame) {
+    let label = if is_archive { "ARCHIVE" } else { "CHATS" };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::new()
+                .fg(theme.text_muted)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        area,
+    );
 }
 
 /// `visible_rows` is already pinned-first (see `state::chat_list`); this
@@ -268,11 +294,12 @@ fn archive_row_line(unread: u32, theme: &Theme) -> Line<'static> {
 
 /// Dim rule marking the pinned/unpinned boundary (spec §11: "pinned chats
 /// above the list"). Deliberately unlabelled — the position alone conveys
-/// the split without repeating "pinned" on every render.
+/// the split without repeating "pinned" on every render — and drawn in
+/// `border`, the token reserved for chrome.
 fn separator_line(width: u16, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(width as usize),
-        Style::new().fg(theme.text_muted),
+        Style::new().fg(theme.border),
     ))
 }
 
@@ -306,7 +333,7 @@ fn draw_folder_tabs(
     let mut col = 0u16;
     for (i, id) in folders.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(SEPARATOR, Style::new().fg(theme.text_muted)));
+            spans.push(Span::styled(SEPARATOR, Style::new().fg(theme.border)));
             col += SEPARATOR.width() as u16;
         }
         let style = if *id == active {
@@ -361,25 +388,25 @@ fn scroll_offset(total: usize, height: usize, selected_idx: Option<usize>) -> us
     }
 }
 
-/// One sidebar row: `▸ ` selection marker, title (truncated to fit), and a
-/// right-aligned unread badge (`@` prefix marks unread mentions, per spec
-/// §6.1's sidebar mock). Selected rows paint `theme.selection` across the
-/// full row width, not just the text, so padding spans carry the background
-/// too.
+/// One sidebar row: the `▏` selection bar, the title (truncated to fit), and
+/// a right-aligned unread badge (`@` prefix marks unread mentions, per spec
+/// §6.1's sidebar mock). A selected row paints `surface_raised` across its
+/// full width, not just the text, so the padding spans carry the background
+/// too — the bar and that wash are the entire selection treatment
+/// (design language §5).
 fn chat_row_line(chat: &ChatView, selected: bool, width: u16, theme: &Theme) -> Line<'static> {
     let width = width as usize;
-    let marker: &'static str = if selected { "▸ " } else { "  " };
 
     let badge = badge_text(chat);
     let badge_width = badge.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
     let badge_col = if badge_width > 0 { badge_width + 1 } else { 0 };
 
-    let title_budget = width.saturating_sub(2 + badge_col);
+    let title_budget = width.saturating_sub(MARKER_WIDTH + badge_col);
     let title = truncate_to_width(&chat.title, title_budget);
-    let used = 2 + title.width() + badge_col;
+    let used = MARKER_WIDTH + title.width() + badge_col;
     let mid_pad = width.saturating_sub(used);
 
-    let row_bg = selected.then_some(theme.selection);
+    let row_bg = selected.then_some(theme.surface_raised);
     let with_row_bg = |mut style: Style| {
         if let Some(bg) = row_bg {
             style = style.bg(bg);
@@ -387,11 +414,6 @@ fn chat_row_line(chat: &ChatView, selected: bool, width: u16, theme: &Theme) -> 
         style
     };
 
-    let marker_style = with_row_bg(if selected {
-        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(theme.text_muted)
-    });
     let text_style = with_row_bg(if chat.is_muted {
         Style::new().fg(theme.text_muted)
     } else {
@@ -399,7 +421,11 @@ fn chat_row_line(chat: &ChatView, selected: bool, width: u16, theme: &Theme) -> 
     });
 
     let mut spans = vec![
-        Span::styled(marker, marker_style),
+        Span::styled(
+            if selected { "▏" } else { " " },
+            with_row_bg(Style::new().fg(theme.accent)),
+        ),
+        Span::styled(" ", with_row_bg(Style::new())),
         Span::styled(title, text_style),
     ];
     if mid_pad > 0 {
@@ -408,11 +434,15 @@ fn chat_row_line(chat: &ChatView, selected: bool, width: u16, theme: &Theme) -> 
     if let Some(badge) = badge {
         spans.push(Span::styled(" ", with_row_bg(Style::new())));
         let mentioned = chat.unread_mention_count > 0;
-        let badge_style = with_row_bg(if mentioned {
-            Style::new().fg(theme.warning).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(theme.accent)
-        });
+        let badge_style = with_row_bg(
+            Style::new()
+                .fg(if mentioned {
+                    theme.warning
+                } else {
+                    theme.accent
+                })
+                .add_modifier(Modifier::BOLD),
+        );
         spans.push(Span::styled(badge, badge_style));
     }
     Line::from(spans)

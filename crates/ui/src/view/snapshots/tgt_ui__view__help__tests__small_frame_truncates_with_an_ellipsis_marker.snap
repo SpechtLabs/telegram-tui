@@ -2,27 +2,27 @@
 source: crates/ui/src/view/help.rs
 expression: rendered
 ---
-┌──────────────────────────────────── help ────────────────────────────────────┐
-│Global                                                                        │
-│  ctrl+p             open command palette                                     │
-│  ?                  show this help                                           │
-│  ctrl+c             quit                                                     │
-│Panes                                                                         │
-│  ← / →              move focus between panes                                 │
-│  tab / shift+tab    cycle panes                                              │
-│Chat list                                                                     │
-│  ↑ / ↓              move selection                                           │
-│  ⏎                  open chat                                                │
-│  /                  filter chats                                             │
-│  a                  toggle archive                                           │
-│  [ / ]              cycle folders                                            │
-│Composer                                                                      │
-│  type               write a message                                          │
-│  ⏎                  send                                                     │
-│  alt+⏎              insert newline                                           │
-│  ↑ (empty input)    enter selection mode                                     │
-│  /send <path>       send a file                                              │
-│…                                                                             │
+╭──────────────────────────────────── help ────────────────────────────────────╮
+│  Global                                                                      │
+│    ctrl+p             open command palette                                   │
+│    ?                  show this help                                         │
+│    ctrl+c             quit                                                   │
+│  Panes                                                                       │
+│    ← / →              move focus between panes                               │
+│    tab / shift+tab    cycle panes                                            │
+│  Chat list                                                                   │
+│    ↑ / ↓              move selection                                         │
+│    ⏎                  open chat                                              │
+│    /                  filter chats                                           │
+│    a                  toggle archive                                         │
+│    [ / ]              cycle folders                                          │
+│  Composer                                                                    │
+│    type               write a message                                        │
+│    ⏎                  send                                                   │
+│    alt+⏎              insert newline                                         │
+│    ↑ (empty input)    enter selection mode                                   │
+│    /send <path>       send a file                                            │
+│  …                                                                           │
 │                                                                              │
-│esc close                                                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
+│  esc close                                                                   │
+╰──────────────────────────────────────────────────────────────────────────────╯

@@ -4,10 +4,10 @@ expression: rendered
 ---
                                                             
                                                             
-                 ┌─── Delete message? ────┐                 
-                 │                        │                 
-                 │      Delete for me     │                 
-                 │   Delete for everyone  │                 
-                 │                        │                 
-                 │ ⏎ confirm · esc cancel │                 
-                 └────────────────────────┘
+                ╭──── Delete message? ─────╮                
+                │                          │                
+                │       Delete for me      │                
+                │    Delete for everyone   │                
+                │                          │                
+                │  ⏎ confirm · esc cancel  │                
+                ╰──────────────────────────╯

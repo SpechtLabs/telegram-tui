@@ -5,9 +5,9 @@ expression: rendered
                                                             
                                                             
                                                             
-                 ┌─── Delete message? ────┐                 
-                 │                        │                 
-                 │      Delete for me     │                 
-                 │                        │                 
-                 │ ⏎ confirm · esc cancel │                 
-                 └────────────────────────┘
+                ╭──── Delete message? ─────╮                
+                │                          │                
+                │       Delete for me      │                
+                │                          │                
+                │  ⏎ confirm · esc cancel  │                
+                ╰──────────────────────────╯

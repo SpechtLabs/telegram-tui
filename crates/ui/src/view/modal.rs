@@ -13,7 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::state::focus::{Focus, ModalKind};
 use tgt_core::state::modal::ModalState;
@@ -57,17 +57,31 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// An overlay panel: rounded, single-line border in `theme.border` on
+/// `surface_raised`, two columns of internal padding, centered
+/// (docs/design-language.md §1). The panel is told apart from the frame
+/// behind it by its raised surface, so its border does not also have to
+/// shout in `accent`.
 fn panel(area: Rect, theme: &Theme, f: &mut Frame, width: u16, height: u16, title: &str) -> Rect {
     let outer = centered(area, width, height);
     f.render_widget(Clear, outer);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(Line::from(format!(" {title} ")).centered())
-        .style(Style::new().bg(theme.surface))
-        .border_style(Style::new().fg(theme.accent));
+        .style(Style::new().bg(theme.surface_raised))
+        .border_style(Style::new().fg(theme.border))
+        .padding(Padding::horizontal(PANEL_PADDING));
     let inner = block.inner(outer);
     f.render_widget(block, outer);
     inner
 }
+
+/// Columns of internal padding on each side of an overlay panel, and the
+/// per-side allowance every width calculation below has to add on top of
+/// the border column.
+const PANEL_PADDING: u16 = 2;
+/// Border + padding, both sides: what a panel costs around its content.
+const PANEL_CHROME: u16 = 2 * (1 + PANEL_PADDING);
 
 const DELETE_FOR_ME: &str = "Delete for me";
 const DELETE_FOR_EVERYONE: &str = "Delete for everyone";
@@ -92,7 +106,7 @@ fn draw_confirm_delete(
         .map(|s| s.chars().count() as u16)
         .max()
         .unwrap_or(0)
-        + 4;
+        + PANEL_CHROME;
     // title line already drawn by panel(); body = blank + options + blank + hint.
     let height = 1 + options.len() as u16 + 2;
     let inner = panel(area, theme, f, width, height + 2, "Delete message?");
@@ -123,7 +137,7 @@ fn draw_confirm_send_file(area: Rect, theme: &Theme, f: &mut Frame, path: &std::
         .map(|s| s.chars().count() as u16)
         .max()
         .unwrap_or(0)
-        + 4;
+        + PANEL_CHROME;
     let inner = panel(area, theme, f, width, 6, "Send file?");
 
     let lines = vec![

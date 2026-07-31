@@ -1,10 +1,10 @@
 //! Composer view: rounded input box, reply/edit banners (spec §6.1 mock).
 //!
 //! ```text
-//! ↳ Alice: hey, did you see the PR?      <- reply banner (only when reply_to)
-//! ✎ editing message                     <- edit banner (only when editing)
+//!   ↳ Alice: hey, did you see the PR?    <- reply banner (only when reply_to)
+//!   ✎ editing message                   <- edit banner (only when editing)
 //! ╭──────────────────────────────────────╮
-//! │ ›  message…                          │
+//! │  ›  message…                         │
 //! ╰──────────────────────────────────────╯
 //! ```
 //!
@@ -37,11 +37,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::model::ids::MessageId;
 use tgt_core::model::message::MessageContent;
 use tgt_core::state::auth::InputField;
+use tgt_core::state::focus::Focus;
 use tgt_core::state::selection::REPLY_EXCERPT_MAX_CHARS;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -52,6 +53,9 @@ const PROMPT: &str = "› ";
 // Leading space matches the spec §6.1 mock's `›  message…` (arrow, two
 // spaces, placeholder) and `view::root`'s existing pre-T30 stub text.
 const PLACEHOLDER: &str = " message…";
+/// Border column plus the box's one column of interior padding: what a
+/// banner has to clear to sit above the draft rather than beside it.
+const BANNER_INDENT: usize = 2;
 
 pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
     let composer = &state.composer;
@@ -61,16 +65,10 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
         banners.push(reply_banner_line(state, reply_id, theme));
     }
     if composer.editing.is_some() {
-        banners.push(Line::from(Span::styled(
-            "✎ editing message",
-            Style::new().fg(theme.warning),
-        )));
+        banners.push(banner_line("✎ editing message".to_string(), theme.warning));
     }
     if composer.pending_send.is_some() {
-        banners.push(Line::from(Span::styled(
-            "sending…",
-            Style::new().fg(theme.text_muted),
-        )));
+        banners.push(banner_line("sending…".to_string(), theme.text_muted));
     }
     // Upload progress line goes here once T39/T40 land (see module docs).
 
@@ -82,13 +80,30 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
         f.render_widget(Paragraph::new(banners), banner_area);
     }
 
-    draw_input_box(box_area, &composer.input, theme, f);
+    let focused = matches!(state.focus.current(), Focus::Composer);
+    draw_input_box(box_area, &composer.input, focused, theme, f);
 }
 
-fn draw_input_box(area: Rect, field: &InputField, theme: &Theme, f: &mut Frame) {
+/// A banner above the box, indented by the box's own border and padding so
+/// its text lines up with the draft underneath it.
+fn banner_line(text: String, color: ratatui::style::Color) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ".repeat(BANNER_INDENT)),
+        Span::styled(text, Style::new().fg(color)),
+    ])
+}
+
+/// The composer is the one box the design language keeps: a border is the
+/// clearest way to say "type here". It stays in `theme.border` and brightens
+/// to `accent` only while the composer holds focus, so focus is shown by the
+/// affordance rather than by recoloring the text inside it
+/// (docs/design-language.md §1).
+fn draw_input_box(area: Rect, field: &InputField, focused: bool, theme: &Theme, f: &mut Frame) {
+    let border = if focused { theme.accent } else { theme.border };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.text_muted));
+        .border_style(Style::new().fg(border))
+        .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -226,7 +241,7 @@ fn reply_banner_line(state: &AppState, reply_id: MessageId, theme: &Theme) -> Li
         Some(msg) => format!("↳ {}: {}", msg.sender_name, excerpt_of(&msg.content)),
         None => "↳ …".to_string(),
     };
-    Line::from(Span::styled(text, Style::new().fg(theme.text_muted)))
+    banner_line(text, theme.text_muted)
 }
 
 /// One line, capped at [`REPLY_EXCERPT_MAX_CHARS`] characters. Mirrors

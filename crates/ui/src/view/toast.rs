@@ -14,13 +14,15 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::state::toasts::Toast;
 
 use crate::theme::Theme;
 
-const TOAST_WIDTH: u16 = 32;
+/// Wide enough that a chat title and a short body still have ~26 columns of
+/// text after the border and the two columns of padding on each side.
+const TOAST_WIDTH: u16 = 36;
 /// Top border + title line + body line + bottom border.
 const TOAST_HEIGHT: u16 = 4;
 const MARGIN: u16 = 1;
@@ -51,11 +53,16 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     }
 }
 
+/// One toast panel, styled like every other overlay in the app: rounded
+/// single-line border in `theme.border` on `surface_raised`, two columns of
+/// internal padding (docs/design-language.md §1).
 fn draw_one(f: &mut Frame, theme: &Theme, rect: Rect, toast: &Toast) {
     f.render_widget(Clear, rect);
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .style(Style::new().bg(theme.surface_raised).fg(theme.text_muted));
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .style(Style::new().bg(theme.surface_raised))
+        .border_style(Style::new().fg(theme.border))
+        .padding(Padding::horizontal(2));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 

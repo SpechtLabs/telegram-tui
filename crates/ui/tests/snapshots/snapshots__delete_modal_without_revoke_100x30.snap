@@ -14,9 +14,9 @@ expression: "render(100, 30, &state)"
                                                                                                     
                                                                                                     
                                                                                                     
-                                     ┌─── Delete message? ────┐                                     
-                                     │                        │                                     
-                                     │      Delete for me     │                                     
-                                     │                        │                                     
-                                     │ ⏎ confirm · esc cancel │                                     
-                                     └────────────────────────┘
+                                    ╭──── Delete message? ─────╮                                    
+                                    │                          │                                    
+                                    │       Delete for me      │                                    
+                                    │                          │                                    
+                                    │  ⏎ confirm · esc cancel  │                                    
+                                    ╰──────────────────────────╯

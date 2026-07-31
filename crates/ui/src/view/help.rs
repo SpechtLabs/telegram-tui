@@ -43,7 +43,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::state::focus::Focus;
 
@@ -240,7 +240,9 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
         .unwrap_or(0)
         .max(TITLE.len())
         .max(FOOTER.len());
-    let width = ((max_content_width as u16) + 4).min(area.width);
+    // Border column plus two columns of internal padding, both sides
+    // (docs/design-language.md §1).
+    let width = ((max_content_width as u16) + 6).min(area.width);
 
     // Overhead outside the content rows: 2 border lines, 1 blank separator,
     // 1 footer line.
@@ -251,9 +253,11 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
 
     f.render_widget(Clear, outer);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(Line::from(format!(" {TITLE} ")).centered())
-        .style(Style::new().bg(theme.surface))
-        .border_style(Style::new().fg(theme.accent));
+        .style(Style::new().bg(theme.surface_raised))
+        .border_style(Style::new().fg(theme.border))
+        .padding(Padding::horizontal(2));
     let inner = block.inner(outer);
     f.render_widget(block, outer);
 

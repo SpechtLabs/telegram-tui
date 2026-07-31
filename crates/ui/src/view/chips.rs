@@ -1,11 +1,13 @@
 //! Selection-mode action chip row (spec §6.3 mock:
 //! `‹ [R Reply] [F Forward] [E React] [C Copy] [D Delete] ›`).
 //!
-//! Each chip renders as `[<SHORTCUT> <Label>]`: the shortcut letter
-//! (uppercased) in `theme.accent` bold, the rest in `theme.text`. The
-//! focused chip (`SelectionState::chip_cursor`) additionally paints
-//! `theme.selection` across its whole cell, mirroring how `chat_list.rs`
-//! paints the selected row.
+//! Each chip renders as `[<SHORTCUT> <Label>]`. The row has two states and
+//! only two: the focused chip (`SelectionState::chip_cursor`) sits on
+//! `surface_raised` with its shortcut letter in `accent` bold and its label
+//! in `text`; every other chip is uniformly `text_muted` with its letter in
+//! `accent_dim`, so the row reads as one dim strip with a single lit cell
+//! rather than five competing buttons (docs/design-language.md §5 — focus is
+//! a background and an accent, never inverse video).
 //!
 //! `core` (`state/selection.rs`) tracks `chip_scroll` as the first visible
 //! chip index but has no way to measure the terminal, so it assumes a fixed
@@ -61,8 +63,7 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
             spans.push(Span::raw(" "));
         }
         let idx = start + i;
-        let bg = (idx == sel.chip_cursor).then_some(theme.selection);
-        spans.extend(chip_spans(*chip, bg, theme));
+        spans.extend(chip_spans(*chip, idx == sel.chip_cursor, theme));
     }
     if right_arrow {
         spans.push(Span::styled(" ›", Style::new().fg(theme.text_muted)));
@@ -109,16 +110,34 @@ fn chip_width(chip: Chip) -> usize {
     chip.label().len() + 4
 }
 
-fn chip_spans(chip: Chip, bg: Option<Color>, theme: &Theme) -> Vec<Span<'static>> {
-    let plain = with_bg(Style::new().fg(theme.text), bg);
-    let letter = with_bg(
-        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+fn chip_spans(chip: Chip, focused: bool, theme: &Theme) -> Vec<Span<'static>> {
+    let bg = focused.then_some(theme.surface_raised);
+    let plain = with_bg(
+        Style::new().fg(if focused {
+            theme.text
+        } else {
+            theme.text_muted
+        }),
         bg,
     );
+    let letter = with_bg(
+        Style::new()
+            .fg(if focused {
+                theme.accent
+            } else {
+                theme.accent_dim
+            })
+            .add_modifier(Modifier::BOLD),
+        bg,
+    );
+    // The brackets belong to the chrome of the chip, not to its label, so
+    // they stay dim even on the focused one.
+    let bracket = with_bg(Style::new().fg(theme.text_muted), bg);
     vec![
-        Span::styled("[", plain),
+        Span::styled("[", bracket),
         Span::styled(chip.shortcut().to_ascii_uppercase().to_string(), letter),
-        Span::styled(format!(" {}]", chip.label()), plain),
+        Span::styled(format!(" {}", chip.label()), plain),
+        Span::styled("]", bracket),
     ]
 }
 

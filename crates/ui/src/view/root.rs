@@ -4,6 +4,23 @@
 //! — and differ only in the `Rect` arithmetic that feeds them; the stack is
 //! not a second implementation.
 //!
+//! ## Chrome (docs/design-language.md §1)
+//!
+//! Regions are separated by space and contrast, not by boxes. There is no
+//! outer frame: the app fills the terminal. The entire line budget for the
+//! main view is two rules — one vertical between the sidebar and the main
+//! column, one horizontal under the chat header — both in `theme.border`,
+//! which is dimmer than `text_muted` so chrome never competes with content.
+//! Everything else is separated by whitespace.
+//!
+//! [`pad`] is the one place that whitespace comes from: every region this
+//! layout hands to a component is inset one column on each side and one row
+//! at the top, so no content ever touches a rule or the terminal edge. The
+//! components draw from `(0, 0)` of whatever they are given and know nothing
+//! about the padding — which is also why the hit regions recorded here are
+//! the *padded* rects: the map has to describe the cells that were actually
+//! painted.
+//!
 //! Which single-pane screen shows is a pure function of state: no open chat,
 //! or focus still on the chat list / its filter, shows the list; otherwise
 //! (a chat is open and focus has moved off the list, i.e. onto the composer
@@ -14,9 +31,9 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::model::hit::{HitTarget, ScrollArea};
 use tgt_core::state::focus::Focus;
@@ -33,6 +50,63 @@ const SIDEBAR_WIDTH: u16 = 30;
 /// The composer's bare rounded box: two border rows and one row of text.
 /// Banners stack on top of it (see [`composer_banner_rows`]).
 const COMPOSER_BOX_ROWS: u16 = 3;
+
+/// The header region: its blank breathing row plus the title line.
+const HEADER_ROWS: u16 = 2;
+
+/// The bottom row's region: its blank breathing row plus the hint (or chip)
+/// line itself.
+const BOTTOM_ROWS: u16 = 2;
+
+/// Insets a region for its content: one column of horizontal padding on each
+/// side, one blank row above the first content row (design language §1).
+/// Saturating throughout, so a region squeezed to nothing by a tiny terminal
+/// collapses to an empty `Rect` rather than wrapping around.
+fn pad(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(1),
+    }
+}
+
+/// The vertical rule between the sidebar and the main column: one column
+/// wide, drawn as a `Block`'s left edge so it spans the full height without
+/// this module repeating a glyph.
+fn draw_vertical_rule(area: Rect, theme: &Theme, f: &mut Frame) {
+    f.render_widget(
+        Block::new()
+            .borders(Borders::LEFT)
+            .border_style(Style::new().fg(theme.border)),
+        area,
+    );
+}
+
+/// The horizontal rule under the chat header, drawn the same way on a
+/// one-row area.
+fn draw_horizontal_rule(area: Rect, theme: &Theme, f: &mut Frame) {
+    f.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(theme.border)),
+        area,
+    );
+}
+
+/// Where the header's rule meets the sidebar's rule, so the two read as one
+/// piece of chrome instead of a `│` sitting next to an unrelated `─`.
+fn draw_rule_junction(x: u16, y: u16, theme: &Theme, f: &mut Frame) {
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled("├", Style::new().fg(theme.border)))),
+        Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        },
+    );
+}
 
 /// `cache` is threaded down to the conversation pane, the only view that lays
 /// messages out and therefore the only one that can hit or fill it.
@@ -57,17 +131,11 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCa
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme.surface)), area);
 
-    let outer = Block::bordered()
-        .title(Line::from(" telegram-tui ").left_aligned())
-        .border_style(Style::new().fg(theme.text_muted));
-    let inner = outer.inner(area);
-    f.render_widget(outer, area);
-
     let mut hits = HitMap::new();
     if state.width >= state.layout_breakpoint_cols {
-        draw_two_pane(inner, state, theme, f, cache, &mut hits);
+        draw_two_pane(area, state, theme, f, cache, &mut hits);
     } else {
-        draw_single_pane(inner, state, theme, f, cache, &mut hits);
+        draw_single_pane(area, state, theme, f, cache, &mut hits);
     }
 
     draw_overlays(state, theme, f);
@@ -133,8 +201,9 @@ fn draw_bottom_row(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
     }
 }
 
-/// Two-pane arrangement (spec §6.1 mock): fixed sidebar, main column with the
-/// chat header above the conversation, hint bar spanning the bottom.
+/// Two-pane arrangement (spec §6.1's layout, this module's chrome): fixed
+/// sidebar, one vertical rule, main column with the chat header over the
+/// conversation, hint bar spanning the bottom.
 fn draw_two_pane(
     area: Rect,
     state: &AppState,
@@ -143,22 +212,34 @@ fn draw_two_pane(
     cache: &mut LayoutCache,
     hits: &mut HitMap,
 ) {
-    let [content_area, hint_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let [content_area, bottom_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(BOTTOM_ROWS)]).areas(area);
 
-    let [sidebar_area, main_area] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
-            .areas(content_area);
+    let [sidebar_area, rule_area, main_area] = Layout::horizontal([
+        Constraint::Length(SIDEBAR_WIDTH),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(content_area);
 
-    hits.push_area(sidebar_area, ScrollArea::ChatList);
-    chat_list::draw(sidebar_area, state, theme, f, hits);
+    draw_vertical_rule(rule_area, theme, f);
 
-    let [header_area, body_area] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(main_area);
-    header::draw(header_area, state, theme, f);
+    let sidebar = pad(sidebar_area);
+    hits.push_area(sidebar, ScrollArea::ChatList);
+    chat_list::draw(sidebar, state, theme, f, hits);
+
+    let [header_area, header_rule, body_area] = Layout::vertical([
+        Constraint::Length(HEADER_ROWS),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(main_area);
+    header::draw(pad(header_area), state, theme, f);
+    draw_horizontal_rule(header_rule, theme, f);
+    draw_rule_junction(rule_area.x, header_rule.y, theme, f);
     draw_conversation_and_composer(body_area, state, theme, f, cache, hits);
 
-    draw_bottom_row(hint_area, state, theme, f);
+    draw_bottom_row(pad(bottom_area), state, theme, f);
 }
 
 /// Single-pane stack below the breakpoint (spec §6.1): full-width chat list,
@@ -176,24 +257,27 @@ fn draw_single_pane(
         || matches!(state.focus.current(), Focus::ChatList | Focus::ChatFilter);
 
     if showing_chat_list {
-        let [list_area, hint_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-        hits.push_area(list_area, ScrollArea::ChatList);
-        chat_list::draw(list_area, state, theme, f, hits);
-        draw_bottom_row(hint_area, state, theme, f);
+        let [list_area, bottom_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(BOTTOM_ROWS)]).areas(area);
+        let list = pad(list_area);
+        hits.push_area(list, ScrollArea::ChatList);
+        chat_list::draw(list, state, theme, f, hits);
+        draw_bottom_row(pad(bottom_area), state, theme, f);
         return;
     }
 
-    let [breadcrumb_area, body_area, hint_area] = Layout::vertical([
+    let [breadcrumb_area, breadcrumb_rule, body_area, bottom_area] = Layout::vertical([
+        Constraint::Length(HEADER_ROWS),
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(BOTTOM_ROWS),
     ])
     .areas(area);
 
-    draw_breadcrumb(breadcrumb_area, state, theme, f);
+    draw_breadcrumb(pad(breadcrumb_area), state, theme, f);
+    draw_horizontal_rule(breadcrumb_rule, theme, f);
     draw_conversation_and_composer(body_area, state, theme, f, cache, hits);
-    draw_bottom_row(hint_area, state, theme, f);
+    draw_bottom_row(pad(bottom_area), state, theme, f);
 }
 
 /// `telegram ▸ <chat title>` (spec §6.1): the single-pane stack's back
@@ -207,9 +291,12 @@ fn draw_breadcrumb(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
         .unwrap_or_default();
 
     let line = Line::from(vec![
-        Span::styled("telegram ", Style::new().fg(theme.text)),
-        Span::styled("▸ ", Style::new().fg(theme.accent)),
-        Span::styled(title.to_string(), Style::new().fg(theme.text)),
+        Span::styled("telegram ", Style::new().fg(theme.text_muted)),
+        Span::styled("▸ ", Style::new().fg(theme.text_muted)),
+        Span::styled(
+            title.to_string(),
+            Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -228,8 +315,15 @@ fn draw_conversation_and_composer(
     hits: &mut HitMap,
 ) {
     let composer_height = COMPOSER_BOX_ROWS + composer_banner_rows(state);
-    let [conversation_area, composer_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(composer_height)]).areas(area);
+    // The blank row between the two is the same "regions are separated by
+    // space" rule the rest of this layout follows; the composer's own box
+    // would otherwise butt straight against the last message.
+    let [conversation_area, _gap, composer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(composer_height),
+    ])
+    .areas(pad(area));
 
     hits.push_area(conversation_area, ScrollArea::Conversation);
     conversation::draw(conversation_area, state, theme, f, cache, hits);

@@ -36,7 +36,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::state::palette::{CommandId, PaletteItem, PaletteState};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -57,11 +57,17 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     let height = raw_height.max(5).min(area.height as u32) as u16;
     let outer = centered(area, width, height);
 
+    // Rounded, one-line border in `border` on `surface_raised`, two columns
+    // of internal padding (docs/design-language.md §1): the same panel
+    // treatment `view::modal` and `view::help` use, so the three overlays
+    // read as one family.
     f.render_widget(Clear, outer);
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(Line::from(" palette ").centered())
-        .style(Style::new().bg(theme.surface))
-        .border_style(Style::new().fg(theme.accent));
+        .style(Style::new().bg(theme.surface_raised))
+        .border_style(Style::new().fg(theme.border))
+        .padding(Padding::horizontal(2));
     let inner = block.inner(outer);
     f.render_widget(block, outer);
 
@@ -126,7 +132,7 @@ fn draw_separator(area: Rect, theme: &Theme, f: &mut Frame) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "\u{2500}".repeat(area.width as usize),
-            Style::new().fg(theme.text_muted),
+            Style::new().fg(theme.border),
         ))),
         area,
     );
@@ -193,7 +199,11 @@ fn result_row_line(
     theme: &Theme,
 ) -> Line<'static> {
     let width = width as usize;
-    let marker: &'static str = if selected { "\u{25b8} " } else { "  " };
+    // The same selection idiom as the chat list: an accent bar at the left
+    // edge plus a wash across the row. `selection` rather than
+    // `surface_raised` because the panel itself is already raised, and a row
+    // painted its own background colour would be invisible on it.
+    let marker: &'static str = if selected { "\u{258f} " } else { "  " };
     let row_bg = selected.then_some(theme.selection);
     let with_row_bg = |mut style: Style| {
         if let Some(bg) = row_bg {
@@ -221,11 +231,7 @@ fn result_row_line(
 
     let base_style = with_row_bg(Style::new().fg(theme.text));
     let match_style = with_row_bg(Style::new().fg(theme.accent).add_modifier(Modifier::BOLD));
-    let marker_style = with_row_bg(if selected {
-        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(theme.text_muted)
-    });
+    let marker_style = with_row_bg(Style::new().fg(theme.accent));
 
     let (label_spans, label_width) =
         label_spans(&label, &positions, label_budget, base_style, match_style);

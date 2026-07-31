@@ -2,8 +2,8 @@
 source: crates/ui/src/view/composer.rs
 expression: "render_to_string(40, 5, &state)"
 ---
-↳ Alice: hey, did you see the PR?       
+  ↳ Alice: hey, did you see the PR?     
 ╭──────────────────────────────────────╮
-│›  message…                           │
+│ ›  message…                          │
 │                                      │
 ╰──────────────────────────────────────╯

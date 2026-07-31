@@ -500,9 +500,10 @@ fn hit_map_resolves_chat_rows_messages_and_the_composer_140x40() {
 
     let (rendered, hits) = render_with_hits(140, 40, &state);
 
-    // Sidebar: the selected chat's own row. Column 5 is inside the sidebar
-    // (outer border, pane border, then the `▸ ` marker).
-    let chat_row = row_showing(&rendered, "▸ Alice Müller");
+    // Sidebar: the selected chat's own row, found by its `▏` selection bar
+    // (docs/design-language.md §5). Column 5 is inside the sidebar, past the
+    // region padding and the bar.
+    let chat_row = row_showing(&rendered, "▏ Alice Müller");
     assert_eq!(
         hits.target_at(5, chat_row),
         Some(HitTarget::ChatRow(MAIN_CHAT))

@@ -3,6 +3,6 @@ source: crates/ui/src/view/composer.rs
 expression: "render_to_string(40, 4, &state)"
 ---
 ╭──────────────────────────────────────╮
-│›  message…                           │
+│ ›  message…                          │
 │                                      │
 ╰──────────────────────────────────────╯
