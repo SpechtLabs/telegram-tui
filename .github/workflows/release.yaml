@@ -23,6 +23,15 @@ permissions:
   pull-requests: write
   id-token: write
 
+# A new push supersedes the run in flight. The three-platform matrix is not
+# cheap even when it is free — macOS runners bill at 10x and Windows at 2x on
+# private repos — and a superseded run proves nothing about the current head.
+# Releases are exempt: cancelling one half-way could leave a tag published
+# with no binary attached to it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   ci:
     name: CI
