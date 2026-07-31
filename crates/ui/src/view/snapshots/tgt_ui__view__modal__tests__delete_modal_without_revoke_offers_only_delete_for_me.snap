@@ -1,0 +1,13 @@
+---
+source: crates/ui/src/view/modal.rs
+expression: rendered
+---
+                                                            
+                                                            
+                                                            
+                 ┌─── Delete message? ────┐                 
+                 │                        │                 
+                 │      Delete for me     │                 
+                 │                        │                 
+                 │ ⏎ confirm · esc cancel │                 
+                 └────────────────────────┘

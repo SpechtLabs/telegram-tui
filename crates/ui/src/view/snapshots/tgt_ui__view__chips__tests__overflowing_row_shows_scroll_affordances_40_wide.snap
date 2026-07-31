@@ -1,0 +1,5 @@
+---
+source: crates/ui/src/view/chips.rs
+expression: rendered
+---
+‹ [E React] [C Copy] [D Edit] ›
