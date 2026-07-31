@@ -273,6 +273,37 @@ fn reanchor_after_deletion(messages: &VecDeque<MessageView>, deleted_id: Message
 /// Routes a `GetChatHistory` completion through the T17 paging machine, then
 /// prepends whatever came back and enforces the window bound. See the module
 /// doc comment for the eviction rule.
+///
+/// ## T59 additions: local-first history and the remote reconcile
+///
+/// `only_local` here is the flag of the *request that just completed* (not a
+/// property of `convo.paging`, which the machine already moved on from by
+/// the time this reads it) — that is what both additions below key off:
+///
+/// - **The opening request has no `oldest_loaded` to retry from.** The
+///   paging machine's empty-response trap (spec §5.2) needs a message id to
+///   re-request from; `chat_list`/`palette` mark the opening request
+///   `Loading` the same way scroll-triggered paging does (see their
+///   `open_chat_requests_local_first` tests), so an empty completion drives
+///   `on_history_loaded` into `Loading` wanting a remote retry — but with
+///   nothing loaded yet, `oldest_loaded` is `None` and the machine (correctly
+///   generic — it doesn't know about TDLib's id-0 sentinel) has nothing to
+///   build a `Request` from. Detected here as "ended in `Loading` with no
+///   directive and nothing loaded": retry from `MessageId(0)`, the same
+///   "newest message" sentinel the opening request itself used. This applies
+///   uniformly to every empty attempt while the window is still empty (local
+///   or remote), not just the first.
+/// - **A non-empty completion of a request that was itself `only_local:
+///   true` only proves what TDLib's on-disk cache already had.** Messages
+///   that arrived on another device (or on this one, from the server) while
+///   the app was closed are not in that cache yet. Exactly one follow-up
+///   `GetChatHistory { from_message_id: MessageId(0), only_local: false }`
+///   reconciles them; [`prepend_messages`]'s dedupe-by-id absorbs whatever
+///   overlaps. Keyed strictly off this call's `only_local` parameter — never
+///   off `convo.paging`, which a scroll-up page racing the reconcile could
+///   otherwise put back into `Loading` — so the reconcile's own completion
+///   (always `only_local: false`) can never spawn another one: that is the
+///   loop guard.
 pub fn apply_history_page(
     app: &mut AppState,
     chat_id: ChatId,
@@ -286,29 +317,53 @@ pub fn apply_history_page(
     match outcome {
         Ok(msgs) => {
             let oldest_loaded = convo.messages.front().map(|m| m.id);
-            let directive = history::on_history_loaded(
-                &mut convo.paging,
-                msgs.len(),
-                only_local,
-                oldest_loaded,
-            );
+            let received = msgs.len();
+            let directive =
+                history::on_history_loaded(&mut convo.paging, received, only_local, oldest_loaded);
 
             prepend_messages(&mut convo.messages, msgs);
             evict_excess(&mut convo.messages, &convo.scroll);
             drop_selection_if_gone(convo);
 
+            let mut effects = Vec::new();
+
             match directive {
                 PagingDirective::Request {
                     from_message_id,
                     only_local,
-                } => vec![Effect::Td(TdRequest::GetChatHistory {
+                } => effects.push(Effect::Td(TdRequest::GetChatHistory {
                     chat_id,
                     from_message_id,
                     limit: history::PAGE_SIZE,
                     only_local,
-                })],
-                PagingDirective::None => Vec::new(),
+                })),
+                PagingDirective::None
+                    if oldest_loaded.is_none()
+                        && matches!(convo.paging, PagingState::Loading { .. }) =>
+                {
+                    // See the doc comment: the empty-response retry has
+                    // nothing loaded to anchor on yet, so retry from
+                    // TDLib's "newest message" sentinel instead.
+                    effects.push(Effect::Td(TdRequest::GetChatHistory {
+                        chat_id,
+                        from_message_id: MessageId(0),
+                        limit: history::PAGE_SIZE,
+                        only_local: false,
+                    }));
+                }
+                PagingDirective::None => {}
             }
+
+            if only_local && received > 0 {
+                effects.push(Effect::Td(TdRequest::GetChatHistory {
+                    chat_id,
+                    from_message_id: MessageId(0),
+                    limit: history::PAGE_SIZE,
+                    only_local: false,
+                }));
+            }
+
+            effects
         }
         Err(e) => {
             let retry_after = match e {
@@ -1228,6 +1283,110 @@ mod tests {
         let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(1)]));
         assert!(effects.is_empty());
         assert!(app.conversations.is_empty());
+    }
+
+    // --- T59: local-first history / remote reconcile ------------------
+
+    /// The shape `chat_list::open_selected`/`palette::open_chat` produce: an
+    /// opening request tracked as `Loading { only_local: true }` against an
+    /// empty window (nothing loaded yet, so `oldest_loaded` is `None`).
+    fn fixture_opening(app: &mut AppState) {
+        open(app, CHAT);
+        app.conversations.get_mut(&CHAT).unwrap().paging = PagingState::Loading {
+            attempt: 1,
+            only_local: true,
+        };
+    }
+
+    #[test]
+    fn local_page_applies_and_issues_one_remote_reconcile() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+
+        let page: Vec<MessageView> = (1..=50).map(msg).collect();
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(page));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Td(TdRequest::GetChatHistory {
+                    chat_id: CHAT,
+                    from_message_id: MessageId(0),
+                    limit: history::PAGE_SIZE,
+                    only_local: false,
+                })]
+            ),
+            "exactly one reconcile request, from the newest-message sentinel: {effects:?}"
+        );
+        let convo = &app.conversations[&CHAT];
+        assert_eq!(
+            convo.messages.len(),
+            50,
+            "the local page rendered instantly"
+        );
+        assert_eq!(convo.paging, PagingState::Idle);
+    }
+
+    /// The reconcile's own completion (`only_local: false`) must never spawn
+    /// another one — the loop guard is keyed strictly off `only_local`, not
+    /// off `paging`, which is already back to `Idle` by this point regardless.
+    #[test]
+    fn remote_completion_never_spawns_reconcile() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+        let page: Vec<MessageView> = (1..=50).map(msg).collect();
+        apply_history_page(&mut app, CHAT, true, &Ok(page));
+
+        // The reconcile lands: two genuinely new, newer messages plus an
+        // overlapping tail of what the local page already had.
+        let mut reconcile_page: Vec<MessageView> = (30..=50).map(msg).collect();
+        reconcile_page.push(msg(51));
+        reconcile_page.push(msg(52));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(reconcile_page));
+
+        assert!(
+            effects.is_empty(),
+            "a remote completion must never spawn a reconcile of its own: {effects:?}"
+        );
+        let convo = &app.conversations[&CHAT];
+        assert_eq!(convo.messages.len(), 52, "no duplicates from the overlap");
+        assert!(convo.messages.iter().any(|m| m.id == MessageId(51)));
+        assert!(convo.messages.iter().any(|m| m.id == MessageId(52)));
+        let ids: Vec<i64> = convo.messages.iter().map(|m| m.id.0).collect();
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids.len(), deduped.len(), "no duplicate ids in the window");
+    }
+
+    /// The empty-response trap (spec §5.2), through the machine, for the one
+    /// request shape it never had to handle before T59: the very first page,
+    /// where nothing loaded yet means there is no `oldest_loaded` id to retry
+    /// from. The retry must still happen, from TDLib's newest-message
+    /// sentinel.
+    #[test]
+    fn empty_local_page_refetches_remote() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(Vec::new()));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Td(TdRequest::GetChatHistory {
+                chat_id: CHAT,
+                from_message_id: MessageId(0),
+                limit: history::PAGE_SIZE,
+                only_local: false,
+            })]
+        ));
+        assert_eq!(
+            app.conversations[&CHAT].paging,
+            PagingState::Loading {
+                attempt: 1,
+                only_local: false,
+            }
+        );
+        assert!(app.conversations[&CHAT].messages.is_empty());
     }
 
     // --- handle_key ----------------------------------------------------

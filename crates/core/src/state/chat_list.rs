@@ -462,12 +462,25 @@ fn move_selection(app: &mut AppState, delta: i32) {
 /// Enter on a selected row: opens the chat and requests the newest page of
 /// history. `from_message_id: MessageId(0)` is TDLib's "from the latest
 /// message" sentinel.
+///
+/// T59 (local-first history): the request is `only_local: true`. TDLib's
+/// on-disk database persists across restarts, so the cached page renders
+/// instantly even while TDLib is still syncing with the server in the
+/// background — see design spec §5.2 and `conversation::apply_history_page`,
+/// which reconciles with a remote follow-up once this local page lands.
+/// `paging` is set to `Loading` unconditionally (not only on first insert),
+/// mirroring the request this function always issues on every Enter — the
+/// same way `on_scroll_near_top` marks a request it sends as in flight, so
+/// the completion (`apply_history_page`) can route through the paging
+/// machine (and its empty-response trap, spec §5.2) instead of being
+/// silently dropped as a "stale" completion.
 fn open_selected(app: &mut AppState) -> Vec<Effect> {
     let Some(chat_id) = app.chat_list.selected else {
         return Vec::new();
     };
     app.open_chat = Some(chat_id);
-    app.conversations
+    let convo = app
+        .conversations
         .entry(chat_id)
         .or_insert_with(|| ConversationState {
             chat_id,
@@ -480,13 +493,17 @@ fn open_selected(app: &mut AppState) -> Vec<Effect> {
             search_hits: Vec::new(),
             selection: None,
         });
+    convo.paging = PagingState::Loading {
+        attempt: 1,
+        only_local: true,
+    };
     vec![
         Effect::Td(TdRequest::OpenChat { chat_id }),
         Effect::Td(TdRequest::GetChatHistory {
             chat_id,
             from_message_id: MessageId(0),
             limit: 50,
-            only_local: false,
+            only_local: true,
         }),
     ]
 }
@@ -672,9 +689,43 @@ mod tests {
                 chat_id: ChatId(1),
                 from_message_id: MessageId(0),
                 limit: 50,
-                only_local: false,
+                only_local: true,
             })
         ));
+    }
+
+    /// T59: opening a chat serves TDLib's on-disk cache first — the request
+    /// is `only_local: true` — and `paging` is left tracking it as an
+    /// in-flight `Loading` request, the same way `on_scroll_near_top` tracks
+    /// a request it issues, so the completion routes through the paging
+    /// machine instead of being dropped as stale (see
+    /// `conversation::apply_history_page`).
+    #[test]
+    fn open_chat_requests_local_first() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 10));
+        app.chat_list.selected = Some(ChatId(1));
+
+        let effects = handle_key(&mut app, Key::Enter).expect("chat list claims Enter");
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Td(TdRequest::GetChatHistory {
+                    chat_id: ChatId(1),
+                    from_message_id: MessageId(0),
+                    limit: 50,
+                    only_local: true,
+                })
+            )),
+            "expected a local-first GetChatHistory request: {effects:?}"
+        );
+        assert_eq!(
+            app.conversations[&ChatId(1)].paging,
+            PagingState::Loading {
+                attempt: 1,
+                only_local: true,
+            }
+        );
     }
 
     #[test]

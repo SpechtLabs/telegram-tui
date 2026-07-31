@@ -12,6 +12,22 @@
 //! `tgt-app` is a binary crate with no library target, so the modules under
 //! test are included by path; the crate-level `allow(dead_code)` is for the
 //! surface that comes along with them.
+//!
+//! # T59: opening a chat is local-first
+//!
+//! The opening `GetChatHistory` request is `only_local: true` — TDLib's
+//! on-disk cache renders instantly instead of waiting behind TDLib's startup
+//! server sync (design spec §5.2). A non-empty local completion always
+//! follows up with exactly one remote reconcile
+//! (`from_message_id: MessageId(0), only_local: false`) to pick up whatever
+//! arrived while the app was closed; see `state::conversation::apply_history_page`.
+//! Both tests below that open a chat now script an extra `Await` step for
+//! that reconcile. The reconcile/loop-guard behavior itself (dedupe, "a
+//! remote completion never spawns another reconcile") is covered in depth by
+//! `crates/app/tests/local_first.rs` — the assertions added here only check
+//! that this suite's two existing narratives (instant render, and the
+//! scroll-triggered empty-response trap) still hold with the extra request
+//! spliced in.
 
 #![allow(dead_code)]
 
@@ -44,6 +60,7 @@ use tgt_core::model::ids::{ChatId, MessageId, UserId};
 use tgt_core::model::key::KeyBindings;
 use tgt_core::model::message::{MessageCaps, MessageContent, MessageView, SendState, Sender};
 use tgt_core::state::chat_list::visible_rows;
+use tgt_core::state::history::PagingState;
 use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
 use tgt_core::td::request::{TdRequest, TdResponse};
 use tgt_core::td::runtime::TdRuntime;
@@ -283,11 +300,40 @@ async fn open_chat_loads_history_and_renders() {
                 chat_id,
                 from_message_id: MessageId(0),
                 limit: 50,
-                only_local: false,
+                only_local: true,
             } if *chat_id == ChatId(1)
         )),
         "the first page is requested from the newest message (id 0 is TDLib's \
-         sentinel): {received:?}"
+         sentinel), local-first (T59, design spec §5.2): {received:?}"
+    );
+
+    // T59: the non-empty local page must trigger exactly one remote
+    // reconcile. Waited for via the request count rather than a state change
+    // — this fixture's reconcile response is a no-op page (see
+    // `read_only_script`), so nothing in `AppState` moves when it lands, but
+    // `FakeTd::received()` records the request the instant its spawned task
+    // is first polled, same as every other effect this harness waits on.
+    app.advance_until("the T59 remote reconcile to be sent", |_, fake| {
+        fake.received()
+            .iter()
+            .filter(|r| matches!(r, TdRequest::GetChatHistory { .. }))
+            .count()
+            >= 2
+    })
+    .await;
+    let received = app.fake.received();
+    assert!(
+        received.iter().any(|r| matches!(
+            r,
+            TdRequest::GetChatHistory {
+                chat_id,
+                from_message_id: MessageId(0),
+                limit: 50,
+                only_local: false,
+            } if *chat_id == ChatId(1)
+        )),
+        "a local-first open must reconcile with exactly one remote request \
+         (T59): {received:?}"
     );
 
     assert_eq!(app.window_len(), 50);
@@ -328,6 +374,31 @@ async fn empty_history_response_retries_then_succeeds() {
     })
     .await;
 
+    // T59: the non-empty local opening page triggers an automatic remote
+    // reconcile. This fixture answers it with nothing (`empty_then_page_script`)
+    // to prove the *other* half of the loop guard: an empty response to a
+    // request that was itself remote (`only_local: false`) must not be
+    // mistaken for the scroll-triggered empty-response trap this test is
+    // about. `apply_history_page` only ever acts on a completion while
+    // `paging` is `Loading` — and `paging` is back to `Idle` by the time this
+    // reconcile fires (the local completion already returned it there) — so
+    // the machine's stale-completion branch ignores it outright: no retry,
+    // no `Exhausted`, and nothing added to the window.
+    app.advance_until("the T59 remote reconcile (empty) to land", |_, fake| {
+        fake.received()
+            .iter()
+            .filter(|r| matches!(r, TdRequest::GetChatHistory { .. }))
+            .count()
+            >= 2
+    })
+    .await;
+    assert_eq!(
+        app.state().conversations[&ChatId(1)].paging,
+        PagingState::Idle,
+        "an empty *remote* reconcile completion must not disturb paging state"
+    );
+    assert_eq!(app.window_len(), 5, "the empty reconcile added nothing");
+
     // Scroll off the bottom: the anchor lands inside the paging window and
     // asks for the page before the oldest loaded message. `PageUp` rather
     // than `Up` since T28 wired the §6.2 routing table — with the composer
@@ -352,12 +423,40 @@ async fn empty_history_response_retries_then_succeeds() {
         .collect();
     assert_eq!(
         history_requests.len(),
-        3,
-        "expected the opening page, the empty round and its retry: {history_requests:?}"
+        4,
+        "expected the opening page, its T59 remote reconcile, the empty \
+         scroll-triggered round and its retry: {history_requests:?}"
     );
-    // Both paging requests start from the same oldest-loaded message: the
-    // empty response moved nothing, so the retry asks for the same page.
-    for request in &history_requests[1..] {
+    assert!(
+        matches!(
+            history_requests[0],
+            TdRequest::GetChatHistory {
+                chat_id: ChatId(1),
+                from_message_id: MessageId(0),
+                only_local: true,
+                ..
+            }
+        ),
+        "the opening request must be local-first (T59): {:?}",
+        history_requests[0]
+    );
+    assert!(
+        matches!(
+            history_requests[1],
+            TdRequest::GetChatHistory {
+                chat_id: ChatId(1),
+                from_message_id: MessageId(0),
+                only_local: false,
+                ..
+            }
+        ),
+        "the T59 reconcile must go remote: {:?}",
+        history_requests[1]
+    );
+    // Both scroll-triggered paging requests start from the same
+    // oldest-loaded message: the empty response moved nothing, so the retry
+    // asks for the same page.
+    for request in &history_requests[2..] {
         assert!(
             matches!(
                 request,
@@ -510,12 +609,20 @@ fn position_storm_script() -> Vec<ScriptStep> {
     steps
 }
 
-/// The on-disk read-only session: one chat with a full 50-message page.
+/// The on-disk read-only session: one chat with a full 50-message page, plus
+/// (T59) the automatic remote reconcile that follows it — scripted here as a
+/// no-op (the same 50 messages again) since this test's narrative is about
+/// the opening render, not the reconcile's merge behavior (see
+/// `local_first.rs` for that).
 fn read_only_script() -> Vec<ScriptStep> {
     let mut steps = ready_and_load_chats();
     steps.extend([
         chat(1, "Ada Lovelace", 100),
         chat(2, "Bob", 90),
+        ScriptStep::Await {
+            expect: expect("GetChatHistory"),
+            respond: page(1..=50),
+        },
         ScriptStep::Await {
             expect: expect("GetChatHistory"),
             respond: page(1..=50),
@@ -528,10 +635,20 @@ fn empty_then_page_script() -> Vec<ScriptStep> {
     let mut steps = ready_and_load_chats();
     steps.extend([
         chat(1, "Ada Lovelace", 100),
-        // The opening page.
+        // The opening page (T59: local-first, `only_local: true`).
         ScriptStep::Await {
             expect: expect("GetChatHistory"),
             respond: page(101..=105),
+        },
+        // T59: the automatic remote reconcile the non-empty opening page
+        // triggers. Answered with nothing on purpose — an empty *remote*
+        // reconcile must not be mistaken for the scroll-triggered trap below
+        // (see the assertion in the test body).
+        ScriptStep::Await {
+            expect: expect("GetChatHistory"),
+            respond: RespondWith::Ok(TdResponse::Messages {
+                messages: Vec::new(),
+            }),
         },
         // The trap: TDLib has more history but answers the scroll-triggered
         // page with nothing (spec §5.2).
