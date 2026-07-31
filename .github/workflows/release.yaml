@@ -42,6 +42,15 @@ on:
         description: Existing release tag to build or repair (e.g. v0.2.0)
         required: true
         type: string
+      force_rebuild:
+        description: >-
+          Rebuild every target even if its published assets already verify.
+          Only for a target built from a bad commit — an ordinary repair
+          (missing SHA256SUMS, a failed Homebrew push) does not need this;
+          see the build job's "Decide" step for why the default matters.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -127,13 +136,104 @@ jobs:
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
       TARGET: ${{ matrix.target }}
+      # Mirrors `crates/app/src/update.rs`'s `SIGNING_IDENTITY`/`OIDC_ISSUER`
+      # exactly — this is the same check `tgt update --require-signature`
+      # runs on a client, used here to answer "is what's already published
+      # for this target still good" before deciding whether to touch it. If
+      # either constant ever changes there, it has to change here too, or a
+      # repair would start "verifying" its own tarballs against a check no
+      # client actually performs.
+      SIGNING_IDENTITY: https://github.com/SpechtLabs/telegram-tui/.github/workflows/release.yaml@refs/heads/main
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TAG }}
 
+      # Moved ahead of the build: the "Decide" step below needs it to check
+      # whatever this target already has published, before any of the
+      # expensive work below runs.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Downloads whatever this target currently has on the release, if
+      # anything — a fresh `push` release, or a repair of a target that
+      # never got built, will simply find nothing. Non-fatal either way:
+      # this step's only job is to leave `dist/` populated (or not) for
+      # "Decide" to inspect next.
+      - name: Fetch this target's currently published assets, if any
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" \
+            -p "tgt-*-${TARGET}.tar.gz" \
+            -p "tgt-*-${TARGET}.tar.gz.cosign.bundle" \
+            -D dist --clobber \
+            || echo "nothing published for $TARGET yet"
+
+      # THE FIX (task #73): a repair used to rebuild every target
+      # unconditionally, even though the build is not reproducible — two
+      # repairs of v0.1.4 produced two different sha256 sums for the same
+      # target from the same tag. That meant every repair republished
+      # different bytes than whatever a user may have already downloaded,
+      # and — because the tarball and its cosign bundle upload as two
+      # separate API calls seconds apart, see "Attach artifacts" below —
+      # created a real window where a client could fetch a new tarball
+      # paired with the previous run's bundle and see a signature failure
+      # that reads as tampering.
+      #
+      # Most repairs need none of that: v0.1.4's two repairs existed only to
+      # produce SHA256SUMS and push the Homebrew formula, not to change a
+      # single built byte. So a target whose published (tarball, bundle)
+      # pair already verifies — the exact check a real client performs —
+      # is left alone entirely: not rebuilt, not re-signed, not
+      # re-uploaded. Every step below that does real work is gated on
+      # `skip_build`.
+      #
+      # Deliberately not cross-referenced against SHA256SUMS: v0.1.4 proved
+      # that file can be the very thing missing, so "the sums file agrees"
+      # cannot be the test for "the tarball is fine". `cosign verify-blob`
+      # against the bundle checks the tarball's actual bytes on its own —
+      # a truncated or corrupted upload fails it the same way a genuinely
+      # tampered one would, which a mere "does a file with this name
+      # exist" check would not catch.
+      - name: Decide whether to rebuild this target
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::force_rebuild requested; rebuilding $TARGET unconditionally."
+            exit 0
+          fi
+
+          shopt -s nullglob
+          tarballs=(dist/tgt-*-"${TARGET}".tar.gz)
+          bundles=(dist/tgt-*-"${TARGET}".tar.gz.cosign.bundle)
+
+          if [ "${#tarballs[@]}" -ne 1 ] || [ "${#bundles[@]}" -ne 1 ]; then
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no complete (tarball, bundle) pair published yet for $TARGET; building."
+            exit 0
+          fi
+
+          if cosign verify-blob --bundle "${bundles[0]}" \
+              --certificate-identity "$SIGNING_IDENTITY" \
+              --certificate-oidc-issuer "$OIDC_ISSUER" \
+              "${tarballs[0]}"; then
+            echo "skip_build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TARGET's published assets already verify; skipping rebuild."
+          else
+            echo "skip_build=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$TARGET's published assets exist but failed signature verification (a truncated or corrupted upload, most likely); rebuilding."
+            rm -f "${tarballs[0]}" "${bundles[0]}"
+          fi
+
       - name: Install mise
+        if: steps.decide.outputs.skip_build != 'true'
         uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
         with:
           version: 2026.6.10
@@ -145,7 +245,7 @@ jobs:
       # copies it into the tarball so users do not. patchelf is what gives the
       # copies a $ORIGIN runpath of their own.
       - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.decide.outputs.skip_build != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libc++1 libc++abi1 patchelf
@@ -156,6 +256,7 @@ jobs:
       # across releases. The target triple is in the key because each row has
       # its own target/<triple>/ tree and its own downloaded TDLib.
       - name: Cache cargo registry and release target
+        if: steps.decide.outputs.skip_build != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -178,6 +279,7 @@ jobs:
       # report to the committed project rather than to a retargeted one.
       # Never echo it: the value must not reach the log.
       - name: Package
+        if: steps.decide.outputs.skip_build != 'true'
         env:
           TGT_SENTRY_DSN: ${{ secrets.TGT_SENTRY_DSN }}
         run: mise run package
@@ -186,6 +288,7 @@ jobs:
       # bump did not land. Fail loudly rather than shipping a mislabeled
       # artifact.
       - name: Verify binary version matches the tag
+        if: steps.decide.outputs.skip_build != 'true'
         run: |
           set -euo pipefail
           built="$(dist/tgt/bin/tgt --version | awk '{print $2}')"
@@ -200,6 +303,7 @@ jobs:
       # again by the Homebrew job. Only the digests travel between jobs; the
       # tarballs go straight to the release.
       - name: Checksum
+        if: steps.decide.outputs.skip_build != 'true'
         run: |
           set -euo pipefail
           cd dist
@@ -211,6 +315,28 @@ jobs:
           fi
           cat "${TARGET}.sha256"
 
+      # The `skip_build` twin of "Checksum" above: the tarball already sitting
+      # in `dist/` is the one "Fetch this target's currently published
+      # assets" downloaded and "Decide" just proved still verifies, so this
+      # only has to hash it — SHA256SUMS still needs every target's line
+      # whether or not that target was actually rebuilt this run.
+      - name: Checksum the already-verified tarball
+        if: steps.decide.outputs.skip_build == 'true'
+        run: |
+          set -euo pipefail
+          cd dist
+          tarball="$(ls tgt-*-${TARGET}.tar.gz)"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$tarball" > "${TARGET}.sha256"
+          else
+            shasum -a 256 "$tarball" > "${TARGET}.sha256"
+          fi
+          cat "${TARGET}.sha256"
+
+      # Unconditional: `dist/${TARGET}.sha256` exists either way, written by
+      # whichever of the two "Checksum" steps above actually ran. The
+      # `checksums` job needs a line from every target regardless of which
+      # ones this run rebuilt.
       - name: Upload checksum for the aggregate and the formula
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -218,16 +344,27 @@ jobs:
           path: dist/${{ matrix.target }}.sha256
           if-no-files-found: error
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
+      # `skip_build`'s whole point: a target "Decide" left alone already has
+      # a valid (tarball, bundle) pair on the release — re-signing here
+      # would produce a *different*, equally valid signature over the same
+      # bytes and then re-upload it for no reason, which is exactly the
+      # unnecessary churn this task exists to stop. Cosign was installed
+      # earlier in this job (before "Decide", which needs it too).
       - name: Sign the tarball
+        if: steps.decide.outputs.skip_build != 'true'
         run: |
           set -euo pipefail
           tarball="$(ls dist/tgt-*-"${TARGET}".tar.gz)"
           cosign sign-blob --yes --bundle "${tarball}.cosign.bundle" "$tarball"
 
+      # Also gated: this is the step whose two-files-seconds-apart upload
+      # created the tarball/bundle mismatch window task #73 exists to close
+      # (module docs above). Skipping it entirely for an already-verified
+      # target means that window simply never opens for that target on this
+      # run — nothing is re-clobbered, so there is nothing to be caught
+      # between.
       - name: Attach artifacts to the release
+        if: steps.decide.outputs.skip_build != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
