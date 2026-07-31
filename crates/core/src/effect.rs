@@ -34,9 +34,20 @@ pub enum ConfigPatch {
     ConsentAcknowledged { enabled: bool },
 }
 
+/// Whether this session may report anything at all.
+///
+/// A master switch, not a destination. Which egresses a session actually has
+/// — the project's Sentry project for crash reports, a user-configured OTLP
+/// collector, both, or neither — is decided in `tgt-app` from `[telemetry]`
+/// and from what was baked in at build time. `tgt-core` has no business
+/// knowing any of that; all it needs is whether minting a `TelemetryEvent`
+/// is permitted this run.
+///
+/// `Off` is what `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`,
+/// `DO_NOT_TRACK`, and a Disable at the first-run consent screen all resolve
+/// to, and it disables *every* egress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryMode {
-    Vendor,
-    Custom,
+    On,
     Off,
 }

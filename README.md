@@ -99,7 +99,9 @@ inline_images = true      # downloaded photos render inline where the terminal c
 palette = "ctrl+p"
 
 [telemetry]
-mode = "vendor"           # "vendor" | "custom" | "off"
+enabled = true            # master switch over both egresses
+crash_reports = true      # anonymous crash reports; on unless turned off
+# endpoint = "..."        # your own OTLP collector; opt-in, unset by default
 ```
 
 Themes are TOML files under `~/.config/telegram-tui/themes/<name>.toml` defining twelve semantic color tokens plus an eight-color sender palette. Truecolor is used when the terminal supports it, with a defined 256-color fallback.
@@ -108,13 +110,15 @@ A photo you have downloaded renders as the picture itself on terminals that spea
 
 ## Privacy
 
-Telemetry is opt-in-with-disclosure and enforced structurally rather than by policy. A first-run screen states what's collected before anything is sent or you even log in.
+Two things can leave your machine, they carry different guarantees, and a first-run screen describes both before anything is sent or you even log in.
 
-The guarantee: `crates/core/src/telemetry/schema.rs` declares the complete set of permitted attribute keys, an `emit!` macro is the only path to the exporter, and the OTLP layer drops anything lacking its marker. A stray `tracing::info!("opening chat {}", chat.title)` therefore cannot reach the network no matter who writes it. Message text, names, usernames, phone numbers, chat titles, and file names aren't on the allowlist, which is the reason they can't be exported. A CI test boots the app against an in-process collector, drains every exported attribute key, and fails on anything outside that list.
+**Anonymous crash reports, on unless you turn them off.** When the app panics or exits with an error it sends a stack trace, the error message and its cause chain, the app and OS version, and the last few actions as breadcrumbs. Your IP address, username and hostname are kept off it, the breadcrumbs are drawn from the allowlist below, and the pseudonymous install id is deliberately not attached so a crash can't be joined to a usage session. The error message is the honest caveat: whatever code failed writes it, so it can carry limited content such as a file path. Nothing in this client formats a chat title or message body into an error, but that's an observation about the code rather than something a test enforces. Builds from source carry no Sentry DSN and never initialise it at all.
 
-The rolling local log under `~/.local/state/telegram-tui/` stays rich (it never leaves the machine). Terminal notifications carry a fixed generic body, so nothing identifying rides an `OSC 777` into a multiplexer's log.
+**OTLP export, off unless you point it at your own collector.** The project runs no OTLP destination. This path is enforced structurally rather than by policy: `crates/core/src/telemetry/schema.rs` declares the complete set of permitted attribute keys, an `emit!` macro is its only entrance, and the export layer drops anything lacking its marker. A stray `tracing::info!("opening chat {}", chat.title)` therefore cannot reach a collector no matter who writes it. Message text, names, usernames, phone numbers, chat titles, and file names aren't on the allowlist, which is the reason they can't be exported this way. A CI test boots the app against an in-process collector, drains every exported attribute key, and fails on anything outside that list. It's an OTLP collector, so that proof says nothing about the crash-report path, and the test file says so itself.
 
-Controls: `telemetry.mode` in config, `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK=1`, `tgt telemetry show` to print exactly what a session would send, and `tgt telemetry reset-id` to regenerate the pseudonymous install id.
+The rolling local log under `~/.local/state/telegram-tui/` stays rich and never leaves the machine. Terminal notifications carry a fixed generic body, so nothing identifying rides an `OSC 777` into a multiplexer's log.
+
+Controls, each of which disables both paths: `[telemetry] enabled = false`, `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK=1`, or Disable on the first-run screen. `crash_reports = false` silences only the first. `tgt telemetry show` prints the live state of both, and `tgt telemetry reset-id` regenerates the pseudonymous install id.
 
 ## How it's built
 

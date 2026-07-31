@@ -22,8 +22,10 @@ spirit of Claude Code and Codex CLI, not a terminal log viewer.
   Enter, and Escape.
 - Visually deliberate: consistent spacing, semantic color, and grouping that reads
   as designed rather than decorated.
-- Fully instrumented with OpenTelemetry, with a structurally enforced guarantee
-  that no personally identifiable information leaves the machine.
+- Instrumented with OpenTelemetry behind a structurally enforced allowlist, so
+  that no personally identifiable information reaches a collector, and with
+  anonymous crash reporting whose narrower guarantee is spelled out in §13.9
+  rather than folded into this one.
 
 ### Non-goals for v1
 
@@ -470,12 +472,18 @@ layout_breakpoint_cols = 100
 palette = "ctrl+p"
 
 [telemetry]
-mode = "vendor"        # "vendor" | "custom" | "off"
-# endpoint = "https://otlp.example.com"
+enabled = true         # master switch over both egresses
+crash_reports = true   # anonymous crash reports; on unless turned off
+# endpoint = "https://otlp.example.com"   # your own collector; opt-in
 # protocol = "http/protobuf"
 # [telemetry.headers]
 # Authorization = "Basic …"
 ```
+
+The retired `mode = "vendor" | "custom" | "off"` key still loads: `off` carries
+across as `enabled = false`, the other two as `enabled = true`, each with a
+warning naming the keys that replaced it. An opt-out written years ago must not
+be quietly upgraded into telemetry being back on.
 
 Unknown keys produce a warning rather than a hard failure, so a config written by
 a newer version does not brick an older binary.
@@ -491,52 +499,90 @@ published to crates.io.
 
 ```toml
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git",
-                      default-features = false, features = ["opentelemetry"] }
+                      default-features = false, features = ["sentry"] }
+sentry = { version = "=0.48.5", default-features = false,
+           features = ["panic", "backtrace", "contexts", "debug-images",
+                       "release-health", "reqwest", "rustls"] }
 ```
 
-`default-features = false` is required: the crate enables `sentry` by default and
-v1 ships exactly one egress destination.
+There are **two egress destinations**, and they do not carry the same guarantee.
+Anything written about one of them is wrong about the other until it says so.
+
+| Egress | Default | What governs its contents |
+|---|---|---|
+| Sentry crash reports | **on** unless the user opts out | the failure's own stack and message; not an allowlist |
+| OTLP export | **off** unless the user names a collector | the §13.2 allowlist, proved on the wire by §13.8 |
+
+The project runs the Sentry project and nothing else; it operates no OTLP
+destination, so the OTLP path exists for a user pointing the client at their own
+stack.
+
+Only the Sentry battery is used. `OpenTelemetry::setup` builds its own
+`tracing_subscriber::registry()` and calls `.init()`, which cannot coexist with
+the rolling file layer of §13.3, and it filters by level alone, which would ship
+every `tracing::info!` and defeat §13.2 outright. `Sentry::setup` touches no
+subscriber — it calls `sentry::init`, which binds a client to a process-global
+hub and chains a panic hook — so it composes with the app's own layered
+subscriber without argument. The rule: a battery that takes the global
+subscriber cannot be used, a battery that does not can. `otel.rs` therefore
+drives `opentelemetry_sdk` + `opentelemetry-otlp` +
+`opentelemetry-appender-tracing` directly, which are the crates the battery
+itself wraps.
+
+`sentry` is named as a direct dependency only to widen its feature set;
+`tracing-batteries` depends on it with `default-features = false`, which drops
+the panic and backtrace integrations that make a crash reporter one at all.
 
 ```rust
 let session = Session::new("telegram-tui", env!("CARGO_PKG_VERSION"))
-    .with_context("install.id", install_id)
-    .with_battery(
-        OpenTelemetry::new(endpoint)
-            .with_protocol(OpenTelemetryProtocol::HttpProtobuf)
-            .with_header("x-tgt-client", env!("CARGO_PKG_VERSION")),
-    );
+    .with_context("host.environment", "Customer")
+    .with_battery(Sentry::new((dsn, ClientOptions {
+        attach_stacktrace: true,
+        send_default_pii: false,
+        before_send: Some(Arc::new(|mut event| {
+            event.server_name = None;  // the machine's hostname
+            Some(event)
+        })),
+        ..Default::default()
+    })));
 ```
 
-### 13.2 Allowlist, not denylist
+### 13.2 Allowlist, not denylist — the OTLP path
 
 In a Telegram client nearly every interesting value is PII — message text, chat
 titles, display names, phone numbers, file names. A rule of "remember not to log
-PII" fails eventually. The guarantee is therefore structural.
+PII" fails eventually. For the OTLP path the guarantee is therefore structural.
 
 - `core/telemetry/schema.rs` defines the **complete** set of permitted event names
   and attribute keys as constants.
-- A `telemetry::emit!` macro is the only path to the remote exporter. It sets a
+- A `telemetry::emit!` macro is the only path to the OTLP exporter. It sets a
   `telemetry.public = true` marker field.
 - The OTLP `tracing_subscriber` layer filters on that marker. Any event without
   it is dropped before export.
 
-A stray `tracing::info!("opening chat {}", chat.title)` therefore cannot reach the
-network. It lands only in the local log.
+A stray `tracing::info!("opening chat {}", chat.title)` therefore cannot reach a
+collector. It lands only in the local log.
 
-### 13.3 Two sinks
+This says nothing about §13.9. A crash report is assembled out of the failure's
+own text at the moment it happens, so there is no fixed list for an allowlist to
+be, and the proof of §13.8 does not extend to it.
+
+### 13.3 Three sinks
 
 | Sink | Contents | Leaves machine |
 |---|---|---|
 | Rolling file log, `~/.local/state/telegram-tui/` | Full debug detail; may contain chat ids and titles | Never |
-| OTLP exporter | Allowlisted keys only | Yes |
+| OTLP exporter | Allowlisted keys only | Only if the user configures a collector |
+| Sentry crash reports | Stack trace, error text, allowlisted breadcrumbs | Yes, unless switched off |
 
-The local log stays rich because richness is what makes a bug tractable. The wire
-stays clean because it must.
+The local log stays rich because richness is what makes a bug tractable. The OTLP
+wire stays clean because it must. The crash report sits between the two: narrower
+than the log, wider than the wire, and §13.9 says how much wider.
 
 Nothing is ever written to stdout or stderr while the TUI is active; doing so
 corrupts the display.
 
-### 13.4 Permitted attributes
+### 13.4 Permitted attributes — the OTLP path
 
 ```
 app.version            os.version              term.program
@@ -553,8 +599,11 @@ duration_ms            chat.kind {private|group|supergroup|channel}
 history.page_depth     download.size_bucket
 ```
 
-**Never exported:** message text or its length, display names, usernames, phone
-numbers, chat titles, file names, entity contents, raw Telegram identifiers.
+**Never exported by this path:** message text or its length, display names,
+usernames, phone numbers, chat titles, file names, entity contents, raw Telegram
+identifiers. None of them is on the list above, and the list above is the whole
+list; §13.8 checks the complement on the wire. The qualifier "by this path" is
+load-bearing — see §13.9 for what a crash report can carry.
 
 Where correlation genuinely helps — for example diagnosing repeated history-paging
 failures on one specific chat — identifiers are exported as
@@ -566,47 +615,68 @@ uncorrelatable across installs, and irreversible.
 
 `install.id` is a pseudonymous identifier, so it is disclosed rather than buried.
 
-A dedicated first-run screen, shown **before login and before any data is sent**,
-states in plain language what is collected, what is not, and where it goes, with
-Enable (preselected) and Disable. Acknowledgement is required to proceed.
+Crash reporting is on unless the user turns it off, so the disclosure has to come
+before the first send rather than after. A dedicated first-run screen, shown
+**before login and before any data is sent**, states in plain language what is
+collected, what is not, where it goes, and that an error message can carry
+limited content, with Enable (preselected) and Disable. Acknowledgement is
+required to proceed, and neither egress is constructed until it has been given.
 
-Controls:
+`Enable` is preselected because that is what "on unless you opt out" means; the
+screen exists to make the default visible rather than to pretend the default is
+off.
 
-- `telemetry.mode` in config
+Controls, each of which disables **both** egresses:
+
+- `[telemetry] enabled = false` in config
 - `--no-telemetry` flag
 - `TELEGRAM_TUI_TELEMETRY=off`
-- `tgt telemetry reset-id` regenerates `install.id` and the HMAC salt
-- `tgt telemetry show` prints exactly what would be sent
 - `DO_NOT_TRACK=1` is honored
+- Disable at the first-run screen, which persists as `enabled = false`
 
-Under `mode = "custom"` the user's endpoint, protocol, and headers **fully
-replace** the vendor destination. Data is never dual-shipped. Standard
-`OTEL_EXPORTER_OTLP_ENDPOINT` / `_HEADERS` / `_PROTOCOL` environment variables are
-honored, as `tracing-batteries` already reads them.
+Narrower controls: `[telemetry] crash_reports = false` switches off Sentry alone
+and leaves a configured collector running; leaving `[telemetry] endpoint` unset —
+the default — means no OTLP export while crash reports continue. Alongside these,
+`tgt telemetry reset-id` regenerates `install.id` and the HMAC salt, and
+`tgt telemetry show` prints both egresses with their live settings.
 
-### 13.6 Vendor ingest
+The `endpoint`, `protocol`, and `headers` under `[telemetry]` name the user's own
+collector. Standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `_HEADERS` / `_PROTOCOL`
+environment variables are honored.
 
-The default endpoint is an **ingest proxy** operated by the project, which holds
-the real Grafana Cloud credentials and forwards OTLP. No secret is compiled into
-the binary. The proxy allows rate limiting, abuse rejection, and credential
-rotation without shipping a release.
+### 13.6 Build-time destinations
 
-The proxy URL is set at build time via an environment variable. A build without
-it produces a binary whose vendor mode is inert — it collects nothing until the
-user configures their own endpoint.
+Neither destination is compiled into a source build. `TGT_SENTRY_DSN` supplies
+the Sentry DSN at build time, and a build without it produces a binary whose
+crash reporting is inert: `sentry::init` is never called at all, so there is no
+panic hook, no uploader, and no release-health session. Every contributor build
+and every CI build is such a build, and `crash.rs` has a test that says so.
 
-### 13.7 The exporter must never hurt the TUI
+A DSN is not a secret — it is a write-only ingest key, and every Sentry client
+ever shipped contains one — but it stays out of the repository and arrives from
+the release workflow's environment.
+
+There is no build-time OTLP endpoint. The former `TGT_INGEST_ENDPOINT` vendor
+proxy is gone: the project no longer runs an OTLP destination, so that path
+starts from nothing and waits for the user to name a collector.
+
+### 13.7 Neither egress may hurt the TUI
 
 - Bounded queue with drop-on-full. Telemetry backpressure never reaches the
   render loop.
 - Export runs on its own task; no telemetry call blocks `update()` or `view()`.
-- `session.shutdown()` is wrapped in a hard **2-second** timeout. A chat client
-  that takes four seconds to quit because an exporter is retrying is worse than
-  one with no telemetry at all.
-- Failure to reach the endpoint is logged locally at debug level and never
+- `session.shutdown()` is wrapped in a hard **2-second** timeout, and Sentry's
+  own `shutdown_timeout` is set to the same 2 seconds. A chat client that takes
+  four seconds to quit because an uploader is retrying is worse than one with no
+  telemetry at all.
+- Failure to reach either destination is logged locally at debug level and never
   surfaced to the user.
+- The crash reporter is built after `color_eyre::install` and before the
+  terminal-restoring panic hook, so a panic restores the terminal first, then
+  captures, then prints. Uploading a report over a frozen alternate screen would
+  be the one way crash reporting could make a crash worse.
 
-### 13.8 Proving it
+### 13.8 Proving it — the OTLP path, and only that path
 
 - A CI test boots the app against a local OTLP collector stub, drains every
   exported attribute key across a scripted session, and asserts the set is a
@@ -616,8 +686,41 @@ user configures their own endpoint.
 - A unit test asserts that an event emitted via raw `tracing::` macros does not
   reach the OTLP layer.
 
-This turns "no PII" from an intention into a property with a failing test behind
-it.
+This turns "no PII on the OTLP wire" from an intention into a property with a
+failing test behind it. The scope is the OTLP wire and nothing else: the stub is
+an OTLP collector, so a crash report never passes through it, and no assertion in
+that file constrains what Sentry receives. `crates/app/tests/telemetry_allowlist.rs`
+says so in its own header, because a proof that quietly implies more than it
+checks is worse than no proof.
+
+### 13.9 What a crash report carries
+
+A report is built when the app panics or returns an error from `main`, and it
+holds:
+
+- a stack trace, plus the OS, architecture, and app version;
+- the panic message or the error's `Display` text and its cause chain;
+- the recent `Effect::Telemetry` events as breadcrumbs, which are built from the
+  same `TelemetryEvent` fields §13.4 permits and so carry no more than the OTLP
+  path does.
+
+The error text is the part with no allowlist behind it, because the code that
+failed writes it rather than choosing it from a fixed set. In practice nothing in
+this client formats a chat title or message body into an error, and the strings
+that do reach one are TDLib error codes and file paths — but "in practice" is a
+weaker claim than §13.2's and the docs are required to say which of the two they
+are making, everywhere they make it.
+
+Two options narrow the rest. `send_default_pii: false` keeps Sentry from
+attaching the user's IP address or username, and a `before_send` hook nulls
+`server_name`, which would otherwise be the machine's hostname and on a personal
+laptop is usually a person's name. `install.id` is deliberately **not** attached
+here: giving the two egresses a shared key would let a crash be joined to a usage
+session, which is worth less than keeping them unlinkable.
+
+This posture is a choice rather than an oversight. Dropping error text entirely
+was the alternative, and an error report without the error in it is not worth
+sending.
 
 ---
 
@@ -675,7 +778,7 @@ Each milestone is independently demonstrable.
 | 5 | Rich content | Entity styling, reply quotes, reactions, read receipts, typing indicators, presence |
 | 6 | Media | Download with progress, placeholder cards, inline images with protocol detection, sending files |
 | 7 | Search | `ctrl+p` palette, in-chat search, unread badges, pinned, archive, folders |
-| 8 | Observability | `tracing-batteries` wiring, allowlist schema and macro, consent screen, config modes, CI allowlist test |
+| 8 | Observability | `tracing-batteries` Sentry wiring, allowlist schema and macro, consent screen, config switches, CI allowlist test |
 | 9 | Polish | Theme file loading, help overlay, snapshot test suite, distributable binary |
 
 Milestone 8 may be pulled earlier if usage insight during development is wanted;
@@ -693,5 +796,5 @@ code is written rather than retrofitted.
 | UTF-16 entity offset bugs | Isolated pure function with exhaustive tests |
 | Graphics protocol ghosting on scroll | Explicit invalidation; placeholder fallback always available |
 | Extractable ingest credentials | Solved by the proxy design; no secret in the binary |
-| Telemetry perceived as sneaky | Mandatory first-run disclosure, `DO_NOT_TRACK`, `tgt telemetry show` |
+| Telemetry perceived as sneaky | Mandatory first-run disclosure naming the crash-report caveat, `DO_NOT_TRACK`, `tgt telemetry show` listing both egresses |
 | Retrofitting multi-account | Accepted. Contained to going from one TDLib actor to N |

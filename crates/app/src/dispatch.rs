@@ -180,6 +180,11 @@ impl Dispatcher {
                 let _ = self.quit_tx.send(true);
             }
             Effect::Telemetry(event) => {
+                // The trail a crash report arrives with. A no-op unless a
+                // Sentry client is bound, and allowlist-shaped either way —
+                // it is built from this same event's fields. Before the
+                // `emit!` because that macro consumes the event.
+                crate::crash::record_action(&event);
                 // The sole `emit!` call site, per architecture.md §4.8.
                 tgt_core::emit!(event);
             }

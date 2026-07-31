@@ -6,7 +6,8 @@
 //!
 //! The on-disk shape matches spec §12: `[app]` (theme, layout_breakpoint_cols,
 //! mouse, inline_images),
-//! `[keys]` (palette), `[telemetry]` (mode, optional endpoint/protocol/headers).
+//! `[keys]` (palette), `[telemetry]` (`enabled`, `crash_reports`, and an
+//! optional user endpoint/protocol/headers).
 //! Two sections extend beyond the spec's illustrative sample so the state
 //! `ConfigPatch` can mutate actually persists somewhere: `[credentials]`
 //! (api_id/api_hash, written by the auth wizard per spec §9.1 — "writes it
@@ -82,7 +83,17 @@ pub struct Config {
     pub auto_download_photos: bool,
     /// Raw `"ctrl+p"`-style string; parsed into a `Key` by `boot_fields`.
     pub palette_key: String,
+    /// `[telemetry].enabled` — the master switch over both egresses.
+    /// Also what `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off` and
+    /// `DO_NOT_TRACK` set, and what a Disable at the consent screen persists.
     pub telemetry_mode: TelemetryMode,
+    /// `[telemetry].crash_reports` — anonymous crash and error reports to the
+    /// project's Sentry project. Default on: this is the egress the project
+    /// actually runs, and it is the reason a first-run disclosure exists.
+    /// Inert in a build without a DSN baked in (see `crash::DSN`).
+    pub telemetry_crash_reports: bool,
+    /// `[telemetry].endpoint` — a collector the *user* runs. Opt-in and
+    /// unset by default; the project operates no OTLP destination.
     pub telemetry_endpoint: Option<String>,
     pub telemetry_protocol: Option<String>,
     pub telemetry_headers: Vec<(String, String)>,
@@ -103,7 +114,8 @@ impl Default for Config {
             inline_images: true,
             auto_download_photos: true,
             palette_key: "ctrl+p".to_string(),
-            telemetry_mode: TelemetryMode::Vendor,
+            telemetry_mode: TelemetryMode::On,
+            telemetry_crash_reports: true,
             telemetry_endpoint: None,
             telemetry_protocol: None,
             telemetry_headers: Vec::new(),
@@ -114,10 +126,10 @@ impl Default for Config {
     }
 }
 
-/// The user-configured destination `mode = "custom"` resolves to (spec
-/// §13.5). Shaped like `otel::CustomEndpoint` on purpose — `main.rs` maps
-/// one directly into the other — but kept as this module's own type so
-/// `config.rs` never has to depend on `otel.rs` (see `Config::custom_destination`).
+/// The OTLP collector the user configured, if any (spec §13.5). Shaped like
+/// `otel::CustomEndpoint` on purpose — `main.rs` maps one directly into the
+/// other — but kept as this module's own type so `config.rs` never has to
+/// depend on `otel.rs` (see `Config::custom_destination`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CustomDestination {
     pub endpoint: String,
@@ -166,25 +178,36 @@ impl Config {
                 self.api_id = Some(*api_id);
                 self.api_hash = Some(api_hash.clone());
             }
-            ConfigPatch::ConsentAcknowledged { enabled } => self.consent_acknowledged = *enabled,
+            // Both choices acknowledge; the choice itself lands in
+            // `telemetry_mode`. Writing `enabled` into `acknowledged` would
+            // mean a Disable never persisted *and* re-prompted next launch,
+            // which with crash reporting on by default would quietly undo
+            // the opt-out.
+            ConfigPatch::ConsentAcknowledged { enabled } => {
+                self.consent_acknowledged = true;
+                self.telemetry_mode = if *enabled {
+                    TelemetryMode::On
+                } else {
+                    TelemetryMode::Off
+                };
+            }
         }
     }
 
-    /// The destination this config resolves to under `mode = "custom"`
-    /// (spec §13.5). `None` when the mode isn't `custom` at all, or when
-    /// custom mode has no endpoint configured — an unset custom destination
-    /// is inert the same way an unset vendor one is. This is the single
-    /// place that reads the custom-endpoint fields, shared by `main.rs`'s
-    /// exporter startup (which maps it into `otel::CustomEndpoint`) and
-    /// `telemetry_cli::show`, so the two can never disagree about what
-    /// custom mode would send to.
+    /// The OTLP collector this config exports to, if the user configured one
+    /// (spec §13.5). `None` when telemetry is off altogether, or when no
+    /// endpoint is set — which is the default, because the project runs no
+    /// OTLP destination of its own. This is the single place that reads the
+    /// endpoint fields, shared by `main.rs`'s exporter startup (which maps it
+    /// into `otel::CustomEndpoint`) and `telemetry_cli::show`, so the two can
+    /// never disagree about where a session would export.
     ///
     /// Deliberately not `otel::CustomEndpoint` itself: several integration
     /// tests under `tests/` pull in `config.rs` via `#[path]` without
     /// `otel.rs` (it drags in the whole OTLP stack), so this module must
     /// stay free of that dependency.
     pub fn custom_destination(&self) -> Option<CustomDestination> {
-        if self.telemetry_mode != TelemetryMode::Custom {
+        if self.telemetry_mode == TelemetryMode::Off {
             return None;
         }
         let endpoint = self.telemetry_endpoint.clone()?;
@@ -196,6 +219,15 @@ impl Config {
             protocol: self.telemetry_protocol.clone(),
             headers: self.telemetry_headers.clone(),
         })
+    }
+
+    /// Whether this session may send crash and error reports. The mirror of
+    /// [`Config::custom_destination`] for the other egress, and for the same
+    /// reason: `main.rs` and `telemetry_cli::show` both read it, so neither
+    /// can describe a session the other would not produce. Says nothing
+    /// about whether this *build* has a DSN — `crash::init` decides that.
+    pub fn crash_reports_enabled(&self) -> bool {
+        self.telemetry_mode != TelemetryMode::Off && self.telemetry_crash_reports
     }
 
     /// Atomically writes the current config to disk as a freshly rendered,
@@ -262,10 +294,25 @@ impl Config {
         out.push_str(&format!("palette = {}\n\n", toml_string(&self.palette_key)));
 
         out.push_str("[telemetry]\n");
+        out.push_str("# Master switch. false turns off everything below, and is what\n");
+        out.push_str("# --no-telemetry, TELEGRAM_TUI_TELEMETRY=off and DO_NOT_TRACK set.\n");
         out.push_str(&format!(
-            "mode = {}        # \"vendor\" | \"custom\" | \"off\"\n",
-            toml_string(telemetry_mode_str(self.telemetry_mode))
+            "enabled = {}\n",
+            self.telemetry_mode != TelemetryMode::Off
         ));
+        out.push_str("# Anonymous crash and error reports to the telegram-tui project, so\n");
+        out.push_str("# crashes get fixed without anyone having to file a bug. Reports carry\n");
+        out.push_str("# a stack trace, the error message, and a trail of recent actions.\n");
+        out.push_str("# Error messages come from the code that failed, so unlike the OTLP\n");
+        out.push_str("# path below they are not drawn from a fixed allowlist and can carry\n");
+        out.push_str("# limited content such as a file path. See the telemetry guide.\n");
+        out.push_str(&format!(
+            "crash_reports = {}\n",
+            self.telemetry_crash_reports
+        ));
+        out.push_str("# Your own OpenTelemetry collector, if you want one. Opt-in and unset\n");
+        out.push_str("# by default: the project runs no OTLP destination. What goes here is\n");
+        out.push_str("# allowlisted usage events only — never message text, names or titles.\n");
         match &self.telemetry_endpoint {
             Some(v) => out.push_str(&format!("endpoint = {}\n", toml_string(v))),
             None => out.push_str("# endpoint = \"https://otlp.example.com\"\n"),
@@ -309,19 +356,18 @@ fn toml_string(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
 }
 
-fn telemetry_mode_str(mode: TelemetryMode) -> &'static str {
-    match mode {
-        TelemetryMode::Vendor => "vendor",
-        TelemetryMode::Custom => "custom",
-        TelemetryMode::Off => "off",
-    }
-}
-
-fn parse_telemetry_mode(s: &str) -> Option<TelemetryMode> {
-    match s.to_ascii_lowercase().as_str() {
-        "vendor" => Some(TelemetryMode::Vendor),
-        "custom" => Some(TelemetryMode::Custom),
-        "off" => Some(TelemetryMode::Off),
+/// Parses `TELEGRAM_TUI_TELEMETRY`. `off` is the value that matters and the
+/// one that is documented; `on` is accepted so the variable can be used to
+/// *undo* an `off` inherited from a parent shell.
+///
+/// The retired `vendor` and `custom` spellings are still understood, and
+/// both mean `On`: a shell profile that exports `TELEGRAM_TUI_TELEMETRY=
+/// vendor` predates this change and meant "telemetry on", so honouring it is
+/// closer to the user's intent than warning and ignoring it.
+fn parse_telemetry_switch(s: &str) -> Option<TelemetryMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "false" | "0" => Some(TelemetryMode::Off),
+        "on" | "true" | "1" | "vendor" | "custom" => Some(TelemetryMode::On),
         _ => None,
     }
 }
@@ -394,7 +440,18 @@ fn known_keys(section: &str) -> &'static [&'static str] {
             "auto_download_photos",
         ],
         "keys" => &["palette"],
-        "telemetry" => &["mode", "endpoint", "protocol", "headers"],
+        // `mode` is retired but still listed: it is handled explicitly in
+        // `parse` with a deprecation warning that says what replaced it,
+        // which is more use to someone with an old config than a generic
+        // "unknown key; ignoring".
+        "telemetry" => &[
+            "enabled",
+            "crash_reports",
+            "mode",
+            "endpoint",
+            "protocol",
+            "headers",
+        ],
         "credentials" => &["api_id", "api_hash"],
         "consent" => &["acknowledged"],
         _ => &[],
@@ -485,14 +542,48 @@ fn parse(text: &str) -> eyre::Result<Config> {
     }
 
     if let Some(tel) = root.get("telemetry").and_then(toml::Value::as_table) {
+        // Read before `enabled` so the new key wins when both are present.
+        // The only value worth carrying across is `off`: it is an opt-out,
+        // and silently turning telemetry back on for someone who wrote it is
+        // the one migration outcome that would be indefensible. `vendor` and
+        // `custom` both meant "on" and both map to `enabled = true`, with the
+        // difference between them now expressed by whether `endpoint` is set.
         if let Some(v) = tel.get("mode") {
             let s = v
                 .as_str()
                 .ok_or_else(|| eyre::eyre!("[telemetry].mode must be a string"))?;
-            cfg.telemetry_mode = parse_telemetry_mode(s).unwrap_or_else(|| {
-                tracing::warn!(mode = %s, "unrecognized [telemetry].mode; defaulting to vendor");
-                TelemetryMode::Vendor
-            });
+            match parse_telemetry_switch(s) {
+                Some(mode) => {
+                    cfg.telemetry_mode = mode;
+                    tracing::warn!(
+                        mode = %s,
+                        "[telemetry].mode is no longer used; it has been replaced by \
+                         `enabled` (master switch), `crash_reports` (crash reporting) and \
+                         `endpoint` (your own OTLP collector). Your setting was carried over; \
+                         the key will be dropped from the file on the next save."
+                    );
+                }
+                None => tracing::warn!(
+                    mode = %s,
+                    "unrecognized retired [telemetry].mode; ignoring it. Use `enabled` and \
+                     `crash_reports` instead."
+                ),
+            }
+        }
+        if let Some(v) = tel.get("enabled") {
+            let on = v
+                .as_bool()
+                .ok_or_else(|| eyre::eyre!("[telemetry].enabled must be a boolean"))?;
+            cfg.telemetry_mode = if on {
+                TelemetryMode::On
+            } else {
+                TelemetryMode::Off
+            };
+        }
+        if let Some(v) = tel.get("crash_reports") {
+            cfg.telemetry_crash_reports = v
+                .as_bool()
+                .ok_or_else(|| eyre::eyre!("[telemetry].crash_reports must be a boolean"))?;
         }
         if let Some(v) = tel.get("endpoint") {
             cfg.telemetry_endpoint = Some(
@@ -551,9 +642,11 @@ fn parse(text: &str) -> eyre::Result<Config> {
 }
 
 /// `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` override file credentials;
-/// `TELEGRAM_TUI_TELEMETRY` (`vendor`|`custom`|`off`) overrides the
-/// telemetry mode; `DO_NOT_TRACK` set to anything other than empty or `"0"`
-/// forces telemetry off regardless of everything else.
+/// `TELEGRAM_TUI_TELEMETRY=off` turns the master switch off; `DO_NOT_TRACK`
+/// set to anything other than empty or `"0"` forces it off regardless of
+/// everything else. Off here means off for both egresses — crash reports and
+/// a user's OTLP collector alike — because both are gated on
+/// `telemetry_mode`.
 fn apply_env_overrides(cfg: &mut Config) {
     if let Ok(raw) = std::env::var("TELEGRAM_API_ID") {
         match raw.parse::<i32>() {
@@ -568,10 +661,10 @@ fn apply_env_overrides(cfg: &mut Config) {
     }
 
     if let Ok(raw) = std::env::var("TELEGRAM_TUI_TELEMETRY") {
-        match parse_telemetry_mode(&raw) {
+        match parse_telemetry_switch(&raw) {
             Some(mode) => cfg.telemetry_mode = mode,
             None => {
-                tracing::warn!(value = %raw, "TELEGRAM_TUI_TELEMETRY is not vendor|custom|off; ignoring")
+                tracing::warn!(value = %raw, "TELEGRAM_TUI_TELEMETRY is not on|off; ignoring")
             }
         }
     }
@@ -694,7 +787,15 @@ mod tests {
         assert_eq!(cfg.theme, "default");
         assert_eq!(cfg.layout_breakpoint_cols, 100);
         assert_eq!(cfg.palette_key, "ctrl+p");
-        assert_eq!(cfg.telemetry_mode, TelemetryMode::Vendor);
+        assert_eq!(cfg.telemetry_mode, TelemetryMode::On);
+        assert!(
+            cfg.telemetry_crash_reports,
+            "crash reporting is on unless the user opts out"
+        );
+        assert!(
+            cfg.telemetry_endpoint.is_none(),
+            "OTLP is opt-in: no collector is configured by default"
+        );
         assert_eq!(cfg.api_id, None);
         assert!(!cfg.consent_acknowledged);
 
@@ -890,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn do_not_track_forces_mode_off() {
+    fn do_not_track_forces_telemetry_off() {
         let _lock = lock_env();
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
@@ -904,7 +1005,9 @@ mod tests {
             dir.join("config.toml"),
             r#"
                 [telemetry]
-                mode = "vendor"
+                enabled = true
+                crash_reports = true
+                endpoint = "https://collector.example/"
             "#,
         )
         .unwrap();
@@ -914,13 +1017,151 @@ mod tests {
         }
         let cfg = load().expect("load should succeed");
         assert_eq!(cfg.telemetry_mode, TelemetryMode::Off);
+        // Both egresses, not just one: the switch is the master switch, and
+        // a config that asked for crash reports and named a collector must
+        // still reach neither.
+        assert!(!cfg.crash_reports_enabled());
+        assert!(cfg.custom_destination().is_none());
 
         // "0" is the documented opt-out-of-opt-out and must not force Off.
         unsafe {
             std::env::set_var("DO_NOT_TRACK", "0");
         }
         let cfg = load().expect("load should succeed");
-        assert_eq!(cfg.telemetry_mode, TelemetryMode::Vendor);
+        assert_eq!(cfg.telemetry_mode, TelemetryMode::On);
+        assert!(cfg.crash_reports_enabled());
+        assert!(cfg.custom_destination().is_some());
+
+        clear_related_env();
+    }
+
+    /// The other two spellings of the same master switch. `--no-telemetry`
+    /// is applied in `main::effective_telemetry_mode` rather than here, and
+    /// is tested there.
+    #[test]
+    fn telegram_tui_telemetry_off_disables_both_egresses() {
+        let _lock = lock_env();
+        clear_related_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by the env lock held above.
+        unsafe {
+            set_config_dir(tmp.path());
+        }
+
+        let dir = tmp.path().join("telegram-tui");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+                [telemetry]
+                enabled = true
+                crash_reports = true
+                endpoint = "https://collector.example/"
+            "#,
+        )
+        .unwrap();
+
+        // SAFETY: serialized by the env lock held above.
+        unsafe {
+            std::env::set_var("TELEGRAM_TUI_TELEMETRY", "off");
+        }
+        let cfg = load().expect("load should succeed");
+        assert_eq!(cfg.telemetry_mode, TelemetryMode::Off);
+        assert!(!cfg.crash_reports_enabled());
+        assert!(cfg.custom_destination().is_none());
+
+        // SAFETY: serialized by the env lock held above.
+        unsafe {
+            std::env::set_var("TELEGRAM_TUI_TELEMETRY", "on");
+        }
+        let cfg = load().expect("load should succeed");
+        assert_eq!(cfg.telemetry_mode, TelemetryMode::On);
+
+        clear_related_env();
+    }
+
+    /// `[telemetry].enabled = false` is what a Disable at the consent screen
+    /// leaves on disk, so it has to survive a reload and take both egresses
+    /// with it — otherwise the opt-out would last exactly one run.
+    #[test]
+    fn a_persisted_opt_out_disables_both_egresses_on_reload() {
+        let _lock = lock_env();
+        clear_related_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by the env lock held above.
+        unsafe {
+            set_config_dir(tmp.path());
+        }
+
+        let mut cfg = load().expect("initial load generates defaults");
+        assert!(cfg.crash_reports_enabled(), "the default is on");
+
+        cfg.apply_patch(&ConfigPatch::ConsentAcknowledged { enabled: false });
+        cfg.telemetry_endpoint = Some("https://collector.example/".to_string());
+        cfg.save().expect("save should succeed");
+
+        let reloaded = load().expect("reload should succeed");
+        assert!(
+            reloaded.consent_acknowledged,
+            "a Disable still acknowledges, or the screen would ask again and \
+             the opt-out would not persist"
+        );
+        assert_eq!(reloaded.telemetry_mode, TelemetryMode::Off);
+        assert!(!reloaded.crash_reports_enabled());
+        assert!(reloaded.custom_destination().is_none());
+
+        clear_related_env();
+    }
+
+    /// A config written by an older binary must keep working, and — the part
+    /// that matters — an old `mode = "off"` must not be quietly upgraded
+    /// into telemetry being back on.
+    #[test]
+    fn a_retired_mode_key_still_loads_and_keeps_an_opt_out() {
+        let _lock = lock_env();
+        clear_related_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by the env lock held above.
+        unsafe {
+            set_config_dir(tmp.path());
+        }
+
+        let dir = tmp.path().join("telegram-tui");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("config.toml"),
+            "[app]\ntheme = \"midnight\"\n\n[telemetry]\nmode = \"off\"\n",
+        )
+        .unwrap();
+        let cfg = load().expect("an old config must still load");
+        assert_eq!(cfg.theme, "midnight", "the rest of the file still applies");
+        assert_eq!(cfg.telemetry_mode, TelemetryMode::Off);
+        assert!(!cfg.crash_reports_enabled());
+
+        // `vendor` and `custom` both meant "on" and both become `On`; what
+        // used to be the difference between them is now whether `endpoint`
+        // is set.
+        for mode in ["vendor", "custom"] {
+            std::fs::write(
+                dir.join("config.toml"),
+                format!("[telemetry]\nmode = \"{mode}\"\n"),
+            )
+            .unwrap();
+            let cfg = load().expect("an old config must still load");
+            assert_eq!(cfg.telemetry_mode, TelemetryMode::On, "mode = {mode:?}");
+        }
+
+        // The new key wins when a half-migrated file carries both.
+        std::fs::write(
+            dir.join("config.toml"),
+            "[telemetry]\nmode = \"vendor\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load().expect("load should succeed").telemetry_mode,
+            TelemetryMode::Off
+        );
 
         clear_related_env();
     }
@@ -941,7 +1182,7 @@ mod tests {
             api_hash: "s3cr3t".to_string(),
         });
         cfg.apply_patch(&ConfigPatch::ConsentAcknowledged { enabled: true });
-        cfg.apply_patch(&ConfigPatch::TelemetryMode(TelemetryMode::Custom));
+        cfg.apply_patch(&ConfigPatch::TelemetryMode(TelemetryMode::Off));
         cfg.save().expect("save should succeed");
 
         let reloaded = load().expect("reload should succeed");
@@ -949,7 +1190,7 @@ mod tests {
         assert_eq!(reloaded.api_id, Some(42));
         assert_eq!(reloaded.api_hash.as_deref(), Some("s3cr3t"));
         assert!(reloaded.consent_acknowledged);
-        assert_eq!(reloaded.telemetry_mode, TelemetryMode::Custom);
+        assert_eq!(reloaded.telemetry_mode, TelemetryMode::Off);
 
         clear_related_env();
     }
@@ -962,9 +1203,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_mode_endpoint_replaces_vendor() {
+    fn a_configured_endpoint_resolves_to_a_destination() {
         let mut cfg = Config {
-            telemetry_mode: TelemetryMode::Custom,
             telemetry_endpoint: Some("https://collector.example/".to_string()),
             telemetry_protocol: Some("http/json".to_string()),
             telemetry_headers: vec![("x-scope-orgid".to_string(), "42".to_string())],
@@ -973,7 +1213,7 @@ mod tests {
 
         let dest = cfg
             .custom_destination()
-            .expect("custom mode with an endpoint resolves to a destination");
+            .expect("a configured endpoint resolves to a destination");
         assert_eq!(dest.endpoint, "https://collector.example/");
         assert_eq!(dest.protocol.as_deref(), Some("http/json"));
         assert_eq!(
@@ -981,20 +1221,19 @@ mod tests {
             vec![("x-scope-orgid".to_string(), "42".to_string())]
         );
 
-        // Vendor mode never resolves a custom destination, even with the
-        // same fields populated: custom fully replaces vendor, and the two
-        // are never combined (spec §13.5).
-        cfg.telemetry_mode = TelemetryMode::Vendor;
+        // The master switch takes the endpoint with it.
+        cfg.telemetry_mode = TelemetryMode::Off;
         assert!(
             cfg.custom_destination().is_none(),
-            "vendor mode must not see a custom destination"
+            "telemetry off must not resolve a destination"
         );
 
-        // Custom mode with no endpoint configured is inert, same as an
-        // unset vendor endpoint.
-        cfg.telemetry_mode = TelemetryMode::Custom;
+        // And with no endpoint there is nothing to resolve, which is the
+        // default: OTLP is opt-in.
+        cfg.telemetry_mode = TelemetryMode::On;
         cfg.telemetry_endpoint = None;
         assert!(cfg.custom_destination().is_none());
+        assert!(Config::default().custom_destination().is_none());
     }
 
     #[test]

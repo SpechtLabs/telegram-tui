@@ -1,13 +1,19 @@
-//! The OTLP exporter: the only thing in this binary that puts bytes on the
-//! network on the app's behalf. See docs/architecture.md §2.3, §4.8; spec
-//! §13.1, §13.5-§13.7.
+//! The OTLP exporter: the allowlist-enforced egress, and one of the two
+//! things in this binary that put bytes on the network on the app's behalf.
+//! The other is `crash.rs`, whose rules are different and deliberately so —
+//! read its module docs before assuming a property proved here holds there.
+//! See docs/architecture.md §2.3, §4.8; spec §13.1, §13.5-§13.7.
+//!
+//! This path is **opt-in**: it exists for a user pointing the client at
+//! their own collector, and does nothing until `[telemetry].endpoint` is
+//! set. The project operates no OTLP destination.
 //!
 //! # Why this is not `tracing-batteries`
 //!
-//! Spec §13.1 sketches a `tracing_batteries::Session` with the
-//! `OpenTelemetry` battery. That crate is still a dependency (§6.4 pins it),
-//! but its battery cannot be used here, for two reasons visible in its
-//! source at rev `f059e936`:
+//! Spec §13.1 sketches a `tracing_batteries::Session`. The Sentry half of
+//! that sketch is real and lives in `crash.rs`; the `OpenTelemetry` battery
+//! cannot be used here, for two reasons visible in its source at rev
+//! `f059e936`:
 //!
 //! 1. `OpenTelemetry::setup` builds its *own* `tracing_subscriber::registry()`
 //!    and calls `.init()` on it. Only one subscriber can be global, so the
@@ -23,6 +29,11 @@
 //! `opentelemetry-otlp` + `opentelemetry-appender-tracing`, the crates the
 //! battery itself wraps) directly, which lets the export layer be filtered
 //! and composed into the one registry `logging::init` installs.
+//!
+//! Both objections are about the subscriber, which is why the *Sentry*
+//! battery is used unchanged: it installs none. The rule, stated once, is
+//! that a battery which takes the global subscriber cannot be used here and
+//! a battery which does not can.
 //!
 //! # Shape of the pipeline
 //!
@@ -44,7 +55,6 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::{BatchConfigBuilder, BatchLogProcessor, SdkLoggerProvider};
-use tgt_core::effect::TelemetryMode;
 use tgt_core::telemetry::schema::keys;
 use tracing::{Event, Metadata, Subscriber};
 use tracing_subscriber::Layer;
@@ -58,12 +68,10 @@ use crate::logging::ExportLayer;
 /// filter test below is what keeps the two honest.
 pub const TELEMETRY_TARGET: &str = "tgt_telemetry";
 
-/// Vendor ingest proxy (spec §13.6), baked in at build time. A build
-/// without it produces a binary whose vendor mode is inert.
-const VENDOR_ENDPOINT: Option<&str> = option_env!("TGT_INGEST_ENDPOINT");
-
-/// Sent with every request so the ingest proxy can reject or rate-limit by
-/// client version without a release (spec §13.1, §13.6).
+/// Sent with every request so a collector can identify (and, if it wants,
+/// reject) a client version. Retained now that the destination is the user's
+/// own: it costs one header and it is what makes a version-specific export
+/// bug diagnosable from the collector side.
 const CLIENT_HEADER: &str = "x-tgt-client";
 
 /// Hard ceiling on shutdown (spec §13.7). Quitting must not wait on a
@@ -96,8 +104,9 @@ pub struct SessionContext {
     pub width_bucket: &'static str,
 }
 
-/// A user-configured destination which, under `mode = "custom"`, *replaces*
-/// the vendor one. Data is never dual-shipped (spec §13.5).
+/// The collector the user configured. There is no second OTLP destination
+/// for this to be weighed against any more: the project runs none, so a
+/// session exports to this or to nowhere.
 pub struct CustomEndpoint {
     pub endpoint: String,
     /// `http/protobuf` or `http/json`; `None` means http/protobuf.
@@ -219,29 +228,27 @@ impl Drop for OtelGuard {
     }
 }
 
-/// Builds the export pipeline for `mode`, or `Ok(None)` when this build and
-/// configuration have nothing to export to (telemetry off, or a vendor build
-/// without `TGT_INGEST_ENDPOINT`).
+/// Builds the export pipeline, or `Ok(None)` when this session has nowhere
+/// to export to — which is the default, since OTLP is opt-in and the caller
+/// passes `None` unless `[telemetry].endpoint` is set and telemetry is on.
 ///
 /// Callers must treat `Err` as "no telemetry", not as a startup failure: a
 /// misconfigured collector is never a reason to refuse to run a chat client
 /// (spec §13.7).
 pub fn init(
-    mode: TelemetryMode,
     session: &SessionContext,
-    custom: Option<CustomEndpoint>,
+    destination: Option<CustomEndpoint>,
 ) -> eyre::Result<Option<Exporter>> {
-    let Some(destination) = destination(mode, custom) else {
+    let Some(destination) = destination.filter(|d| !d.endpoint.trim().is_empty()) else {
         return Ok(None);
     };
 
     let provider = build_provider(&destination, session)?;
     let layer = PublicOnly::new(OpenTelemetryTracingBridge::new(&provider));
 
-    tracing::debug!(
-        mode = mode_str(mode),
-        "telemetry exporter installed" // deliberately without the endpoint
-    );
+    // Deliberately without the endpoint: the local log is rich, but a
+    // collector URL can carry a token in its path.
+    tracing::debug!("telemetry exporter installed");
 
     Ok(Some(Exporter {
         layer: Box::new(layer),
@@ -249,20 +256,6 @@ pub fn init(
             provider: Some(provider),
         },
     }))
-}
-
-/// Where this session exports to, if anywhere. Custom fully replaces vendor;
-/// the two are never combined (spec §13.5).
-fn destination(mode: TelemetryMode, custom: Option<CustomEndpoint>) -> Option<CustomEndpoint> {
-    match mode {
-        TelemetryMode::Off => None,
-        TelemetryMode::Vendor => VENDOR_ENDPOINT.map(|endpoint| CustomEndpoint {
-            endpoint: endpoint.to_string(),
-            protocol: None,
-            headers: Vec::new(),
-        }),
-        TelemetryMode::Custom => custom.filter(|c| !c.endpoint.trim().is_empty()),
-    }
 }
 
 fn build_provider(
@@ -434,14 +427,6 @@ fn env_protocol_is_grpc() -> bool {
 
 fn env_present(var: &str) -> bool {
     std::env::var_os(var).is_some_and(|value| !value.is_empty())
-}
-
-fn mode_str(mode: TelemetryMode) -> &'static str {
-    match mode {
-        TelemetryMode::Vendor => "vendor",
-        TelemetryMode::Custom => "custom",
-        TelemetryMode::Off => "off",
-    }
 }
 
 /// Reads the per-install identity from the config directory, generating and
@@ -649,7 +634,6 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
 
         let exporter = init(
-            TelemetryMode::Custom,
             &SessionContext {
                 install_id: "0123456789abcdef".to_string(),
                 session_id: "fedcba98".to_string(),
@@ -664,7 +648,7 @@ mod tests {
             }),
         )
         .expect("the exporter builds against any syntactically valid endpoint")
-        .expect("custom mode with an endpoint yields an exporter");
+        .expect("a configured endpoint yields an exporter");
 
         let Exporter { layer, guard } = exporter;
         {
@@ -694,7 +678,6 @@ mod tests {
         let collector = std::thread::spawn(move || read_one_request(&listener));
 
         let exporter = init(
-            TelemetryMode::Custom,
             &SessionContext {
                 install_id: "0123456789abcdef".to_string(),
                 session_id: "fedcba98".to_string(),
@@ -709,7 +692,7 @@ mod tests {
             }),
         )
         .expect("the exporter builds")
-        .expect("custom mode with an endpoint yields an exporter");
+        .expect("a configured endpoint yields an exporter");
 
         let Exporter { layer, guard } = exporter;
         {
@@ -792,31 +775,44 @@ mod tests {
             .position(|window| window == needle)
     }
 
+    /// OTLP is opt-in, so "no endpoint configured" has to mean *nothing*,
+    /// not a default. Left to itself the SDK would happily export to
+    /// `localhost:4318`; `init` has to refuse before it can.
     #[test]
-    fn vendor_mode_is_inert_without_a_build_time_endpoint() {
-        // This build has no TGT_INGEST_ENDPOINT (CI never sets it), so
-        // vendor mode must produce nothing at all rather than defaulting to
-        // localhost:4318, which is what the SDK would do on its own.
-        assert!(VENDOR_ENDPOINT.is_none(), "test build must be vendor-inert");
-        assert!(destination(TelemetryMode::Vendor, None).is_none());
-        assert!(destination(TelemetryMode::Off, None).is_none());
+    fn without_a_configured_endpoint_there_is_no_exporter() {
+        let session = SessionContext {
+            install_id: "0123456789abcdef".to_string(),
+            session_id: "fedcba98".to_string(),
+            term_program: None,
+            graphics_protocol: "none",
+            width_bucket: "80-120",
+        };
+
+        assert!(
+            init(&session, None)
+                .expect("no endpoint is not an error")
+                .is_none(),
+            "an unset endpoint must not produce an exporter"
+        );
+        assert!(
+            init(
+                &session,
+                Some(CustomEndpoint {
+                    endpoint: "   ".to_string(),
+                    protocol: None,
+                    headers: Vec::new(),
+                })
+            )
+            .expect("a blank endpoint is not an error")
+            .is_none(),
+            "a blank endpoint must not produce an exporter"
+        );
     }
 
     #[test]
-    fn custom_endpoint_replaces_vendor_and_is_never_combined() {
-        let custom = destination(
-            TelemetryMode::Custom,
-            Some(CustomEndpoint {
-                endpoint: "https://collector.example/".to_string(),
-                protocol: Some("http/json".to_string()),
-                headers: vec![("x-scope-orgid".to_string(), "42".to_string())],
-            }),
-        )
-        .expect("a custom endpoint is a destination");
-
-        assert_eq!(custom.endpoint, "https://collector.example/");
+    fn endpoint_protocol_and_path_are_resolved_as_configured() {
         assert_eq!(
-            logs_endpoint(&custom.endpoint),
+            logs_endpoint("https://collector.example/"),
             "https://collector.example/v1/logs"
         );
         assert_eq!(
@@ -824,7 +820,7 @@ mod tests {
             "https://c.example/v1/logs"
         );
         assert!(matches!(
-            protocol_from(custom.protocol.as_deref()),
+            protocol_from(Some("http/json")),
             Ok(Protocol::HttpJson)
         ));
         assert!(matches!(protocol_from(None), Ok(Protocol::HttpBinary)));

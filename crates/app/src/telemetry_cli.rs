@@ -3,13 +3,18 @@
 //! to spec §13.3's "nothing but the file logger writes while the TUI is
 //! active" rule.
 //!
-//! `show` must print *exactly* what a session would send: only schema
-//! constants and, where harmless, the live values a real session would
-//! attach. `show_to`'s only job beyond formatting is staying honest about
-//! that boundary, which is why every line it writes traces back to either
-//! `tgt_core::telemetry::schema` or a value a real session actually
-//! computes (`otel::load_or_create_identity`, `graphics::probe`, the
-//! terminal size).
+//! For the OTLP egress `show` prints *exactly* what a session would send:
+//! only schema constants and, where harmless, the live values a real session
+//! would attach. Every line of that section traces back to either
+//! `tgt_core::telemetry::schema` or a value a real session actually computes
+//! (`otel::load_or_create_identity`, `graphics::probe`, the terminal size).
+//!
+//! For the crash-reporting egress it cannot make that promise and does not
+//! try. A crash report is assembled at the moment something fails, out of
+//! the failure's own text and stack, so there is no fixed list to print. The
+//! output says what a report is made of and says plainly that its contents
+//! are not enumerable in advance — which is a less satisfying answer than
+//! the one above, and the true one.
 
 use std::io::Write;
 
@@ -18,16 +23,11 @@ use tgt_core::effect::TelemetryMode;
 use tgt_core::telemetry::schema::{actions, buckets, error_kinds, keys};
 
 use crate::config::Config;
-use crate::{graphics, otel};
+use crate::{crash, graphics, otel};
 
-/// Vendor ingest proxy, baked in at build time (spec §13.6). Read the same
-/// way `otel.rs` reads it — `option_env!` resolves per call site from the
-/// same environment variable, so this needs no coupling to that module.
-const VENDOR_ENDPOINT: Option<&str> = option_env!("TGT_INGEST_ENDPOINT");
-
-/// Prints exactly what a session would send: the resource attributes every
-/// session attaches once, the event attribute names with their allowed
-/// value sets, and where this session's data would go.
+/// Prints what a session would send: which egresses are live, the resource
+/// attributes every export attaches once, and the event attribute names with
+/// their allowed value sets.
 pub fn show(config: &Config) -> eyre::Result<()> {
     match show_to(config, &mut std::io::stdout().lock()) {
         // `tgt telemetry show | head` closes our stdout early; that is the
@@ -45,8 +45,39 @@ pub fn show(config: &Config) -> eyre::Result<()> {
 /// [`show`], writing to an arbitrary sink instead of stdout — what the
 /// `show_lists_only_allowlisted_keys` test captures and parses.
 pub fn show_to(config: &Config, out: &mut dyn Write) -> eyre::Result<()> {
-    writeln!(out, "telemetry mode: {}", mode_str(config.telemetry_mode))?;
-    writeln!(out, "destination: {}", destination_line(config))?;
+    writeln!(out, "telemetry: {}", mode_str(config.telemetry_mode))?;
+    writeln!(out)?;
+
+    writeln!(out, "crash reports: {}", crash_reports_line(config))?;
+    writeln!(
+        out,
+        "  A report is built when the app crashes or exits with an error. It carries a"
+    )?;
+    writeln!(
+        out,
+        "  stack trace, the error or panic message, the app and OS version, and the recent"
+    )?;
+    writeln!(
+        out,
+        "  actions listed below as breadcrumbs. The message comes from whatever failed, so"
+    )?;
+    writeln!(
+        out,
+        "  unlike the OTLP attributes below it is not drawn from a fixed list and can carry"
+    )?;
+    writeln!(
+        out,
+        "  limited content such as a file path. Your IP address, username and hostname are"
+    )?;
+    writeln!(out, "  not sent.")?;
+    writeln!(out)?;
+
+    writeln!(out, "OTLP export: {}", destination_line(config))?;
+    writeln!(
+        out,
+        "  Exactly the keys below and nothing else, enforced by an allowlist and proven by"
+    )?;
+    writeln!(out, "  a CI test that decodes the wire.")?;
     writeln!(out)?;
 
     writeln!(out, "resource attributes (sent once per session):")?;
@@ -74,30 +105,37 @@ pub fn reset_id() -> eyre::Result<()> {
 
 fn mode_str(mode: TelemetryMode) -> &'static str {
     match mode {
-        TelemetryMode::Vendor => "vendor",
-        TelemetryMode::Custom => "custom",
-        TelemetryMode::Off => "off",
+        TelemetryMode::On => "on",
+        TelemetryMode::Off => "off — nothing is sent by either path below",
     }
 }
 
-/// Where this session's data would go, mirroring `otel::destination`
-/// exactly: custom fully replaces vendor, never both (spec §13.5).
+/// Whether crash reports would actually be sent, reading the same
+/// `Config::crash_reports_enabled` and `crash::build_has_dsn` that
+/// `crash::init` does, so the two cannot describe different sessions.
+fn crash_reports_line(config: &Config) -> String {
+    if !config.crash_reports_enabled() {
+        return "off — nothing is sent".to_string();
+    }
+    if !crash::build_has_dsn() {
+        return "on, but this build has no Sentry DSN baked in, so nothing is sent".to_string();
+    }
+    "on — sent to the telegram-tui project's Sentry".to_string()
+}
+
+/// Where this session's OTLP export would go, mirroring `otel::init`'s own
+/// check: the endpoint the user configured, or nowhere.
 fn destination_line(config: &Config) -> String {
-    match config.telemetry_mode {
-        TelemetryMode::Off => "nowhere — telemetry is disabled".to_string(),
-        TelemetryMode::Vendor => match VENDOR_ENDPOINT {
-            Some(endpoint) => format!("{endpoint} (vendor)"),
-            None => "nowhere — this build has no vendor endpoint baked in; vendor mode is inert"
-                .to_string(),
-        },
-        TelemetryMode::Custom => match config.custom_destination() {
-            Some(dest) => format!(
-                "{} (custom, {})",
-                dest.endpoint,
-                dest.protocol.as_deref().unwrap_or("http/protobuf")
-            ),
-            None => "nowhere — custom mode has no endpoint configured".to_string(),
-        },
+    if config.telemetry_mode == TelemetryMode::Off {
+        return "off — nothing is sent".to_string();
+    }
+    match config.custom_destination() {
+        Some(dest) => format!(
+            "{} ({})",
+            dest.endpoint,
+            dest.protocol.as_deref().unwrap_or("http/protobuf")
+        ),
+        None => "nowhere — no collector configured; this path is opt-in".to_string(),
     }
 }
 
@@ -206,6 +244,11 @@ mod tests {
     /// allowlist. This is spec §13.2's structural guarantee, checked from
     /// the CLI side: `show` cannot claim a session would send something
     /// that isn't in `ALLOWED_KEYS`.
+    ///
+    /// Scoped to the OTLP half, which is the half that has an allowlist.
+    /// The crash-reporting section writes prose, not `key = value` lines, so
+    /// it contributes nothing here — deliberately, since there is no fixed
+    /// list of what a crash report contains for this test to check against.
     #[test]
     fn show_lists_only_allowlisted_keys() {
         let _lock = crate::logging::tests::env_lock();
@@ -242,36 +285,98 @@ mod tests {
         );
     }
 
-    #[test]
-    fn show_reports_custom_mode_destination_and_never_vendor() {
+    /// `show` runs against a scratch config dir and returns the line
+    /// starting with `prefix`.
+    fn line_for(config: &Config, prefix: &str) -> String {
         let _lock = crate::logging::tests::env_lock();
         let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by the shared env lock other telemetry tests use.
         unsafe {
             set_config_dir(tmp.path());
         }
 
-        let config = Config {
-            telemetry_mode: TelemetryMode::Custom,
-            telemetry_endpoint: Some("https://collector.example/".to_string()),
-            ..Config::default()
-        };
-
         let mut buf = Vec::new();
-        show_to(&config, &mut buf).unwrap();
+        show_to(config, &mut buf).expect("show_to should succeed against a scratch config dir");
 
+        // SAFETY: serialized by the lock above.
         unsafe {
             unset_config_dir();
         }
 
-        let output = String::from_utf8(buf).unwrap();
-        let destination = output
+        let output = String::from_utf8(buf).expect("show_to writes UTF-8");
+        output
             .lines()
-            .find(|l| l.starts_with("destination:"))
-            .expect("a destination line");
-        assert!(destination.contains("https://collector.example/"));
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{output}"))
+            .to_string()
+    }
+
+    #[test]
+    fn show_reports_the_configured_collector_as_the_otlp_destination() {
+        let config = Config {
+            telemetry_endpoint: Some("https://collector.example/".to_string()),
+            ..Config::default()
+        };
+        assert!(line_for(&config, "OTLP export:").contains("https://collector.example/"));
+    }
+
+    /// OTLP is opt-in now, so the default config — telemetry fully on — must
+    /// still report that it exports nowhere. A user reading this output is
+    /// entitled to see that the two egresses have different defaults.
+    #[test]
+    fn show_reports_no_otlp_destination_by_default() {
+        let line = line_for(&Config::default(), "OTLP export:");
         assert!(
-            !destination.contains("vendor"),
-            "custom mode must never mention the vendor destination: {destination}"
+            line.contains("nowhere"),
+            "the default config exports to no collector: {line}"
+        );
+    }
+
+    /// Every route to "off" has to reach the output, or `show` would be
+    /// telling a user who opted out that they are still sending.
+    #[test]
+    fn show_reports_both_egresses_off_when_the_master_switch_is_off() {
+        // What --no-telemetry, TELEGRAM_TUI_TELEMETRY=off and DO_NOT_TRACK
+        // all produce.
+        let config = Config {
+            telemetry_mode: TelemetryMode::Off,
+            telemetry_crash_reports: true,
+            telemetry_endpoint: Some("https://collector.example/".to_string()),
+            ..Config::default()
+        };
+
+        assert!(line_for(&config, "telemetry:").contains("off"));
+        assert!(line_for(&config, "crash reports:").contains("off"));
+        let otlp = line_for(&config, "OTLP export:");
+        assert!(otlp.contains("off"), "{otlp}");
+        assert!(
+            !otlp.contains("collector.example"),
+            "a configured endpoint must not be reported as live while telemetry is off: {otlp}"
+        );
+    }
+
+    #[test]
+    fn show_reports_crash_reports_off_when_only_that_switch_is_off() {
+        let config = Config {
+            telemetry_crash_reports: false,
+            ..Config::default()
+        };
+        assert!(line_for(&config, "crash reports:").contains("off"));
+        // The master switch is still on, so the line above must not claim
+        // telemetry as a whole is off.
+        assert!(line_for(&config, "telemetry:").contains("on"));
+    }
+
+    /// A from-source build has no DSN, and saying "on" without saying that
+    /// would overstate what it does. CI is such a build, so this is the
+    /// branch the test suite actually takes.
+    #[test]
+    fn show_admits_when_the_build_has_no_dsn() {
+        assert!(!crash::build_has_dsn(), "the test build must have no DSN");
+        let line = line_for(&Config::default(), "crash reports:");
+        assert!(
+            line.contains("no Sentry DSN") && line.contains("nothing is sent"),
+            "a DSN-less build must say so: {line}"
         );
     }
 

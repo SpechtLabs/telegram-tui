@@ -1,24 +1,25 @@
 ---
 source: crates/ui/src/view/consent.rs
-assertion_line: 263
 expression: "render_to_string(100, 30, &state)"
 ---
                                                                                                     
-                                                                                                    
-                                                                                                    
               ┌────────────────────────── Before we start ───────────────────────────┐              
-              │telegram-tui can send anonymous usage telemetry to help find bugs and │              
-              │see which features get used.                                          │              
+              │telegram-tui sends anonymous crash reports so bugs get fixed without  │              
+              │you having to file them. This is on unless you turn it off.           │              
               │                                                                      │              
-              │Collected: app/OS version, terminal type, action names (e.g. "sent a  │              
-              │message"), outcomes, error kinds, durations, and a random per-install │              
-              │id.                                                                   │              
+              │Collected: app/OS version, terminal type, a stack trace and error     │              
+              │message when something goes wrong, recent action names (e.g. "sent a  │              
+              │message"), outcomes, durations, and a random per-install id.          │              
               │                                                                      │              
               │Never collected: message text, contact names, phone numbers, chat     │              
-              │titles, or file names.                                                │              
+              │titles, file names, your IP address, or your computer's name.         │              
               │                                                                      │              
-              │Sent to: the telegram-tui project's telemetry endpoint.               │              
+              │One caveat: an error message is written by whatever failed, not chosen│              
+              │from the list above, so it can carry limited content such as a file   │              
+              │path.                                                                 │              
               │                                                                      │              
+              │Sent to: the telegram-tui project's crash reporting. Usage data goes  │              
+              │nowhere else unless you configure your own collector.                 │              
               │                                                                      │              
               │Change your mind later: `--no-telemetry`,                             │              
               │`TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK=1`, or edit config.toml.  │              

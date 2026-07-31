@@ -35,9 +35,9 @@ config:
       - title: Inline images where the terminal allows
         icon: mdi:image-outline
         details: Downloaded photos render as pictures on kitty, Ghostty, iTerm2 and WezTerm, with opt-in sixel. Everywhere else a photo is one honest descriptive line, never a broken block of escape codes.
-      - title: Telemetry that cannot leak
+      - title: Told before anything is sent
         icon: mdi:shield-lock-outline
-        details: One allowlist of attribute keys, one macro that can reach the exporter, and a CI test that boots the app against a collector stub and fails on any key outside the list. Message text is not on the list, so it cannot be exported.
+        details: Crash reports are on unless you turn them off, and a first-run screen says so before login. They carry a stack trace, recent action names and the error message, and that message is written by whatever failed rather than drawn from a list, so it can include limited content such as a file path. Usage export stays off until you name your own collector, and there a CI test decodes the wire and fails on any attribute key outside the allowlist. --no-telemetry silences both.
       - title: Testable to the frame
         icon: mdi:test-tube
         details: update() does no I/O and reads no clock, so the whole client replays from recorded TDLib sessions with no network and no account. Rendering is pinned by insta snapshots.

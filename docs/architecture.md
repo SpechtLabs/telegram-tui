@@ -123,7 +123,8 @@ is a candidate for editing.
 | `media_kind.rs` | Path/extension → `OutgoingFileKind` |
 | `notify.rs` | `OSC 777` / `BEL` emission; generic body only, structurally no payload |
 | `logging.rs` | Rolling file log under `~/.local/state/telegram-tui/`; nothing to stdout/stderr while TUI active |
-| `otel.rs` | `tracing-batteries` session, public-marker filter layer, 2 s shutdown timeout |
+| `otel.rs` | OTLP exporter (opt-in), public-marker filter layer, 2 s shutdown timeout |
+| `crash.rs` | `tracing-batteries` Sentry session, breadcrumbs, fatal-error capture, 2 s flush |
 | `telemetry_cli.rs` | `telemetry show` / `reset-id` implementations |
 | `panic.rs` | Panic hook: leave alternate screen and raw mode before printing |
 | `build.rs` | macOS rpath link args and dev-time dylib copy (§9.2) |
@@ -1360,10 +1361,26 @@ impl TdError {
 
 ### 4.8 Telemetry — `core/src/telemetry/`
 
-The allowlist is structural: `TelemetryEvent` fields are `&'static str` drawn
-from `schema` constants, so arbitrary strings (names, titles, message text)
-cannot be passed without a compile-visible constant addition, which the insta
-snapshot turns into a reviewed diff.
+Two egresses leave this binary, and everything below describes one of them.
+
+| Egress | Module | Default | Governed by |
+|---|---|---|---|
+| OTLP export | `app/src/otel.rs` | off until a collector is configured | the allowlist in this section, proved on the wire by spec §13.8 |
+| Sentry crash reports | `app/src/crash.rs` | on unless switched off | spec §13.9; the failure's own stack and text, with no allowlist |
+
+The allowlist is structural for the OTLP path: `TelemetryEvent` fields are
+`&'static str` drawn from `schema` constants, so arbitrary strings (names,
+titles, message text) cannot be passed without a compile-visible constant
+addition, which the insta snapshot turns into a reviewed diff.
+
+A crash report is a different shape of thing. It gets assembled when something
+fails, out of that failure's stack trace and message, so there is no fixed field
+list for an allowlist to be. `send_default_pii: false` and a `before_send` that
+nulls `server_name` keep the user's IP address, username, and hostname off it;
+the error text itself is written by whatever failed and can carry limited
+content such as a file path. Breadcrumbs are the exception — `crash::record_action`
+builds them from the same `TelemetryEvent` the OTLP path exports, so the action
+trail is allowlist-shaped even when the report around it is not.
 
 ```rust
 // core/src/telemetry/schema.rs — THE COMPLETE allowlist. Additions are a
@@ -1535,8 +1552,15 @@ core only as `Effect::Telemetry(TelemetryEvent)`, whose fields are schema
 constants; (2) the dispatcher is the single `emit!` call site for those events
 (impure layers may also call `emit!` directly, same constraint applies); (3) the
 OTLP layer filter drops anything without the marker, so a stray
-`tracing::info!` never exports; (4) the CI collector-stub test fails on any
-exported key outside `ALLOWED_KEYS` (spec §13.8).
+`tracing::info!` never reaches a collector; (4) the CI collector-stub test fails
+on any exported key outside `ALLOWED_KEYS` (spec §13.8).
+
+All four are properties of the OTLP path. The collector stub the CI test drives
+speaks OTLP, so no crash report ever passes through it, and nothing in that file
+constrains what Sentry receives — the test's header says so, and so does spec
+§13.9. A stray `tracing::info!` still stays out of Sentry, but for a different
+and weaker reason: nothing bridges `tracing` events into the Sentry hub, rather
+than a filter dropping them.
 
 ### 4.9 Theme and ui-side signatures — `crates/ui/src/`
 
@@ -2013,21 +2037,31 @@ Notes:
   any published version); its default `v1` feature already selects the
   macOS Keychain store (`apple-native-keyring-store`) on this platform, so the
   plain pin is correct and sufficient.
-- **T49 amendment:** `tracing-batteries`' `OpenTelemetry` battery is unusable
-  here — at rev `f059e936` its `setup` installs its own global subscriber
-  (mutually exclusive with the rolling file layer) and filters only by level
-  (it would export every `tracing::info!`, defeating the §13.2 allowlist).
-  `otel.rs` therefore drives the same underlying stack directly
-  (`opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` /
+- **T49 amendment, revised by T73:** `tracing-batteries`' `OpenTelemetry`
+  battery is unusable here — at rev `f059e936` its `setup` installs its own
+  global subscriber (mutually exclusive with the rolling file layer) and
+  filters only by level (it would export every `tracing::info!`, defeating the
+  §13.2 allowlist). `otel.rs` therefore drives the same underlying stack
+  directly (`opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` /
   `opentelemetry-appender-tracing` + `reqwest` for TLS, all pinned to the
-  versions batteries itself resolves — see the manifest comment). The
-  batteries git dep stays pinned per spec §13.1; whether to drop it entirely
-  is an open decision for the user.
+  versions batteries itself resolves — see the manifest comment).
+  Both objections are about the *subscriber*, and the `Sentry` battery installs
+  none: its `setup` calls `sentry::init`, which binds a client to a
+  process-global hub, and returns. So that battery is used as-is by `crash.rs`,
+  and the rule is stated once in both modules — a battery that takes the global
+  subscriber cannot be used here, a battery that does not can.
 - `tracing-batteries` is not on crates.io; pinned to commit
-  `f059e936623c2eb0ca67f6ae3301487c9443ffd0` (repo HEAD, 2026-07-21).
-  `default-features = false` is load-bearing: the crate enables `sentry` by
-  default and v1 ships exactly one egress destination (spec §13.1). If the repo
-  goes stale, vendor it.
+  `f059e936623c2eb0ca67f6ae3301487c9443ffd0` (repo HEAD, 2026-07-21), with
+  `default-features = false, features = ["sentry"]`. The `opentelemetry`
+  feature is off because that battery is unusable (above) and turning it on
+  would drag in tonic and gRPC for nothing.
+- `sentry` is a direct dependency for its feature flags alone. Batteries depends
+  on it with `default-features = false`, which drops `panic`, `backtrace`,
+  `contexts`, and `debug-images` — every integration that makes a crash reporter
+  one. Cargo unifies features across the graph, so pinning the same version here
+  widens the set without a second copy of the crate. It does pull a second
+  `reqwest` major (0.13 for Sentry's transport alongside 0.12 for the OTLP
+  exporter's), which is a real cost accepted for a working uploader.
 - The four `opentelemetry*` crates are the stack `tracing-batteries` wraps,
   driven directly by `app/src/otel.rs` (T49). The battery itself is unusable
   here: `OpenTelemetry::setup` calls `.init()` on a registry it builds
@@ -2040,8 +2074,11 @@ Notes:
 - `axum` + `opentelemetry-proto` + `prost` exist only for the CI allowlist test
   (§13.8): an in-process OTLP collector stub that decodes export requests and
   drains attribute keys.
-- The vendor ingest proxy URL arrives at build time via `TGT_INGEST_ENDPOINT`;
-  a build without it produces a binary whose vendor telemetry mode is inert.
+- The Sentry DSN arrives at build time via `TGT_SENTRY_DSN`; a build without it
+  never calls `sentry::init` at all, so it installs no panic hook and starts no
+  uploader. Every source and CI build is such a build, and `crash.rs` tests it.
+  There is no build-time OTLP endpoint any more: `TGT_INGEST_ENDPOINT` and the
+  vendor proxy behind it are gone, since the project runs no OTLP destination.
 
 ### 6.5 `rust-toolchain.toml`, `.mise.toml`
 

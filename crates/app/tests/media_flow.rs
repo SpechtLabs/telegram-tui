@@ -48,6 +48,8 @@
 
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/crash.rs"]
+mod crash;
 #[path = "../src/dispatch.rs"]
 mod dispatch;
 #[path = "../src/media_kind.rs"]

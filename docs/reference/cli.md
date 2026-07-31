@@ -22,7 +22,7 @@ Starts the terminal client. On first run it shows the telemetry disclosure, then
 
 | Flag | Description |
 | --- | --- |
-| `--no-telemetry` | Disable telemetry for this run, overriding config and environment. The config file is not modified. |
+| `--no-telemetry` | Disable telemetry for this run, overriding config and environment. It's the master switch, so it covers crash reports and OTLP export together. The config file is not modified. |
 | `-h`, `--help` | Print help and exit |
 | `-V`, `--version` | Print the version and exit. Terminal modes are never touched, so this is safe to call from a script. |
 
@@ -51,11 +51,13 @@ tgt telemetry show
 
 **Description**
 
-Prints exactly what a session would send: the current telemetry mode, the destination, every resource attribute with its live value, and every event attribute name with the set of values it may take. It never starts the TUI and never connects to anything.
+Prints the state of both egresses without starting the TUI or connecting to anything: a `telemetry:` line for the master switch, a `crash reports:` line with a paragraph describing what a report is made of, and an `OTLP export:` line naming the collector you configured or saying there isn't one. Then the resource attributes with their live values, and every event attribute name with the set of values it may take.
 
-`--no-telemetry` applies here too, so `tgt --no-telemetry telemetry show` reports mode `off`. Piping into `head` exits cleanly rather than dying on a broken pipe.
+For OTLP that listing really is exactly what a session would send, since every key on it is a schema constant. For crash reports it can't be, and the output says so: a report is assembled out of the failure's own message and stack at the moment something breaks, so its contents aren't enumerable in advance.
 
-::: terminal Inspect what would be sent
+`--no-telemetry` applies here too, so `tgt --no-telemetry telemetry show` reports `off` on all three lines. Piping into `head` exits cleanly rather than dying on a broken pipe.
+
+::: terminal Inspect the telemetry settings
 
 ```shell
 $ tgt telemetry show
@@ -67,7 +69,7 @@ $ tgt telemetry show | head -20
 
 :::
 
-If you built from source without setting `TGT_INGEST_ENDPOINT`, the destination line says so: vendor mode is inert in a build with no endpoint baked in.
+If you built from source without setting `TGT_SENTRY_DSN`, the crash-reports line admits it: reporting reads as on, but the build has no DSN baked in, so `sentry::init` is never called and nothing is sent.
 
 ## `tgt telemetry reset-id`
 

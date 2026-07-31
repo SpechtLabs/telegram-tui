@@ -7,11 +7,11 @@ The first run walks through up to three screens before you see a chat: a telemet
 
 ## The telemetry screen comes first
 
-Before login, before any TDLib traffic, and before an exporter object is ever constructed, `tgt` shows a panel titled "Before we start". It states what would be collected (app and OS version, terminal type, action names like "sent a message", outcomes, error kinds, durations, and a random per-install id) and what never is (message text, contact names, phone numbers, chat titles, file names).
+Before login, before any TDLib traffic, and before either egress is constructed, `tgt` shows a panel titled "Before we start". It opens by saying that anonymous crash reports are on unless you turn them off, then lists what gets collected (app and OS version, terminal type, a stack trace and error message when something goes wrong, recent action names like "sent a message", outcomes, durations, and a random per-install id) and what doesn't (message text, contact names, phone numbers, chat titles, file names, your IP address, your computer's name). It also spells out the caveat: an error message is written by whatever failed rather than chosen from that list, so it can carry limited content such as a file path.
 
-Arrow keys, <kbd>Tab</kbd>, or <kbd>Shift</kbd>+<kbd>Tab</kbd> flip between Enable and Disable; Enable is preselected. <kbd>Enter</kbd> records your answer and moves on. Every other key is swallowed rather than passed through, so a keystroke can't leak to the screen behind it.
+Arrow keys, <kbd>Tab</kbd>, or <kbd>Shift</kbd>+<kbd>Tab</kbd> flip between Enable and Disable; Enable is preselected, because reporting is on by default and the screen is there to make that visible rather than to pretend otherwise. <kbd>Enter</kbd> records your answer and moves on. Every other key is swallowed rather than passed through, so a keystroke can't leak to the screen behind it.
 
-Two details worth knowing. Answering Disable sets the in-memory telemetry mode to off in the same tick, so no stale mode can mint events between your answer and the config write. And in practice this build sends nothing either way: the vendor endpoint is baked in at compile time via `TGT_INGEST_ENDPOINT`, and a build without it has an inert vendor mode rather than a default of `localhost:4318`. [Telemetry controls](../guides/telemetry.md) covers the rest.
+Two details worth knowing. Answering Disable sets the in-memory telemetry mode to off in the same tick, so no stale mode can mint events between your answer and the config write, and it persists as `[telemetry] enabled = false`. A build from source also sends nothing either way, but for a different reason than it used to: the Sentry DSN is baked in at compile time via `TGT_SENTRY_DSN`, and without one the client never initialises Sentry at all, so there's no panic hook and no uploader. [Telemetry controls](../guides/telemetry.md) covers the rest.
 
 ## Signing in
 

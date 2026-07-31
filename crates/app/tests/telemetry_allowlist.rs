@@ -1,5 +1,6 @@
 //! **The allowlist proof** (docs/plan.md T52, spec §13.8): the Milestone 8
-//! gate, and the one test the privacy promise in `docs/spec.md` §13 rests on.
+//! gate, and the test the OTLP half of the privacy promise in the design
+//! spec §13 rests on.
 //!
 //! A whole session is driven against `FakeTd` — login, opening a chat,
 //! downloading a file, reacting, deleting, replying, sending, editing, the
@@ -8,6 +9,25 @@
 //! trip into `support/otlp_stub.rs`. Every attribute key that arrives is
 //! then checked against `schema::ALLOWED_KEYS`, and any key outside it fails
 //! the test by name.
+//!
+//! # This proof does not cover the Sentry path
+//!
+//! Since T73 the binary has a second egress: `crash.rs` sends crash and
+//! error reports, on by default. **Nothing in this file constrains it.** The
+//! stub here speaks OTLP, and a crash report never travels over OTLP, so it
+//! cannot arrive at the collector below whatever it contains. Nor is there
+//! an allowlist for it to violate: a report is assembled at the moment
+//! something fails, out of that failure's stack trace and message, and the
+//! message is written by the code that failed rather than drawn from
+//! `schema`. Spec §13.9 states what it can carry and
+//! `docs/understanding/telemetry-allowlist.md` says the same in the user's
+//! language.
+//!
+//! This paragraph is here because the alternative is worse than having no
+//! proof at all: a test named "the allowlist proof" invites the reading that
+//! everything leaving the process has been checked, and after T73 that
+//! reading is false. Do not widen the claims below without widening what
+//! they actually check.
 //!
 //! # Why this is a subset assertion and not a coverage one
 //!
@@ -79,6 +99,8 @@
 
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/crash.rs"]
+mod crash;
 #[path = "../src/dispatch.rs"]
 mod dispatch;
 #[path = "../src/logging.rs"]
@@ -237,7 +259,6 @@ fn install_exporter(
     use tracing_subscriber::prelude::*;
 
     let exporter = otel::init(
-        TelemetryMode::Custom,
         &session_context(),
         Some(CustomEndpoint {
             endpoint: stub.endpoint(),
@@ -246,7 +267,7 @@ fn install_exporter(
         }),
     )
     .expect("the exporter builds against the stub")
-    .expect("custom mode with an endpoint yields an exporter");
+    .expect("a configured endpoint yields an exporter");
 
     // `tracing`'s own `set_default` rather than `SubscriberInitExt`'s: the
     // latter also installs the `log` bridge process-wide, which would make
@@ -688,7 +709,7 @@ fn boot(consent_needed: bool) -> Boot {
         theme_name: "default".to_string(),
         bindings: KeyBindings::default(),
         layout_breakpoint_cols: 100,
-        telemetry_mode: TelemetryMode::Custom,
+        telemetry_mode: TelemetryMode::On,
         // Non-zero, so a `chat.hash` that accidentally shipped the raw id
         // could not be mistaken for a hash of it.
         telemetry_salt: [0x5au8; 32],
@@ -712,6 +733,22 @@ fn configured() -> Config {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The nine actions the scripted session performs and therefore must export.
+/// Used twice: as the condition for "the export has finished arriving", and
+/// as the anti-vacuity assertion itself. One list, so the wait can never be
+/// satisfied by less than the assertion demands.
+const REQUIRED_ACTIONS: [&str; 9] = [
+    actions::PHONE_LOGIN,
+    actions::CHAT_OPEN,
+    actions::MESSAGE_REACT,
+    actions::MESSAGE_DELETE,
+    actions::MESSAGE_REPLY,
+    actions::MESSAGE_SEND,
+    actions::MESSAGE_EDIT,
+    actions::PALETTE_OPEN,
+    actions::SEARCH_RUN,
+];
+
 /// **The gate.** Every attribute key that reached the collector, at every
 /// level of the OTLP envelope, is in `schema::ALLOWED_KEYS` — and the keys
 /// and actions that prove the exporter was alive are all there.
@@ -729,7 +766,27 @@ async fn exported_attribute_keys_are_subset_of_allowlist() {
     // `shutdown` `main` runs on quit.
     drop(subscriber);
     guard.shutdown();
-    stub.wait_for("the export to arrive", |stub| stub.request_count() > 0);
+
+    // Wait for the *whole* session, not merely for the first request.
+    //
+    // `guard.shutdown()` is capped at two seconds by design (spec §13.7) and
+    // walks away from the export worker when that runs out, so on a loaded
+    // machine the flush can still be in flight when it returns, arriving as
+    // several requests rather than one. Waiting on `request_count() > 0`
+    // then read a half-populated stub and failed the anti-vacuity check
+    // below with a scattered subset of actions — a confusing way to be told
+    // "you looked too early".
+    //
+    // The condition is the anti-vacuity list itself, which keeps the timeout
+    // meaningful: an exporter that genuinely stopped working never satisfies
+    // it and fails here with the same evidence it would have failed with
+    // below.
+    stub.wait_for("the whole session's export to arrive", |stub| {
+        let observed: BTreeSet<String> = stub.actions().into_iter().collect();
+        REQUIRED_ACTIONS
+            .iter()
+            .all(|action| observed.contains(*action))
+    });
 
     // --- the subset claim ---------------------------------------------
     let offenders: Vec<String> = stub
@@ -781,17 +838,7 @@ async fn exported_attribute_keys_are_subset_of_allowlist() {
     }
 
     let observed: BTreeSet<String> = stub.actions().into_iter().collect();
-    for action in [
-        actions::PHONE_LOGIN,
-        actions::CHAT_OPEN,
-        actions::MESSAGE_REACT,
-        actions::MESSAGE_DELETE,
-        actions::MESSAGE_REPLY,
-        actions::MESSAGE_SEND,
-        actions::MESSAGE_EDIT,
-        actions::PALETTE_OPEN,
-        actions::SEARCH_RUN,
-    ] {
+    for action in REQUIRED_ACTIONS {
         assert!(
             observed.contains(action),
             "the session performed {action:?} but it was never exported\n\
@@ -874,16 +921,39 @@ async fn no_export_before_consent() {
     // the process in when consent is unacknowledged.
     let stub = OtlpStub::start();
 
-    // Part 1: the gate.
+    // Part 1: the gate. It now sits over *both* egresses — an
+    // unacknowledged install builds neither an exporter nor a crash
+    // reporter — so it is checked with each egress separately configured on.
+    let with_collector = config::Config {
+        telemetry_mode: TelemetryMode::On,
+        telemetry_endpoint: Some("https://collector.example/".to_string()),
+        ..config::Config::default()
+    };
+    let with_crash_reports = config::Config {
+        telemetry_mode: TelemetryMode::On,
+        telemetry_crash_reports: true,
+        ..config::Config::default()
+    };
+
     assert!(
-        !consent_gate(false, TelemetryMode::Custom),
-        "an unacknowledged install must not construct an exporter, whatever the mode"
+        !consent_gate(false, &with_collector),
+        "an unacknowledged install must not construct an exporter"
     );
-    assert!(!consent_gate(false, TelemetryMode::Vendor));
-    assert!(!consent_gate(true, TelemetryMode::Off));
     assert!(
-        consent_gate(true, TelemetryMode::Custom),
-        "and an acknowledged install with a mode must, or the gate would be a synonym for Off"
+        !consent_gate(false, &with_crash_reports),
+        "nor a crash reporter"
+    );
+    assert!(!consent_gate(
+        true,
+        &config::Config {
+            telemetry_mode: TelemetryMode::Off,
+            ..with_collector.clone()
+        }
+    ));
+    assert!(
+        consent_gate(true, &with_collector),
+        "and an acknowledged install with telemetry on must, or the gate \
+         would be a synonym for Off"
     );
 
     // Part 2: the screen in front of everything else.
@@ -926,11 +996,16 @@ async fn no_export_before_consent() {
     assert!(stub.unexpected().is_empty(), "{:?}", stub.unexpected());
 }
 
-/// `main.rs`'s exporter gate, restated. Kept next to the test that depends
-/// on it and checked against the original by
+/// `main.rs`'s consent gate, restated. Kept next to the test that depends on
+/// it and checked against the original by
 /// [`the_replicated_consent_gate_still_matches_main`].
-fn consent_gate(consent_acknowledged: bool, telemetry_mode: TelemetryMode) -> bool {
-    consent_acknowledged && telemetry_mode != TelemetryMode::Off
+///
+/// In `main` the acknowledgement is read once into a local and then guards
+/// both egress constructions; whether each *then* has anywhere to go is the
+/// egress's own question, which `Config` answers.
+fn consent_gate(consent_acknowledged: bool, config: &config::Config) -> bool {
+    consent_acknowledged
+        && (config.crash_reports_enabled() || config.custom_destination().is_some())
 }
 
 /// The canary for [`consent_gate`]. A source-text check is a blunt
@@ -945,11 +1020,30 @@ fn the_replicated_consent_gate_still_matches_main() {
     )
     .expect("main.rs is readable");
 
+    // Fragments rather than whole lines: `cargo fmt` reflows the
+    // `crash_reporter` binding across three lines or one depending on what
+    // is around it, and a canary that breaks on formatting teaches people to
+    // edit the canary instead of reading it.
+    for expected in [
+        "let acknowledged = config.consent_acknowledged;",
+        "crash::init(session_config.crash_reports_enabled())",
+        "if acknowledged {",
+    ] {
+        assert!(
+            main.contains(expected),
+            "main.rs's consent gate has changed: {expected:?} is gone. \
+             `no_export_before_consent` replicates it in `consent_gate`; \
+             update both together, and re-read that test's \"what this does \
+             not prove\" section before you do."
+        );
+    }
+    // And that the acknowledgement really is what guards each of them,
+    // rather than three unrelated lines that happen to contain the text
+    // above.
     assert!(
-        main.contains("if config.consent_acknowledged && telemetry_mode != TelemetryMode::Off {"),
-        "main.rs's exporter gate has changed. `no_export_before_consent` \
-         replicates it in `consent_gate`; update both together, and re-read \
-         that test's \"what this does not prove\" section before you do."
+        main.contains("acknowledged\n        .then(|| crash::init(")
+            || main.contains("acknowledged.then(|| crash::init("),
+        "the crash reporter is no longer gated on the consent acknowledgement"
     );
 }
 

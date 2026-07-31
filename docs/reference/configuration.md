@@ -21,17 +21,19 @@ Lowest to highest:
 4. `DO_NOT_TRACK`, which beats `TELEGRAM_TUI_TELEMETRY`
 5. `--no-telemetry`, which forces telemetry off for the run without rewriting the file
 
+The last two are master switches, so they silence crash reports and OTLP export together.
+
 ## Unknown keys warn, they don't fail
 
 An unrecognised section, or an unrecognised key inside a known section, produces a warning in the log and is ignored. A config written by a newer build won't brick an older one. (`[telemetry.headers]` is exempt from the check, since it's a free-form map.)
 
-A key with the *wrong type* is a hard error, with a message naming the key: `[app].mouse must be a boolean`. Unrecognised enum values are soft: an unknown `telemetry.mode` warns and falls back to `vendor`.
+A key with the *wrong type* is a hard error, with a message naming the key: `[app].mouse must be a boolean`. Unrecognised enum values are soft. The retired `[telemetry].mode` is the one you'll still meet in an older file: `off` carries across as `enabled = false`, `vendor` and `custom` as `enabled = true`, both with a deprecation warning naming the keys that replaced it. A `mode` value that's none of those warns and is ignored outright, with no fallback. When a file sets both `mode` and `enabled`, `enabled` wins.
 
 ## Saving
 
 When the client writes the config (a theme toggle, the credentials wizard, the consent answer), it re-renders the whole template from the current values into a temporary file and renames it into place. Comments are regenerated from the template rather than preserved, so hand-written comments in your file will be lost the first time something saves.
 
-Only four fields can be written from inside the app: theme, telemetry mode, credentials, and the consent acknowledgement. Everything else is hand-edit only.
+Only four fields can be written from inside the app: theme, the telemetry master switch (`[telemetry] enabled`), credentials, and the consent acknowledgement. Everything else is hand-edit only.
 
 ## `[app]`
 
@@ -55,16 +57,22 @@ The internal binding table has three entries (palette, help, quit), but only `pa
 
 ## `[telemetry]`
 
+Two different egresses share this section and they don't carry the same guarantee. Crash reports go to the project's Sentry and are on unless you turn them off; the OTLP export goes to a collector you name yourself and does nothing until you name one, since the project operates no OTLP destination.
+
 | Key | Type | Default | What it does |
 | --- | --- | --- | --- |
-| `mode` | string | `"vendor"` | `vendor`, `custom`, or `off`, case-insensitive. Unrecognised values warn and use `vendor`. |
-| `endpoint` | string | unset | OTLP base URL. **Only read when `mode = "custom"`.** `/v1/logs` is appended if absent. |
-| `protocol` | string | unset | `http/protobuf` (also `http-protobuf`, `http-binary`, or empty) or `http/json`. gRPC isn't compiled in. Anything else yields no exporter. **Only read when `mode = "custom"`.** |
-| `headers.<NAME>` | table of strings | empty | Extra HTTP headers, appended after the always-present `x-tgt-client`. **Only read when `mode = "custom"`.** |
+| `enabled` | boolean | `true` | Master switch over both egresses. `false` is what `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK` and a Disable at the first-run screen all resolve to. |
+| `crash_reports` | boolean | `true` | Sentry crash and error reports: a stack trace, the panic or error message and its cause chain, the app/OS/arch version, and recent actions as breadcrumbs. Setting it to `false` switches off Sentry alone and leaves a configured collector exporting. |
+| `endpoint` | string | unset | OTLP base URL for a collector you run. `/v1/logs` is appended if absent. Unset means no OTLP export at all; there's no fallback to `localhost:4318`. |
+| `protocol` | string | unset | `http/protobuf` (also `http-protobuf`, `http-binary`, or empty) or `http/json`. gRPC isn't compiled in. Anything else yields no exporter. |
+| `headers.<NAME>` | table of strings | empty | Extra HTTP headers on the OTLP request, appended after the always-present `x-tgt-client`. |
+| `mode` | string | retired | Still read for old files, then dropped from the file on the next save. See the enum note above. |
 
-::: warning endpoint, protocol and headers are silently inert outside custom mode
-The generated template renders all three unconditionally, and there is no warning when they're set while the mode is `vendor`. Setting an endpoint without also setting `mode = "custom"` does nothing at all.
+::: warning A crash report's contents are not allowlisted
+The OTLP path exports allowlisted attribute keys and nothing else, and `crates/app/tests/telemetry_allowlist.rs` decodes the wire in CI to prove it. That test does not cover crash reports, and the allowlist doesn't govern them either: the error message in a report is written by whatever failed rather than picked from a fixed list, so it can carry limited content such as a file path. `send_default_pii: false` plus a `before_send` hook that nulls `server_name` keep your IP address, username and hostname out of it, and `install.id` is deliberately not attached, so a crash can't be joined to a usage session. Breadcrumbs are the exception: they're built from the same allowlisted events the OTLP path exports and carry no more than it does.
 :::
+
+A build with no `TGT_SENTRY_DSN` compiled in never calls `sentry::init`, so `crash_reports = true` in such a build installs no panic hook and uploads nothing. Every build from source is one of those, and `tgt telemetry show` says so on the crash-reports line.
 
 Note also that the "environment wins over config" rule holds for `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_PROTOCOL` but not for headers: `[telemetry.headers]` is applied even when `OTEL_EXPORTER_OTLP_HEADERS` is set.
 
@@ -81,7 +89,7 @@ The section is only written out once at least one of the two is set, so a freshl
 
 | Key | Type | Default | What it does |
 | --- | --- | --- | --- |
-| `acknowledged` | boolean | `false` | Whether the first-run telemetry screen has been answered. While false, that screen is shown and no exporter is constructed. |
+| `acknowledged` | boolean | `false` | Whether the first-run telemetry screen has been answered. While false, that screen is shown and neither egress is constructed. Answering it writes this key and `[telemetry].enabled` together, so a Disable there persists as `enabled = false`. |
 
 ## A full example
 
@@ -97,7 +105,13 @@ auto_download_photos = true
 palette = "ctrl+p"
 
 [telemetry]
-mode = "off"
+enabled = true
+crash_reports = false
+endpoint = "https://otlp.example.com"
+protocol = "http/protobuf"
+
+[telemetry.headers]
+Authorization = "Basic aGVsbG86dGhlcmU="
 
 [credentials]
 api_id = 1234567
@@ -107,6 +121,8 @@ api_hash = "0123456789abcdef0123456789abcdef"
 acknowledged = true
 ```
 
+The `[telemetry]` block there is a deliberate mix rather than the default: crash reports off, usage export on and pointed at a collector of your own. Leave both keys out and you get the opposite, which is crash reports on and no OTLP export.
+
 ## Environment variables
 
 ### Credentials and telemetry
@@ -115,8 +131,8 @@ acknowledged = true
 | --- | --- |
 | `TELEGRAM_API_ID` | Overrides `credentials.api_id` for the run. Not persisted. A non-integer value warns and is ignored. |
 | `TELEGRAM_API_HASH` | Overrides `credentials.api_hash` for the run. Not persisted. |
-| `TELEGRAM_TUI_TELEMETRY` | `vendor`, `custom` or `off`, case-insensitive. Overrides the file. |
-| `DO_NOT_TRACK` | Any value other than empty or `0` forces telemetry off, beating both the file and `TELEGRAM_TUI_TELEMETRY`. |
+| `TELEGRAM_TUI_TELEMETRY` | `on`, `off`, `true`, `false`, `1` or `0`, case-insensitive, plus the legacy `vendor` and `custom` which both count as on. Overrides the file for both egresses. Anything else warns and is ignored. |
+| `DO_NOT_TRACK` | Any value other than empty or `0` forces telemetry off, beating both the file and `TELEGRAM_TUI_TELEMETRY`. Crash reports and OTLP export alike. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | When set, the client withholds its own endpoint and lets the OpenTelemetry SDK resolve it. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Same withholding. A value of `grpc` yields no exporter with an explanatory log line. |
 
@@ -143,7 +159,7 @@ acknowledged = true
 | `TGT_OPENER` | Command used to open a downloaded file. Default `open`. |
 | `RUST_LOG` | Filters the local log file only. Default `info`. It deliberately cannot silence telemetry. |
 | `TGT_PREFIX` | Used by `mise run install` / `uninstall` only. Default `~/.local`. Not read by the binary. |
-| `TGT_INGEST_ENDPOINT` | Build-time only. Bakes in the vendor telemetry destination; a build without it has an inert vendor mode. |
+| `TGT_SENTRY_DSN` | Build-time only. Bakes in the Sentry DSN for crash reports. Without it the binary never initialises Sentry, so it has no panic hook and no uploader, which is the case for every from-source and CI build. |
 
 ## Files on disk
 

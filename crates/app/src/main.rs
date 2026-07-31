@@ -4,6 +4,7 @@
 
 mod cli;
 mod config;
+mod crash;
 mod dispatch;
 mod graphics;
 mod keychain;
@@ -58,12 +59,16 @@ fn main() -> eyre::Result<()> {
     run_tui(cli)
 }
 
-/// The effective telemetry mode for this run, applying the one precedence
-/// step left after `config::load()` (spec §13.5): `DO_NOT_TRACK` and
-/// `TELEGRAM_TUI_TELEMETRY` are already folded into `config_mode` by that
+/// The effective telemetry master switch for this run, applying the one
+/// precedence step left after `config::load()` (spec §13.5): `DO_NOT_TRACK`
+/// and `TELEGRAM_TUI_TELEMETRY` are already folded into `config_mode` by that
 /// call's env overrides, so the only thing left to apply here is
 /// `--no-telemetry`, which forces the session to `Off` without rewriting
 /// the config file.
+///
+/// `Off` here disables **both** egresses: it gates `crash::init` through
+/// `Config::crash_reports_enabled` and `otel::init` through
+/// `Config::custom_destination`, and neither has any other way in.
 fn effective_telemetry_mode(cli: &Cli, config_mode: TelemetryMode) -> TelemetryMode {
     if cli.no_telemetry {
         TelemetryMode::Off
@@ -105,13 +110,31 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // change the hashes of chats already seen.
     let identity = otel::load_or_create_identity()?;
     let telemetry_mode = effective_telemetry_mode(&cli, config.telemetry_mode);
+    // `config` still holds the file's own master switch; this run's may be
+    // stricter because of `--no-telemetry`. Both egresses read their gate
+    // off this copy so the flag reaches them without a second code path.
+    let session_config = Config {
+        telemetry_mode,
+        ..config.clone()
+    };
+
     // Read from disk before the consent screen (below, via `App::new`) can
     // possibly run this session — an unacknowledged first run therefore
-    // never constructs an exporter, whatever the user is about to choose.
-    // The screen's own acknowledgement only takes effect on the *next* run,
-    // once its `ConfigPatch::ConsentAcknowledged` has round-tripped to disk.
-    let otel_guard = if config.consent_acknowledged && telemetry_mode != TelemetryMode::Off {
-        install_exporter(&export_handle, telemetry_mode, &config, &identity)
+    // never constructs an exporter or a crash reporter, whatever the user is
+    // about to choose. The screen's own acknowledgement only takes effect on
+    // the *next* run, once its `ConfigPatch::ConsentAcknowledged` has
+    // round-tripped to disk.
+    let acknowledged = config.consent_acknowledged;
+
+    // Between `color_eyre::install` above and `panic::install` below, so the
+    // panic hook chain ends up restore-terminal → Sentry capture → color-eyre
+    // print. See `crash::init`.
+    let crash_reporter = acknowledged
+        .then(|| crash::init(session_config.crash_reports_enabled()))
+        .flatten();
+
+    let otel_guard = if acknowledged {
+        install_exporter(&export_handle, &session_config, &identity)
     } else {
         None
     };
@@ -177,6 +200,20 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // front of a usable shell rather than a frozen alternate screen. The
     // guard's `Drop` still covers every path that leaves before this point.
     drop(terminal_guard);
+
+    // The run's own failure is the most useful thing a crash reporter can
+    // carry, and it has to be captured before the client is closed — hence
+    // reporting here rather than letting the `?` below carry it out of
+    // `main` unseen. A panic needs none of this: the panic integration's
+    // hook has already captured it by the time control reaches here, if it
+    // reaches here at all.
+    let outcome = outcome.map_err(color_eyre::Report::from);
+    if let (Err(report), Some(reporter)) = (&outcome, &crash_reporter) {
+        reporter.record_fatal_error(report);
+    }
+    if let Some(reporter) = crash_reporter {
+        reporter.shutdown();
+    }
     if let Some(guard) = otel_guard {
         guard.shutdown();
     }
@@ -185,13 +222,12 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Builds the exporter and swaps it into the live subscriber. Telemetry is
-/// never a reason to fail startup (spec §13.7): a build with no vendor
-/// endpoint, an unreachable collector, or a malformed custom protocol all
-/// resolve to "no exporter" plus a local debug line.
+/// Builds the OTLP exporter and swaps it into the live subscriber.
+/// Telemetry is never a reason to fail startup (spec §13.7): no configured
+/// endpoint, an unreachable collector, or a malformed protocol all resolve
+/// to "no exporter" plus a local debug line.
 fn install_exporter(
     export_handle: &logging::ExportHandle,
-    mode: TelemetryMode,
     config: &Config,
     identity: &otel::Identity,
 ) -> Option<otel::OtelGuard> {
@@ -204,12 +240,10 @@ fn install_exporter(
         width_bucket: tgt_core::telemetry::schema::buckets::width(cols),
     };
 
-    // Under `mode = "custom"` this replaces the vendor destination outright;
-    // `otel::init` never combines the two (spec §13.5). `custom_destination`
-    // already returns `None` unless `config.telemetry_mode` is `Custom`, so
-    // passing it here regardless of `mode` (which may differ from
-    // `config.telemetry_mode` under `--no-telemetry`) is safe either way.
-    let custom = config
+    // `None` unless the user configured a collector *and* the master switch
+    // is on — `custom_destination` is the one place that decides both, so
+    // there is nothing left for this call site to check.
+    let destination = config
         .custom_destination()
         .map(|dest| otel::CustomEndpoint {
             endpoint: dest.endpoint,
@@ -217,7 +251,7 @@ fn install_exporter(
             headers: dest.headers,
         });
 
-    match otel::init(mode, &session, custom) {
+    match otel::init(&session, destination) {
         Ok(Some(exporter)) => match logging::install_export_layer(export_handle, exporter.layer) {
             Ok(()) => Some(exporter.guard),
             Err(err) => {
@@ -226,9 +260,7 @@ fn install_exporter(
             }
         },
         Ok(None) => {
-            tracing::debug!(
-                "telemetry is configured but this build has no destination for it; not exporting"
-            );
+            tracing::debug!("no OTLP collector configured; not exporting");
             None
         }
         Err(err) => {
@@ -413,11 +445,7 @@ mod tests {
     fn no_telemetry_flag_beats_config() {
         let cli = Cli::try_parse_from(["tgt", "--no-telemetry"]).unwrap();
         assert_eq!(
-            effective_telemetry_mode(&cli, TelemetryMode::Vendor),
-            TelemetryMode::Off
-        );
-        assert_eq!(
-            effective_telemetry_mode(&cli, TelemetryMode::Custom),
+            effective_telemetry_mode(&cli, TelemetryMode::On),
             TelemetryMode::Off
         );
         // Off stays Off either way, but this confirms the flag doesn't need
@@ -429,13 +457,40 @@ mod tests {
 
         let cli = Cli::try_parse_from(["tgt"]).unwrap();
         assert_eq!(
-            effective_telemetry_mode(&cli, TelemetryMode::Vendor),
-            TelemetryMode::Vendor
+            effective_telemetry_mode(&cli, TelemetryMode::On),
+            TelemetryMode::On
         );
-        assert_eq!(
-            effective_telemetry_mode(&cli, TelemetryMode::Custom),
-            TelemetryMode::Custom
-        );
+    }
+
+    /// `--no-telemetry` has to reach *both* egresses, and it reaches them
+    /// through the `session_config` `run_tui` builds — the flag is applied
+    /// to `telemetry_mode`, and both `crash_reports_enabled` and
+    /// `custom_destination` gate on that. This reproduces that assembly, so
+    /// a future change that gave one egress its own path off `config`
+    /// instead would fail here.
+    #[test]
+    fn no_telemetry_flag_silences_crash_reports_and_otlp_alike() {
+        let cli = Cli::try_parse_from(["tgt", "--no-telemetry"]).unwrap();
+
+        // A config that asks for everything: both egresses on, a collector
+        // named, consent long since given.
+        let config = Config {
+            telemetry_mode: TelemetryMode::On,
+            telemetry_crash_reports: true,
+            telemetry_endpoint: Some("https://collector.example/".to_string()),
+            consent_acknowledged: true,
+            ..Config::default()
+        };
+        assert!(config.crash_reports_enabled());
+        assert!(config.custom_destination().is_some());
+
+        let session_config = Config {
+            telemetry_mode: effective_telemetry_mode(&cli, config.telemetry_mode),
+            ..config
+        };
+        assert!(!session_config.crash_reports_enabled());
+        assert!(session_config.custom_destination().is_none());
+        assert!(crash::init(session_config.crash_reports_enabled()).is_none());
     }
 
     /// Every protocol the probe can report has to reach `tgt-ui` as the

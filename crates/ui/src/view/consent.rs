@@ -9,6 +9,23 @@
 //! (`term.width_bucket`, `chat.hash`, …), and a screen full of those would
 //! fail the "plain language" bar on its own. Anyone adding a key to the
 //! allowlist should re-read this text.
+//!
+//! # Two paths, two honesty standards
+//!
+//! The screen describes two egresses that do not have the same guarantee,
+//! and it has to say so rather than average them into one reassuring
+//! sentence. Crash reports are on by default and carry a stack trace and the
+//! error's own message, which is written by whatever failed rather than
+//! drawn from the allowlist — so "never collected" is true of the fields the
+//! app chooses to send, and the screen adds the caveat that an error message
+//! can carry limited content. The OTLP path is allowlist-enforced and
+//! CI-proven, and it is off unless the user points it at their own
+//! collector. `tgt-app`'s `crash.rs` and `otel.rs` are the two
+//! implementations this text is answerable to.
+//!
+//! `Enable` stays preselected because reporting is on unless the user opts
+//! out. Showing the screen anyway is the point: a default that reports is
+//! only defensible if it is disclosed before the first send.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -21,7 +38,7 @@ use tgt_core::state::consent::ConsentChoice;
 use crate::theme::Theme;
 
 const PANEL_WIDTH: u16 = 72;
-const PANEL_HEIGHT: u16 = 24;
+const PANEL_HEIGHT: u16 = 28;
 
 pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     let area = f.area();
@@ -41,12 +58,14 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
         _gap2,
         not_collected_area,
         _gap3,
-        destination_area,
+        caveat_area,
         _gap4,
-        controls_area,
+        destination_area,
         _gap5,
-        options_area,
+        controls_area,
         _gap6,
+        options_area,
+        _gap7,
         hint_area,
     ] = Layout::vertical([
         Constraint::Length(2),
@@ -54,6 +73,8 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(1),
@@ -66,17 +87,21 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     .areas(inner);
 
     f.render_widget(
-        Paragraph::new("telegram-tui can send anonymous usage telemetry to help find bugs and see which features get used.")
-            .wrap(Wrap { trim: true })
-            .style(Style::new().fg(theme.text)),
+        Paragraph::new(
+            "telegram-tui sends anonymous crash reports so bugs get fixed without \
+             you having to file them. This is on unless you turn it off.",
+        )
+        .wrap(Wrap { trim: true })
+        .style(Style::new().fg(theme.text)),
         intro_area,
     );
 
     f.render_widget(
         labeled_paragraph(
             "Collected: ",
-            "app/OS version, terminal type, action names (e.g. \"sent a message\"), \
-             outcomes, error kinds, durations, and a random per-install id.",
+            "app/OS version, terminal type, a stack trace and error message when \
+             something goes wrong, recent action names (e.g. \"sent a message\"), \
+             outcomes, durations, and a random per-install id.",
             theme.success,
             theme.text_muted,
         ),
@@ -86,7 +111,8 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     f.render_widget(
         labeled_paragraph(
             "Never collected: ",
-            "message text, contact names, phone numbers, chat titles, or file names.",
+            "message text, contact names, phone numbers, chat titles, file names, \
+             your IP address, or your computer's name.",
             theme.danger,
             theme.text_muted,
         ),
@@ -94,9 +120,23 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
     );
 
     f.render_widget(
-        Paragraph::new("Sent to: the telegram-tui project's telemetry endpoint.")
-            .wrap(Wrap { trim: true })
-            .style(Style::new().fg(theme.text_muted)),
+        labeled_paragraph(
+            "One caveat: ",
+            "an error message is written by whatever failed, not chosen from the \
+             list above, so it can carry limited content such as a file path.",
+            theme.warning,
+            theme.text_muted,
+        ),
+        caveat_area,
+    );
+
+    f.render_widget(
+        Paragraph::new(
+            "Sent to: the telegram-tui project's crash reporting. Usage data goes \
+             nowhere else unless you configure your own collector.",
+        )
+        .wrap(Wrap { trim: true })
+        .style(Style::new().fg(theme.text_muted)),
         destination_area,
     );
 
@@ -277,6 +317,37 @@ mod tests {
         // if it were collected — spot-check the copy names them as excluded.
         assert!(rendered.contains("message text"), "buffer:\n{rendered}");
         assert!(rendered.contains("phone numbers"), "buffer:\n{rendered}");
+    }
+
+    /// The screen has to disclose crash reporting *and* the one place where
+    /// "never collected" stops being an absolute, because that is the whole
+    /// difference between this disclosure and a reassuring one. Losing
+    /// either sentence in an edit would leave a screen that reads as a
+    /// stronger promise than the app keeps.
+    #[test]
+    fn discloses_crash_reporting_and_its_caveat() {
+        let state = fixture_state(ConsentChoice::Enable);
+        let rendered = render_to_string(120, 34, &state);
+
+        assert!(rendered.contains("crash reports"), "buffer:\n{rendered}");
+        assert!(
+            rendered.contains("on unless you turn it off"),
+            "the default has to be stated, or Enable-preselected is a trick:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("One caveat") && rendered.contains("carry limited content"),
+            "the error-message caveat must survive:\n{rendered}"
+        );
+    }
+
+    /// Enable is preselected because reporting is on unless the user opts
+    /// out; a change that flipped the default without changing the copy
+    /// above would make the screen misleading rather than merely different.
+    #[test]
+    fn enable_is_preselected() {
+        let state = fixture_state(ConsentChoice::Enable);
+        let rendered = render_to_string(120, 34, &state);
+        assert!(rendered.contains("▶ Enable"), "buffer:\n{rendered}");
     }
 
     #[test]

@@ -20,10 +20,14 @@
 //! `ConfigPatch::ConsentAcknowledged`. Disabling also flips
 //! `AppState::telemetry_mode` to `Off` immediately, in the same tick — the
 //! config patch is what survives a restart, but the in-memory mode is what
-//! `App::telemetry_for` and the dispatcher's `Effect::Telemetry` consult for
-//! the rest of *this* session, so a Disable must not leave a stale `Vendor`/
-//! `Custom` value able to mint events for the few frames before the save
-//! round-trips.
+//! the rest of *this* session reads, so a Disable must not leave a stale
+//! `On` able to mint events for the few frames before the save round-trips.
+//!
+//! Both choices set `acknowledged`; only the choice itself differs. That
+//! matters more now than it did when telemetry had a single destination:
+//! `Enable` is preselected because crash reporting is on unless the user
+//! opts out, so a Disable that failed to persist would silently turn
+//! reporting back on at the next launch.
 
 use crate::app::{AppState, Screen};
 use crate::effect::{ConfigPatch, Effect, TelemetryMode};
@@ -91,7 +95,7 @@ mod tests {
             theme_name: "dark".to_string(),
             bindings: KeyBindings::default(),
             layout_breakpoint_cols: 100,
-            telemetry_mode: TelemetryMode::Vendor,
+            telemetry_mode: TelemetryMode::On,
             telemetry_salt: [0u8; 32],
             consent_needed: true,
             has_credentials: false,
@@ -140,7 +144,7 @@ mod tests {
         let effects = app.update(crate::action::Action::Key(Key::Enter));
         assert_eq!(app.state().screen, Screen::Auth);
         assert!(app.state().consent.acknowledged);
-        assert_eq!(app.state().telemetry_mode, TelemetryMode::Vendor);
+        assert_eq!(app.state().telemetry_mode, TelemetryMode::On);
         assert!(matches!(
             effects.as_slice(),
             [Effect::SaveConfig(ConfigPatch::ConsentAcknowledged {

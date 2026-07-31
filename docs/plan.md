@@ -15,7 +15,7 @@ Copied from the spec; every task's requirements implicitly include these.
 - `tgt-core` must not depend on `ratatui` or `crossterm`; `tgt-ui` must not depend on `tdlib-rs`. CI-enforced via `scripts/check-crate-boundaries.sh`.
 - `App::update(&mut self, Action) -> Vec<Effect>` does no I/O, spawns nothing, reads no clock or RNG. Time arrives as `Action::Tick { now }`.
 - One action channel. No `Arc<RwLock<AppState>>`, no locks in the render path.
-- Telemetry is allowlist-enforced: `telemetry::emit!` is the only exporter path, gated on `telemetry.public = true`; the CI test of spec §13.8 must pass. Message text, names, usernames, phone numbers, chat titles, file names, and raw Telegram ids must be structurally incapable of reaching the network.
+- The OTLP export is allowlist-enforced: `telemetry::emit!` is its only path, gated on `telemetry.public = true`; the CI test of spec §13.8 must pass. Message text, names, usernames, phone numbers, chat titles, file names, and raw Telegram ids must be structurally incapable of reaching a collector. Crash reporting (spec §13.9) is a second egress with no allowlist and no such proof; every absolute claim about telemetry must name which of the two it is about.
 - Telegram entity offsets are UTF-16 code units; conversion happens only in `tgt_ui::render::offsets`.
 - Chat order comes from TDLib `order: i64` via `updateChatPosition`. Never computed locally.
 - `getChatHistory` may return zero messages while more history exists (`MAX_EMPTY_ATTEMPTS = 3` retries with `only_local = false` before `Exhausted`).
@@ -657,7 +657,7 @@ controls, and the proof.
 
 ### - [x] T49 — exporter wiring
 
-**Goal:** `tracing-batteries` session (OpenTelemetry battery, HttpProtobuf, `x-tgt-client` header); OTLP layer filtered to `target == "tgt_telemetry" && telemetry.public` present; bounded queue drop-on-full; 2 s shutdown timeout; vendor endpoint from build-time `TGT_INGEST_ENDPOINT` (absent → vendor mode inert); `OTEL_EXPORTER_OTLP_*` honored; export failures logged at debug, never surfaced.
+**Goal:** `tracing-batteries` session (OpenTelemetry battery, HttpProtobuf, `x-tgt-client` header); OTLP layer filtered to `target == "tgt_telemetry" && telemetry.public` present; bounded queue drop-on-full; 2 s shutdown timeout; vendor endpoint from build-time `TGT_INGEST_ENDPOINT` (absent → vendor mode inert); `OTEL_EXPORTER_OTLP_*` honored; export failures logged at debug, never surfaced. **Superseded by T73:** the vendor endpoint and `TGT_INGEST_ENDPOINT` are gone, OTLP is opt-in on `[telemetry].endpoint`, and Sentry crash reporting became the default egress.
 **Owns:** `crates/app/src/otel.rs`, `crates/app/src/logging.rs` (edit), `crates/app/src/main.rs` (edit).
 **Depends on:** T48.
 **Interfaces produced:** `otel::init(mode, install_id, session_id) -> OtelGuard` (guard's Drop runs the timed shutdown).
@@ -674,10 +674,10 @@ controls, and the proof.
 
 ### - [x] T51 — telemetry CLI and config modes
 
-**Goal:** `tgt telemetry show` (prints exactly what a session would send, from schema constants + live values), `tgt telemetry reset-id` (regenerates `install.id` and HMAC salt), `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK=1`, `mode = "custom"` fully replacing the vendor destination (never dual-shipped).
+**Goal:** `tgt telemetry show` (prints exactly what a session would send, from schema constants + live values), `tgt telemetry reset-id` (regenerates `install.id` and HMAC salt), `--no-telemetry`, `TELEGRAM_TUI_TELEMETRY=off`, `DO_NOT_TRACK=1`, the user's own collector as the only OTLP destination (T73 retired the vendor one).
 **Owns:** `crates/app/src/telemetry_cli.rs`, `crates/app/src/cli.rs` (edit), `crates/app/src/config.rs` (edit: custom endpoint/protocol/headers).
 **Depends on:** T50.
-**Tests:** `show_lists_only_allowlisted_keys` (parse output, subset of `ALLOWED_KEYS`); `reset_id_changes_install_id_and_salt`; `custom_mode_endpoint_replaces_vendor` (config precedence unit test); `no_telemetry_flag_beats_config`.
+**Tests:** `show_lists_only_allowlisted_keys` (parse output, subset of `ALLOWED_KEYS`); `reset_id_changes_install_id_and_salt`; `a_configured_endpoint_resolves_to_a_destination` (config precedence unit test, renamed by T73); `no_telemetry_flag_beats_config`.
 **Acceptance:** `cargo test -p tgt-app telemetry_cli` and `cargo run -p tgt-app -- telemetry show` exits 0 printing key names only.
 
 ### - [x] T52 — the allowlist proof (CI)

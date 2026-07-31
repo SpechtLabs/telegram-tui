@@ -5,15 +5,17 @@ createTime: 2026/07/31 10:00:00
 
 Most privacy promises are policies: a rule in a contributing guide saying don't log message contents, enforced by whoever reviews the pull request. That works until the first person who forgets, and it fails silently.
 
-`tgt` makes the same promise a property of the type system, the macro system, and a CI gate. A leak isn't something to be careful about; it's something that doesn't compile, or gets dropped at the layer boundary, or turns CI red.
+For its OpenTelemetry export, `tgt` makes the same promise a property of the type system, the macro system, and a CI gate. A leak isn't something to be careful about; it's something that doesn't compile, or gets dropped at the layer boundary, or turns CI red.
 
-For the practical controls, see [Telemetry controls](../guides/telemetry.md). This page is about why the guarantee holds.
+For the practical controls, see [Telemetry controls](../guides/telemetry.md). This page is about why the guarantee holds — and, at the end, about the one path where it doesn't.
 
 ## The claim
 
-> Message text, contact names, usernames, phone numbers, chat titles, file names, and search queries cannot be exported by this client.
+> Message text, contact names, usernames, phone numbers, chat titles, file names, and search queries cannot be exported **by the OpenTelemetry path**.
 
 Not "aren't", not "shouldn't be". Cannot.
+
+The qualifier is doing real work and it was added deliberately. `tgt` also sends crash reports, which are governed by nothing on this page; [what the proof doesn't cover](#what-the-proof-doesn-t-cover) is the section that says so, and it's worth reading before you take the sentence above as a claim about the whole client.
 
 ## Layer 1: the event type can't hold free text
 
@@ -103,17 +105,31 @@ Two more details show the level of care. Fixed constants are used rather than ra
 
 ## The consent gate
 
-Consent is checked before an exporter object is ever constructed:
+Consent is checked before either egress is constructed:
 
 ```rust
-let otel_guard = if config.consent_acknowledged && telemetry_mode != TelemetryMode::Off {
+let acknowledged = config.consent_acknowledged;
+let crash_reporter = acknowledged.then(|| crash::init(session_config.crash_reports_enabled())).flatten();
+let otel_guard = if acknowledged { install_exporter(&export_handle, &session_config, &identity) } else { None };
 ```
 
-Since the value is read from disk before the consent screen can run, your answer takes effect on the *next* start. This run exports nothing regardless of what you pick, because there's nothing to export through.
+Since the value is read from disk before the consent screen can run, your answer takes effect on the *next* start. This run sends nothing regardless of what you pick, because there's nothing to send through — no exporter, and no Sentry client, which also means no panic hook.
 
 The consent screen swallows every key except quit rather than passing unrecognised ones through, and the code says why: "letting an unrecognized key fall through would be the one crack that leaks a keystroke to whatever screen comes after this one."
 
-The gate condition is replicated in the test, plus a source-text canary that greps `main.rs` for the literal line. The test's own doc block is honest about what it can't prove: a change that moved exporter construction *earlier* than the consent check would break that first part and neither of the others.
+The gate condition is replicated in the test, plus a source-text canary that greps `main.rs` for the literal lines. The test's own doc block is honest about what it can't prove: a change that moved exporter construction *earlier* than the consent check would break that first part and neither of the others.
+
+## What the proof doesn't cover
+
+Everything above is about one of the two ways data leaves this client. The other is crash reporting, and none of it applies there.
+
+A crash report gets assembled at the moment something fails, out of that failure's stack trace and its message. There's no fixed field list for an allowlist to be, so layers 1 and 2 have nothing to bite on: the message isn't a `&'static str` chosen from `schema`, it's whatever the failing code wrote. Layer 4 is pointed at an OTLP collector stub, and a crash report never travels over OTLP, so no assertion in `telemetry_allowlist.rs` constrains what Sentry receives. That file's header says this in as many words, because a proof that quietly implies more than it checks is worse than no proof at all.
+
+What holds instead is weaker and worth stating precisely. Sentry is configured with `send_default_pii: false`, so no IP address or username rides along, and a `before_send` hook nulls `server_name`, which would otherwise be your machine's hostname. Breadcrumbs are built by `crash::record_action` from the same `TelemetryEvent` the OTLP path exports, so the action trail attached to a crash is allowlist-shaped even though the crash isn't. `install.id` is deliberately left off, so a crash can't be joined to a usage session. Nothing in this client formats a chat title or a message body into an error, so the strings that actually reach one are TDLib error codes and file paths.
+
+That last sentence is an observation about the current code, not a property enforced by anything. It's the difference between "cannot" and "doesn't", and the two are not interchangeable — which is why crash reporting is disclosed on the first-run screen with its own caveat, and why every switch that turns telemetry off turns it off too.
+
+Layer 3 still holds on this path, incidentally, but for a duller reason than a filter: nothing bridges `tracing` events into the Sentry hub at all, so a stray `info!` has no route there to be dropped from.
 
 ## Adding an attribute is a reviewed diff
 
@@ -128,6 +144,6 @@ Adding a key means adding a constant, which changes the snapshot, which shows up
 
 ## What this is not
 
-It isn't a claim that the client can't be made to leak by someone determined to. Someone with commit access can delete the layer filter. The claim is narrower and more useful: no ordinary mistake produces a leak. Adding a log line doesn't. Adding a field to an event doesn't compile. Forgetting the review rule doesn't matter, because there's no review rule to forget.
+It isn't a claim about the whole client, as the section above spells out. And within the OTLP path it isn't a claim that the client can't be made to leak by someone determined to; anyone with commit access can delete the layer filter. The claim is narrower and more useful: on that path, no ordinary mistake produces a leak. Adding a log line doesn't. Adding a field to an event doesn't compile. Forgetting the review rule doesn't matter, because there's no review rule to forget.
 
 The same discipline extends past telemetry. The terminal notification function takes no content parameters at all, so no sender name or message text can ride an `OSC 777` escape into a multiplexer's log. The pattern is consistent: make the dangerous thing unsayable, rather than asking people not to say it.

@@ -34,11 +34,22 @@ toml = "=1.1.4"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
-tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["opentelemetry"] }
-# The OTLP stack `tracing-batteries` wraps, driven directly: its battery
-# installs its own global subscriber and filters only by level, neither of
-# which can coexist with the file log or the allowlist. See otel.rs's module
-# docs. Versions match the ones batteries resolves, so nothing is duplicated.
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["sentry"] }
+# Named directly only to turn features on. `tracing-batteries` depends on
+# sentry with `default-features = false`, which drops `panic`, `backtrace`,
+# `contexts` and `debug-images` — i.e. everything that makes a *crash*
+# reporter a crash reporter. Cargo unifies features across the graph, so
+# listing sentry here at the version batteries already resolves adds the
+# integrations without a second copy of the crate. The wiring still goes
+# through the battery (`crash.rs`); this entry only widens the feature set.
+# `reqwest` + `rustls` are the transport, matching batteries' own choice.
+sentry = { version = "=0.48.5", default-features = false, features = ["panic", "backtrace", "contexts", "debug-images", "release-health", "reqwest", "rustls"] }
+# The OTLP stack `tracing-batteries` also wraps, driven directly: its
+# `OpenTelemetry` battery installs its own global subscriber and filters only
+# by level, neither of which can coexist with the file log or the allowlist.
+# Its `Sentry` battery has no such problem and *is* used. See otel.rs and
+# crash.rs module docs. Versions match the ones batteries resolves, so
+# nothing is duplicated.
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["logs"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs", "internal-logs"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }

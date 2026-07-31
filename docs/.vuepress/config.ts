@@ -18,7 +18,7 @@ export default defineUserConfig({
       {
         name: "description",
         content:
-          "tgt is a terminal Telegram client built on TDLib and ratatui. Two modifiers in the whole application, visible action chips instead of memorised chords, and telemetry that cannot leak PII by construction.",
+          "tgt is a terminal Telegram client built on TDLib and ratatui. Two modifiers in the whole application, visible action chips instead of memorised chords, and both of its network egresses disclosed on the first run.",
       },
     ],
     ["link", { rel: "icon", type: "image/png", href: "/images/specht.png" }],
