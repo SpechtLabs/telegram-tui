@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use color_eyre::eyre;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -182,15 +184,14 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // unwinding panic — restores the terminal via this guard's `Drop`.
     let terminal_guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    // Flagged before the escape sequence goes out, not after: if the
+    // `execute!` below fails halfway or something panics inside it, the
+    // restore path still knows to send the disable sequence. Sending it when
+    // capture was never on is harmless; leaving it unsent when it was is not.
     if config.mouse {
-        // Flagged before the escape sequence goes out, not after: if this
-        // `execute!` fails halfway or something panics inside it, the
-        // restore path still knows to send the disable sequence. Sending it
-        // when capture was never on is harmless; leaving it unsent when it
-        // was is not.
         MOUSE_CAPTURE.store(true, Ordering::SeqCst);
-        execute!(io::stdout(), EnableMouseCapture)?;
     }
+    enable_modes_into(&mut io::stdout(), config.mouse)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let app = App::new(boot_from(&config, &cli, terminal.size()?, identity.salt));
@@ -325,20 +326,63 @@ fn install_exporter(
 /// terminal gets left in reporting mode, spraying escape codes at the shell.
 static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
 
-/// Restores the terminal: releases mouse capture (if it was taken), leaves
-/// the alternate screen, disables raw mode. Errors are swallowed — there is
-/// nothing more to do if this itself fails, and it may run from inside the
-/// panic hook where propagating isn't an option.
+/// Restores the terminal: releases mouse capture (if it was taken), turns
+/// bracketed paste back off, leaves the alternate screen, disables raw mode.
+/// Errors are swallowed — there is nothing more to do if this itself fails,
+/// and it may run from inside the panic hook where propagating isn't an
+/// option.
 ///
 /// `swap` rather than `load`: a panic runs this from the hook and then again
 /// from `TerminalGuard::drop` as the stack unwinds, and the second pass has
 /// no reason to re-send a sequence the first one already sent.
 fn restore_terminal() {
-    if MOUSE_CAPTURE.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-    }
+    let _ = restore_modes_into(
+        &mut io::stdout(),
+        MOUSE_CAPTURE.swap(false, Ordering::SeqCst),
+    );
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+/// The escape sequences that put the terminal into the modes the TUI needs,
+/// written to an arbitrary sink so a test can read them back.
+///
+/// Bracketed paste is unconditional, unlike mouse capture. Without it
+/// crossterm never emits `Event::Paste` at all and a paste arrives as
+/// individual keystrokes — so an embedded newline acts as Enter and the
+/// composer sends half of what was pasted, which is what anyone pasting a
+/// link or a multi-line message hits. Everything downstream of the event
+/// already exists (`tgt_ui::input::map_event`, `composer::handle_paste`, the
+/// `~/` expansion in `runtime_loop`); this call is the only thing that
+/// produces the event in the first place. There is no configuration that
+/// turns it off, so nothing flags it: the teardown always sends the disable,
+/// and a terminal that never had it on ignores that.
+fn enable_modes_into(out: &mut impl io::Write, mouse: bool) -> io::Result<()> {
+    execute!(out, EnableBracketedPaste)?;
+    if mouse {
+        execute!(out, EnableMouseCapture)?;
+    }
+    Ok(())
+}
+
+/// The escape sequences [`restore_terminal`] sends, written to an arbitrary
+/// sink so a test can read them back.
+///
+/// Split out for exactly that reason: leaving a terminal in bracketed-paste
+/// mode after the process is gone is invisible from inside the process, and
+/// the panic path — where it matters most — is the one nobody exercises by
+/// hand. `disable_raw_mode` and `LeaveAlternateScreen` stay in the caller:
+/// they are terminal syscalls against the real handle with nothing to
+/// capture.
+fn restore_modes_into(out: &mut impl io::Write, mouse_captured: bool) -> io::Result<()> {
+    if mouse_captured {
+        execute!(out, DisableMouseCapture)?;
+    }
+    // Unconditional, matching the enable. A terminal that never had it on
+    // ignores the sequence; one that did would otherwise keep wrapping every
+    // paste in `\e[200~`/`\e[201~` in the user's shell, long after `tgt`
+    // has exited.
+    execute!(out, DisableBracketedPaste)
 }
 
 /// Restores the terminal when dropped, so every way `run_tui` can exit after
@@ -506,6 +550,85 @@ mod tests {
             effective_telemetry_mode(&cli, TelemetryMode::On),
             TelemetryMode::On
         );
+    }
+
+    /// A terminal left in bracketed-paste mode outlives the process: the
+    /// user's shell keeps wrapping every paste in `\e[200~`/`\e[201~` until
+    /// they reset it by hand. It is invisible from inside the process, and
+    /// the path where it matters most — the panic hook — is the one nobody
+    /// exercises by hand, so it is asserted on the bytes.
+    ///
+    /// Both callers of the teardown go through `restore_modes_into`:
+    /// `TerminalGuard::drop` on every ordinary exit, and `panic::install`'s
+    /// hook on an unwinding one.
+    #[test]
+    fn setup_always_turns_bracketed_paste_on() {
+        // 2004 is the DEC private mode for bracketed paste; `h` enables it.
+        const ENABLE_PASTE: &[u8] = b"\x1b[?2004h";
+
+        let mut without_mouse = Vec::new();
+        enable_modes_into(&mut without_mouse, false).expect("writing to a Vec cannot fail");
+        assert!(
+            contains(&without_mouse, ENABLE_PASTE),
+            "bracketed paste must be enabled even with mouse reporting off, or a \
+             pasted newline is delivered as Enter and sends half the text: {:?}",
+            String::from_utf8_lossy(&without_mouse)
+        );
+
+        let mut with_mouse = Vec::new();
+        enable_modes_into(&mut with_mouse, true).expect("writing to a Vec cannot fail");
+        assert!(
+            contains(&with_mouse, ENABLE_PASTE),
+            "and with it on: {:?}",
+            String::from_utf8_lossy(&with_mouse)
+        );
+        assert!(
+            contains(&with_mouse, b"\x1b[?1006h"),
+            "mouse reporting must still be enabled when configured: {:?}",
+            String::from_utf8_lossy(&with_mouse)
+        );
+    }
+
+    #[test]
+    fn the_teardown_always_turns_bracketed_paste_back_off() {
+        // 2004 is the DEC private mode for bracketed paste; `l` disables it.
+        const DISABLE_PASTE: &[u8] = b"\x1b[?2004l";
+        // 1000/1002/1003/1015/1006 are the mouse-reporting modes crossterm
+        // switches off together; checking one is enough to tell the two
+        // sequences apart.
+        const DISABLE_MOUSE_TAIL: &[u8] = b"\x1b[?1006l";
+
+        let mut without_mouse = Vec::new();
+        restore_modes_into(&mut without_mouse, false).expect("writing to a Vec cannot fail");
+        assert!(
+            contains(&without_mouse, DISABLE_PASTE),
+            "bracketed paste must be disabled even when mouse capture never was: {:?}",
+            String::from_utf8_lossy(&without_mouse)
+        );
+        assert!(
+            !contains(&without_mouse, DISABLE_MOUSE_TAIL),
+            "mouse capture that was never taken must not be released: {:?}",
+            String::from_utf8_lossy(&without_mouse)
+        );
+
+        let mut with_mouse = Vec::new();
+        restore_modes_into(&mut with_mouse, true).expect("writing to a Vec cannot fail");
+        assert!(
+            contains(&with_mouse, DISABLE_PASTE),
+            "bracketed paste must be disabled alongside mouse capture: {:?}",
+            String::from_utf8_lossy(&with_mouse)
+        );
+        assert!(
+            contains(&with_mouse, DISABLE_MOUSE_TAIL),
+            "mouse capture that was taken must be released: {:?}",
+            String::from_utf8_lossy(&with_mouse)
+        );
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     /// Declining has to stop the screen coming back. `consent_needed` is
