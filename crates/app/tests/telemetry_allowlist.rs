@@ -135,7 +135,7 @@ use tgt_core::model::key::KeyBindings;
 use tgt_core::model::message::{
     FileSnapshot, MessageCaps, MessageContent, MessageView, SendState, Sender,
 };
-use tgt_core::state::auth::{AuthField, LoginMethod};
+use tgt_core::state::auth::AuthField;
 use tgt_core::state::chat_list::visible_rows;
 use tgt_core::state::focus::Focus;
 use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
@@ -642,12 +642,34 @@ impl Harness {
     /// even finished asking for a phone number, and it swallows every key
     /// except its own, so nothing behind it can act on input.
     ///
-    /// `p` — the key that picks phone login — is pressed between two `↓`
-    /// presses. `↓` toggles the screen's two-item choice, which is
-    /// observable, so seeing the choice come back to where it started is
-    /// proof that the `p` in between was delivered *and* processed. Waiting
-    /// on the absence of an effect would otherwise be a race dressed up as
-    /// an assertion.
+    /// `↓` is the probe. It toggles the screen's two-item choice, which is
+    /// observable, so the choice moving is proof the key was delivered *and*
+    /// processed — waiting on the absence of an effect would otherwise be a
+    /// race dressed up as an assertion.
+    ///
+    /// # What this does not prove, and why there is no assertion for it
+    ///
+    /// It used to press `p` between two `↓`s and assert `auth.method` had
+    /// not moved, from when `p` picked phone login. That probe went inert
+    /// twice over and is worth recording so it is not reinvented:
+    ///
+    /// 1. The QR-first screen (T77) has no arm for `p` in any state, so it
+    ///    could neither leak nor fail to leak.
+    /// 2. Asserting on `auth.method` at all is inert *whatever* key is used.
+    ///    `auth::handle_key` returns `None` unless `screen == Screen::Auth`,
+    ///    and `dispatch_key` returns `None` outright below step 3 unless
+    ///    `screen == Screen::Main`. So while consent is up, no key reaches
+    ///    the auth screen even if consent stops claiming keys entirely —
+    ///    which was verified by making `consent::handle_key` return `None`
+    ///    for `↓` and watching this test still pass.
+    ///
+    /// The consent gate is defended in layers, and an integration test
+    /// driving keys cannot tell them apart. What it *can* falsify is below:
+    /// that the screen stays up, stays interactive, and is not acknowledged
+    /// by anything but `⏎`. The per-key swallowing claim belongs to
+    /// `tgt_core::state::consent`'s own
+    /// `consent_blocks_all_other_screens_until_acknowledged`, which drives
+    /// the router directly and can see what each key did.
     ///
     /// It deliberately stops short of `⏎`: see the caller's doc comment.
     async fn consent_screen_swallows_the_login_keys(&mut self) {
@@ -666,7 +688,9 @@ impl Harness {
             core.app().state().consent.selected != started_on
         })
         .await;
-        self.press(KeyCode::Char('p')).await;
+
+        // A second `↓` puts the choice back, which shows the screen is still
+        // live rather than wedged after taking a key.
         self.press(KeyCode::Down).await;
         self.advance_until("the choice to move back", |core, _| {
             core.app().state().consent.selected == started_on
@@ -677,19 +701,6 @@ impl Harness {
             self.state().screen,
             Screen::Consent,
             "the consent screen must still be up"
-        );
-        // The witness used to be `method == None`, which stopped meaning
-        // anything when login went QR-first (T77): `handle_td` now sets
-        // `Some(Qr)` the moment `WaitPhoneNumber` arrives, with no key
-        // pressed at all. What still distinguishes "a key leaked" from "the
-        // app moved on its own" is whether any of the keys pressed above
-        // advanced the *choice* — `Down` would highlight the phone line
-        // (`PhoneSelected`) and `Enter` would confirm it (`Phone`), so
-        // either value here means the consent screen let a key through.
-        assert_eq!(
-            self.state().auth.method,
-            Some(LoginMethod::Qr),
-            "a key reached the auth wizard through the consent screen"
         );
         assert!(
             !self.state().consent.acknowledged,
