@@ -17,7 +17,7 @@ use crate::state::focus::{Focus, FocusStack};
 use crate::state::media::MediaState;
 use crate::state::modal::{self, ModalState};
 use crate::state::palette::PaletteState;
-use crate::state::presence::PresenceState;
+use crate::state::presence::{self, PresenceState};
 use crate::state::search::ChatSearchState;
 use crate::state::selection;
 use crate::state::toasts::ToastState;
@@ -173,8 +173,13 @@ impl App {
                 // handler that actually changed something sets dirty.
                 self.state.now = now;
                 let flood_wait_before = self.state.auth.flood_wait_until;
-                let effects = auth::handle_tick(&mut self.state, now);
+                let mut effects = auth::handle_tick(&mut self.state, now);
                 if self.state.auth.flood_wait_until != flood_wait_before {
+                    self.dirty = true;
+                }
+                let typing_before = self.state.presence.typing.len();
+                effects.extend(presence::handle_tick(&mut self.state, now));
+                if self.state.presence.typing.len() != typing_before {
                     self.dirty = true;
                 }
                 effects
@@ -671,7 +676,46 @@ impl App {
                 effects.extend(composer::handle_td(&mut self.state, update));
                 effects
             }
-            // File, presence and reaction updates arrive with M5/M6.
+            // Reaction updates land on the conversation window like every
+            // other per-message mutation above; kept in its own arm because
+            // it is M5 territory, not M4's.
+            TdUpdate::MessageInteractionInfo { .. } => {
+                self.dirty = true;
+                conversation::handle_td(&mut self.state, update)
+            }
+            // Presence: online/offline projection and typing indicators.
+            // Dirty is set only when something actually changed — a
+            // `UserStatus` repeating the status already on file, or a
+            // `ChatAction { is_typing: false }` for a user who wasn't marked
+            // typing, must not force an extra render.
+            TdUpdate::UserStatus { user_id, status } => {
+                let changed = self.state.presence.users.get(user_id) != Some(status);
+                let effects = presence::handle_td(&mut self.state, update);
+                if changed {
+                    self.dirty = true;
+                }
+                effects
+            }
+            TdUpdate::ChatAction {
+                chat_id, user_id, ..
+            } => {
+                let was_typing = self
+                    .state
+                    .presence
+                    .typing
+                    .contains_key(&(*chat_id, *user_id));
+                let effects = presence::handle_td(&mut self.state, update);
+                let is_typing_now = self
+                    .state
+                    .presence
+                    .typing
+                    .contains_key(&(*chat_id, *user_id));
+                if was_typing != is_typing_now {
+                    self.dirty = true;
+                }
+                effects
+            }
+            // File updates arrive with M6.
             _ => Vec::new(),
         }
     }
@@ -936,6 +980,165 @@ mod tests {
         assert_eq!(
             state.conversations[&ChatId(1)].last_read_inbox,
             MessageId(42)
+        );
+    }
+
+    #[test]
+    fn reaction_update_replaces_message_reactions() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        app.update(Action::Td(TdUpdate::NewMessage(message(1, 5))));
+        app.take_dirty();
+
+        let effects = app.update(Action::Td(TdUpdate::MessageInteractionInfo {
+            chat_id: ChatId(1),
+            message_id: MessageId(5),
+            reactions: vec![crate::model::message::ReactionView {
+                emoji: "👍".to_string(),
+                count: 3,
+                chosen_by_me: true,
+            }],
+        }));
+        assert!(effects.is_empty());
+        assert!(app.take_dirty());
+
+        let convo = &app.state().conversations[&ChatId(1)];
+        let msg = convo
+            .messages
+            .iter()
+            .find(|m| m.id == MessageId(5))
+            .unwrap();
+        assert_eq!(msg.reactions.len(), 1);
+        assert_eq!(msg.reactions[0].emoji, "👍");
+        assert_eq!(msg.reactions[0].count, 3);
+        assert!(msg.reactions[0].chosen_by_me);
+    }
+
+    #[test]
+    fn read_outbox_advances_marker_only() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        app.update(Action::Td(TdUpdate::NewMessage(message(1, 5))));
+        let before = message(1, 5);
+        app.take_dirty();
+
+        app.update(Action::Td(TdUpdate::ChatReadOutbox {
+            chat_id: ChatId(1),
+            last_read_outbox_message_id: MessageId(5),
+        }));
+        assert!(app.take_dirty());
+
+        let convo = &app.state().conversations[&ChatId(1)];
+        assert_eq!(convo.last_read_outbox, MessageId(5));
+        // No per-message mutation: the message itself is untouched.
+        let after = convo
+            .messages
+            .iter()
+            .find(|m| m.id == MessageId(5))
+            .unwrap();
+        assert_eq!(after.content, before.content);
+        assert_eq!(after.send_state, before.send_state);
+        assert_eq!(after.reactions, before.reactions);
+    }
+
+    #[test]
+    fn user_status_update_routes_to_presence_and_marks_dirty_only_on_change() {
+        let mut app = logged_in();
+        app.take_dirty();
+
+        app.update(Action::Td(TdUpdate::UserStatus {
+            user_id: UserId(7),
+            status: crate::td::update::PresenceStatus::Online,
+        }));
+        assert!(app.take_dirty());
+        assert_eq!(
+            app.state().presence.users.get(&UserId(7)),
+            Some(&crate::td::update::PresenceStatus::Online)
+        );
+
+        // Repeating the same status changes nothing observable: no redraw.
+        app.update(Action::Td(TdUpdate::UserStatus {
+            user_id: UserId(7),
+            status: crate::td::update::PresenceStatus::Online,
+        }));
+        assert!(!app.take_dirty());
+    }
+
+    #[test]
+    fn chat_action_typing_routes_to_presence_and_marks_dirty_on_change() {
+        let mut app = logged_in();
+        app.take_dirty();
+
+        app.update(Action::Td(TdUpdate::ChatAction {
+            chat_id: ChatId(1),
+            user_id: UserId(7),
+            is_typing: true,
+        }));
+        assert!(app.take_dirty());
+        assert!(
+            app.state()
+                .presence
+                .typing
+                .contains_key(&(ChatId(1), UserId(7)))
+        );
+
+        app.update(Action::Td(TdUpdate::ChatAction {
+            chat_id: ChatId(1),
+            user_id: UserId(7),
+            is_typing: false,
+        }));
+        assert!(app.take_dirty());
+        assert!(
+            !app.state()
+                .presence
+                .typing
+                .contains_key(&(ChatId(1), UserId(7)))
+        );
+
+        // Redundant "not typing" for a user who wasn't marked typing: no
+        // observable change, no redraw.
+        app.update(Action::Td(TdUpdate::ChatAction {
+            chat_id: ChatId(1),
+            user_id: UserId(7),
+            is_typing: false,
+        }));
+        assert!(!app.take_dirty());
+    }
+
+    #[test]
+    fn tick_sweeps_expired_typing_and_marks_dirty() {
+        let mut app = logged_in();
+        app.update(Action::Td(TdUpdate::ChatAction {
+            chat_id: ChatId(1),
+            user_id: UserId(7),
+            is_typing: true,
+        }));
+        app.take_dirty();
+
+        app.update(Action::Tick {
+            now: Millis(presence::TYPING_TTL_MS - 1),
+        });
+        assert!(!app.take_dirty());
+        assert!(
+            app.state()
+                .presence
+                .typing
+                .contains_key(&(ChatId(1), UserId(7)))
+        );
+
+        app.update(Action::Tick {
+            now: Millis(presence::TYPING_TTL_MS + 1),
+        });
+        assert!(app.take_dirty());
+        assert!(
+            !app.state()
+                .presence
+                .typing
+                .contains_key(&(ChatId(1), UserId(7)))
         );
     }
 

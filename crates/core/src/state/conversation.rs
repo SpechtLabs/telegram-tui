@@ -179,6 +179,19 @@ pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
                 convo.last_read_outbox = *last_read_outbox_message_id;
             }
         }
+        // T34 addition: replaces a message's reactions wholesale in place,
+        // same "TDLib is the source of truth" shape as every other arm here.
+        TdUpdate::MessageInteractionInfo {
+            chat_id,
+            message_id,
+            reactions,
+        } => {
+            if let Some(convo) = app.conversations.get_mut(chat_id)
+                && let Some(m) = convo.messages.iter_mut().find(|m| m.id == *message_id)
+            {
+                m.reactions = reactions.clone();
+            }
+        }
         _ => {}
     }
     Vec::new()
