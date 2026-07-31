@@ -287,11 +287,10 @@ pub fn looks_like_path(s: &str) -> bool {
 /// focused) — checked here rather than shared, since this isn't itself a
 /// `handle_key` match arm (paste is a distinct `Action`, not a `Key`).
 ///
-/// Not yet wired from `Action::Paste`: `core/src/app.rs`'s `dispatch` still
-/// drops `Paste` in its catch-all `_ => Vec::new()` arm (see the comment
-/// there). Routing `Action::Paste` into this function is an `app.rs` change,
-/// outside this task's ownership (`composer.rs`/`modal.rs`/`media_kind.rs`
-/// only) — left for whichever later task wires it.
+/// `core/src/app.rs`'s `dispatch` routes `Action::Paste` here (T40). The app
+/// layer expands a pasted `~/…` to an absolute path first — see
+/// `crates/app/src/runtime_loop.rs`'s paste arm, which also records why a
+/// path-shaped string that doesn't exist is still allowed to raise an offer.
 pub fn handle_paste(app: &mut AppState, text: String) {
     if app.screen != Screen::Main || app.open_chat.is_none() {
         return;

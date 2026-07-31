@@ -35,11 +35,14 @@
 //!
 //! TDLib has no dedicated "upload progress" push; an outgoing file's
 //! progress surfaces as the same `updateFile` that downloads use, keyed by
-//! the file TDLib assigned to the upload. Correlating that file id back to
-//! the optimistic message id `SendMessageFile` mints is T39/T40's wiring
-//! (the send-file flow does not exist yet). This module only owns the
-//! table and the plain helpers ([`start_upload`], [`progress_upload`],
-//! [`complete_upload`]) the future wiring will call.
+//! the file TDLib assigned to the upload. `app.rs` calls [`start_upload`]
+//! when a file send is accepted and [`complete_upload`] when it resolves
+//! (T40), so the table tracks which messages are in flight — but nothing
+//! calls [`progress_upload`]: correlating an `updateFile` back to the
+//! optimistic message id `SendMessageFile` minted needs a file id on
+//! [`UploadProgress`] to match against, which this module does not record
+//! yet. Until it does, a tracked upload's byte count stays at zero; see
+//! `App::start_tracking_upload`'s "KNOWN GAP".
 //!
 //! ## Cancel
 //!
@@ -131,8 +134,7 @@ pub fn cancel_effect(file_id: FileId) -> Effect {
 }
 
 /// Starts tracking an outgoing upload under the optimistic message id
-/// `SendMessageFile` mints. Wiring (T39/T40) is not in place yet; this only
-/// owns the table.
+/// `SendMessageFile` mints. Called from `app.rs`'s `MessageSent` arm.
 pub fn start_upload(app: &mut AppState, message_id: MessageId, chat_id: ChatId, total: u64) {
     app.media.uploads.insert(
         message_id,

@@ -6,6 +6,16 @@
 //! Wired so far: `Quit`, `Telemetry`, `Td`, `SaveConfig`, `CopyToClipboard`,
 //! `OpenExternal`. `Alert` (T44) is still logged and dropped.
 //!
+//! # Sending a file — the other impure boundary
+//!
+//! `state/modal.rs` builds every `SendMessageFile` with
+//! `OutgoingFileKind::Document` and whatever path string the user typed or
+//! pasted, because `tgt-core` may not touch the filesystem (architecture
+//! §9.3): it can neither expand a leading `~`, nor check that the file is
+//! there, nor derive a kind from an extension it isn't allowed to resolve.
+//! [`resolve_outgoing_file`] does all three here, in the last moment before
+//! the request would reach TDLib — see its doc comment.
+//!
 //! # Opening a file externally
 //!
 //! `OpenExternal` shells out to `open` on macOS, overridable through
@@ -45,6 +55,7 @@ use tgt_core::td::request::{TdRequest, TdResponse, TdlibParams};
 use tgt_core::td::runtime::TdRuntime;
 
 use crate::config::Config;
+use crate::media_kind;
 
 /// TDLib parameters that come from neither the config file nor `update()`:
 /// the 32-byte database key held in the macOS Keychain and the 0700 database
@@ -188,6 +199,13 @@ impl Inner {
     }
 
     async fn execute_td(&self, request: TdRequest) {
+        let request = match resolve_outgoing_file(request) {
+            Resolved::Send(request) => request,
+            Resolved::Failed(failure) => {
+                let _ = self.action_tx.send(failure).await;
+                return;
+            }
+        };
         let completion = completion_for(&request);
         let kind = request.kind();
         let outcome = self.runtime.request(request).await;
@@ -317,6 +335,66 @@ impl Inner {
     }
 }
 
+/// Finishes a `SendMessageFile` the domain could only build halfway (see the
+/// module docs): expands and existence-checks the path, then replaces core's
+/// placeholder `Document` kind with the one the extension implies. Every
+/// other request passes through untouched.
+///
+/// [`Resolved::Failed`] carries the completion action to send *instead of*
+/// the request: a path that does not resolve never reaches TDLib at all, and
+/// the send comes back as a failed `MessageSent`, the same shape a send TDLib
+/// rejects produces. That matters more than the error's wording — it is the
+/// one completion the composer's spec §14 handling already knows how to
+/// unwind, so nothing is left waiting on a request that was never made.
+///
+/// A path that isn't valid UTF-8 counts as unresolvable: TDLib's JSON
+/// interface takes paths as UTF-8 strings, so such a file could not be sent
+/// even if it exists.
+///
+/// One `stat` runs on the caller's task rather than on the blocking pool.
+/// It is a single metadata lookup at human speed (one confirmed send), which
+/// is well under the cost of the hop it would take to move it.
+fn resolve_outgoing_file(request: TdRequest) -> Resolved {
+    // A `let ... else` would read better, but its pattern moves `request`
+    // and the else branch needs it back to pass through.
+    let (chat_id, path, caption) = match request {
+        TdRequest::SendMessageFile {
+            chat_id,
+            path,
+            kind: _,
+            caption,
+        } => (chat_id, path, caption),
+        other => return Resolved::Send(other),
+    };
+
+    let Some(resolved) = path.to_str().and_then(media_kind::existing_path) else {
+        tracing::warn!(path = %path.display(), "cannot send a file that isn't there");
+        return Resolved::Failed(Action::TdResult(TdResult::MessageSent {
+            chat_id,
+            outcome: Err(TdError::Other {
+                code: 0,
+                message: format!("no such file: {}", path.display()),
+            }),
+        }));
+    };
+
+    Resolved::Send(TdRequest::SendMessageFile {
+        chat_id,
+        kind: media_kind::kind_for(&resolved),
+        path: resolved,
+        caption,
+    })
+}
+
+/// [`resolve_outgoing_file`]'s answer. A plain `Result` would say the same
+/// thing, but both sides are large enough that returning one trips
+/// `clippy::result_large_err`, and neither `Action` nor `TdRequest` may be
+/// boxed — architecture §4.3/§4.7 define both verbatim.
+enum Resolved {
+    Send(TdRequest),
+    Failed(Action),
+}
+
 /// Which `TdResult` a request's response becomes. The mapping is by request
 /// kind alone — the domain context rides in the variant, so there are no
 /// correlation tokens to keep (architecture §8). What the domain cannot
@@ -333,7 +411,11 @@ enum Completion {
         chat_id: ChatId,
         only_local: bool,
     },
-    /// `sendMessage` returned the optimistic message with its temporary id.
+    /// `sendMessage` / `sendMessageFile` returned the optimistic message with
+    /// its temporary id. Both send paths share it: a file send answers with
+    /// the same optimistic `Message`, and everything downstream of it — the
+    /// window append, the composer's spec §14 unwind, the upload the domain
+    /// starts tracking under the returned id — is the same work.
     Sent {
         chat_id: ChatId,
     },
@@ -365,8 +447,6 @@ enum Completion {
     /// Executed for its effect inside TDLib; whatever state it changes comes
     /// back as a push update, so there is no completion action to send.
     FireAndForget,
-    /// Owned by a milestone that has not landed yet.
-    Unwired,
 }
 
 fn completion_for(request: &TdRequest) -> Completion {
@@ -386,13 +466,19 @@ fn completion_for(request: &TdRequest) -> Completion {
             only_local: *only_local,
         },
         // `openChat`/`closeChat` move TDLib's per-chat update subscription;
-        // `viewMessages` marks messages read. All three are answered with a
-        // bare `Ok` and their consequences arrive as updates.
+        // `viewMessages` marks messages read; `cancelDownloadFile` stops a
+        // transfer. All four are answered with a bare `Ok` and their
+        // consequences arrive as updates — a cancelled download's final
+        // `updateFile` (no longer downloading, not complete) is what flips
+        // the card back to its download affordance, not this response.
         TdRequest::OpenChat { .. }
         | TdRequest::CloseChat { .. }
-        | TdRequest::ViewMessages { .. } => Completion::FireAndForget,
+        | TdRequest::ViewMessages { .. }
+        | TdRequest::CancelDownloadFile { .. } => Completion::FireAndForget,
         TdRequest::LogOut => Completion::LogOut,
-        TdRequest::SendMessageText { chat_id, .. } => Completion::Sent { chat_id: *chat_id },
+        TdRequest::SendMessageText { chat_id, .. } | TdRequest::SendMessageFile { chat_id, .. } => {
+            Completion::Sent { chat_id: *chat_id }
+        }
         TdRequest::GetMessageProperties {
             chat_id,
             message_id,
@@ -422,11 +508,6 @@ fn completion_for(request: &TdRequest) -> Completion {
         },
         TdRequest::DownloadFile { file_id, .. } => Completion::Download { file_id: *file_id },
         TdRequest::SearchChatMessages { chat_id, .. } => Completion::Search { chat_id: *chat_id },
-        // Uploads (T39) and download cancellation (T36) are the last two
-        // without a consumer for their completion.
-        TdRequest::SendMessageFile { .. } | TdRequest::CancelDownloadFile { .. } => {
-            Completion::Unwired
-        }
     }
 }
 
@@ -509,7 +590,7 @@ fn map_completion(
             chat_id,
             outcome: outcome.map(found_message_ids),
         }),
-        Completion::FireAndForget | Completion::Unwired => None,
+        Completion::FireAndForget => None,
     }
 }
 
@@ -588,6 +669,7 @@ mod tests {
     use tgt_core::model::ids::{MessageId, UserId};
     use tgt_core::model::message::{MessageCaps, MessageContent, SendState, Sender};
     use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
+    use tgt_core::td::request::OutgoingFileKind;
 
     fn message(chat_id: ChatId, id: i64) -> MessageView {
         MessageView {
@@ -924,18 +1006,19 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
     }
 
+    /// Cancelling a download is fire-and-forget: TDLib answers `Ok` and the
+    /// card only changes once the final `updateFile` says the transfer
+    /// stopped, so there is deliberately no completion action here.
     #[tokio::test]
-    async fn unwired_request_reports_nothing_but_still_reaches_the_runtime() {
+    async fn cancel_download_reaches_tdlib_without_a_completion_action() {
         let fake = fake_runtime("");
         let (dispatcher, mut action_rx, _quit_rx) =
             dispatcher_with(Arc::clone(&fake) as Arc<dyn TdRuntime>, Config::default());
 
-        dispatcher.dispatch(Effect::Td(TdRequest::OpenChat {
-            chat_id: tgt_core::model::ids::ChatId(7),
+        dispatcher.dispatch(Effect::Td(TdRequest::CancelDownloadFile {
+            file_id: FileId(4),
         }));
 
-        // The request is executed; there is simply no completion action for
-        // it until the milestone that consumes one lands.
         tokio::task::yield_now().await;
         for _ in 0..50 {
             if !fake.received().is_empty() {
@@ -945,6 +1028,76 @@ mod tests {
         }
         assert_eq!(fake.received().len(), 1);
         assert!(action_rx.try_recv().is_err());
+    }
+
+    /// The kind core could not derive is derived here, and the request that
+    /// reaches TDLib carries it.
+    #[tokio::test]
+    async fn send_file_reaches_tdlib_with_the_kind_its_extension_implies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clip = dir.path().join("clip.mp4");
+        std::fs::write(&clip, b"not really a video").expect("write temp file");
+
+        let fake = fake_runtime("");
+        let (dispatcher, _action_rx, _quit_rx) =
+            dispatcher_with(Arc::clone(&fake) as Arc<dyn TdRuntime>, Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::SendMessageFile {
+            chat_id: ChatId(9),
+            path: clip.clone(),
+            kind: OutgoingFileKind::Document,
+            caption: None,
+        }));
+
+        for _ in 0..50 {
+            if !fake.received().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let received = fake.received();
+        assert!(
+            matches!(
+                &received[0],
+                TdRequest::SendMessageFile { path, kind, .. }
+                    if path == &clip && *kind == OutgoingFileKind::Video
+            ),
+            "got {:?}",
+            received[0]
+        );
+    }
+
+    /// A path that isn't there is never sent, and the send still completes —
+    /// as a failure, the one shape the composer knows how to unwind (spec
+    /// §14). Dropping it instead would leave the send silently unanswered.
+    #[tokio::test]
+    async fn send_file_with_a_missing_path_fails_without_reaching_tdlib() {
+        let fake = fake_runtime("");
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(Arc::clone(&fake) as Arc<dyn TdRuntime>, Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::SendMessageFile {
+            chat_id: ChatId(9),
+            path: PathBuf::from("/definitely/not/here.jpg"),
+            kind: OutgoingFileKind::Document,
+            caption: None,
+        }));
+
+        let action = action_rx.recv().await.expect("completion action");
+        assert!(
+            matches!(
+                action,
+                Action::TdResult(TdResult::MessageSent {
+                    chat_id: ChatId(9),
+                    outcome: Err(_),
+                })
+            ),
+            "got {action:?}"
+        );
+        assert!(
+            fake.received().is_empty(),
+            "a file that isn't there must not reach TDLib"
+        );
     }
 
     #[tokio::test]

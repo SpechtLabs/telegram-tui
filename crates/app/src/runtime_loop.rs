@@ -170,7 +170,7 @@ impl Core {
                     self.cache.clear();
                 }
                 if let Some(action) = tgt_ui::input::map_event(event) {
-                    self.apply(action);
+                    self.apply(resolve_pasted_path(action));
                 }
             }
             Input::Td(update) => self.apply_td(update),
@@ -202,6 +202,37 @@ impl Core {
         if needs_parameters {
             self.dispatcher.request_tdlib_parameters();
         }
+    }
+}
+
+/// Expands a pasted `~/…` path against `$HOME` when the file it names is
+/// really there, so the send-file offer `state::composer::handle_paste`
+/// raises carries a path TDLib can open. Core cannot do this itself: `$HOME`
+/// and the filesystem are both off-limits to it (architecture §9.3). Any
+/// other action, and any paste that doesn't resolve, passes through
+/// unchanged.
+///
+/// DECISION (plan T40): a paste that *looks* like a path but names nothing
+/// on disk still raises the offer, rather than being rewritten or suppressed
+/// here. Suppressing it would need an action variant meaning "insert this as
+/// plain text, no offer", which does not exist, and inventing one to catch a
+/// rare mis-paste is not worth the widening of the action surface. The
+/// failure it leaves is bounded and already handled: confirming such an
+/// offer never reaches TDLib — `dispatch::resolve_outgoing_file` rejects the
+/// path and completes the send as a failure — so the worst case is one
+/// dismissable modal, not a bad request or lost text.
+fn resolve_pasted_path(action: Action) -> Action {
+    let Action::Paste(text) = &action else {
+        return action;
+    };
+    // Only pay for a `stat` on text that could plausibly be a path; every
+    // ordinary paste (a URL, a paragraph, a code snippet) stops here.
+    if !tgt_core::state::composer::looks_like_path(text) {
+        return action;
+    }
+    match crate::media_kind::existing_path(text.trim()) {
+        Some(path) => Action::Paste(path.to_string_lossy().into_owned()),
+        None => action,
     }
 }
 

@@ -7,10 +7,10 @@
 //! terminal itself; it receives the result of this probe as plain data
 //! (see that module's docs for the boundary rationale).
 //!
-//! Nothing here is reachable from `main` until inline-image rendering is
-//! wired into the draw path (T40), so the module allows dead code rather
-//! than sprinkling `#[allow]` over every item.
-#![allow(dead_code)]
+//! `main` runs the probe once at startup and logs the result. Handing it to
+//! the draw path is what turns it into actual pixels, and that is still
+//! open: see the `T55/polish` note in `tgt_ui::view::conversation`, which
+//! renders every photo as the T37 placeholder card for now.
 
 use std::env;
 

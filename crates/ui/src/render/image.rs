@@ -101,8 +101,10 @@ impl ImageArea {
     /// invalidated whenever the region they were drawn into scrolls out
     /// from under them, or stale pixels can bleed through the next frame
     /// ("ghosting", spec §8.3). This type has no notion of "the viewport
-    /// scrolled" — that is a `view::conversation` concern (wired in T40) —
-    /// so the caller decides when to call this; `ImageArea` only guarantees
+    /// scrolled" — that is a `view::conversation` concern, and that view
+    /// does not own an `ImageArea` yet (see its "File cards" module docs:
+    /// photos still render as placeholder cards) — so the caller decides
+    /// when to call this; `ImageArea` only guarantees
     /// that after the call, the next `render()` re-decodes and re-encodes
     /// from scratch rather than reusing anything.
     ///

@@ -63,6 +63,19 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // put a dialog on screen — happens before raw mode, while stderr is
     // still a usable place for an error report.
     let config = config::load()?;
+
+    // Once per session, before raw mode: the probe only reads environment
+    // variables the terminal set when it started this process, so nothing
+    // later can change its answer. Logged rather than passed anywhere for
+    // now — the draw path still renders every photo as a placeholder card
+    // (see `graphics`'s module docs) — and T49/T51 will export it as
+    // `term.graphics_protocol`.
+    let graphics_protocol = graphics::probe();
+    tracing::info!(
+        protocol = graphics::telemetry_str(graphics_protocol),
+        "terminal graphics protocol probed"
+    );
+
     let td_boot = TdBootParams {
         database_directory: keychain::td_database_dir()?,
         database_encryption_key: keychain::db_key()?.to_vec(),

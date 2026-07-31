@@ -7,9 +7,11 @@
 //! whether a path exists (needs the filesystem) or sniff a file's real type
 //! (needs its bytes). Those three things live here instead, in the one crate
 //! allowed to touch the outside world. `crates/core/src/state/modal.rs`
-//! always sends `OutgoingFileKind::Document` for exactly this reason; T40's
-//! dispatcher wiring is expected to call [`kind_for`] on the confirmed path
-//! before the `SendMessageFile` request reaches TDLib, upgrading the kind.
+//! always sends `OutgoingFileKind::Document` for exactly this reason;
+//! `dispatch.rs`'s `resolve_outgoing_file` calls both functions below on the
+//! confirmed path before the `SendMessageFile` request reaches TDLib —
+//! upgrading the kind, and turning a path that isn't there into a failed
+//! send rather than a request.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -20,9 +22,6 @@ use tgt_core::td::request::OutgoingFileKind;
 /// not on any of the three recognized lists, sends as a plain `Document` —
 /// the fallback TDLib accepts for any file (spec §10's table: jpg→Photo,
 /// mp4→Video, mp3→Audio, pdf→Document, unknown→Document).
-// Not called from `dispatch.rs` yet: wiring `kind_for` in ahead of the
-// `SendMessageFile` request is T40's job (see the module doc comment).
-#[allow(dead_code)]
 pub fn kind_for(path: &Path) -> OutgoingFileKind {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return OutgoingFileKind::Document;
@@ -41,10 +40,6 @@ pub fn kind_for(path: &Path) -> OutgoingFileKind {
 /// exist, or any other `fs` error swallowed by `Path::exists` — collapses to
 /// `None`; callers only need "usable to hand to TDLib" or not, not the
 /// reason it isn't.
-// Not called from `runtime_loop.rs`/`dispatch.rs` yet: pre-checking a
-// pasted/`/send` path before it becomes a `ConfirmSendFile` offer is T40's
-// job (see the module doc comment).
-#[allow(dead_code)]
 pub fn existing_path(s: &str) -> Option<PathBuf> {
     let expanded = match s.strip_prefix("~/") {
         Some(rest) => PathBuf::from(env::var_os("HOME")?).join(rest),

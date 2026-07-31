@@ -7,6 +7,7 @@ use crate::action::{Action, TdResult};
 use crate::effect::{Effect, TelemetryMode};
 use crate::model::ids::ChatId;
 use crate::model::key::{Key, KeyBindings};
+use crate::model::message::{MessageContent, MessageView, SendState};
 use crate::model::time::Millis;
 use crate::state::auth::{self, AuthField, AuthState, InputField, LoginMethod};
 use crate::state::chat_list::{self, ChatListState, ChatLoadPhase};
@@ -191,6 +192,18 @@ impl App {
                 Vec::new()
             }
             Action::Key(key) => self.route_key(key),
+            // Bracketed paste. `handle_paste` decides between inserting the
+            // text and holding it as a send-file offer, and enforces its own
+            // claim rules (composer focused, a chat open) — a paste arriving
+            // anywhere else is a no-op there. Dirty is set either way: a
+            // claimed paste always changes the input buffer or the offer,
+            // and detecting the unclaimed case just to skip one redundant
+            // frame is not worth the bookkeeping.
+            Action::Paste(text) => {
+                composer::handle_paste(&mut self.state, text);
+                self.dirty = true;
+                Vec::new()
+            }
             Action::Td(update) => self.route_td(&update),
             Action::TdResult(TdResult::AuthRequestDone { outcome }) => {
                 // Always render-worthy: at minimum the in-flight spinner
@@ -236,13 +249,15 @@ impl App {
                 self.dirty = true;
                 let mut effects = composer::handle_td_result(&mut self.state, &result);
                 if let TdResult::MessageSent {
-                    outcome: Ok(view), ..
+                    chat_id,
+                    outcome: Ok(view),
                 } = &result
                 {
                     effects.extend(conversation::handle_td(
                         &mut self.state,
                         &TdUpdate::NewMessage(view.clone()),
                     ));
+                    start_tracking_upload(&mut self.state, *chat_id, view);
                 }
                 effects
             }
@@ -266,9 +281,9 @@ impl App {
                 self.dirty = true;
                 media::handle_td_result(&mut self.state, file_id, &outcome)
             }
-            // Paste and the remaining completions land with the tasks that
-            // own their state. T32 wired the dispatcher end of all of them,
-            // so `EditDone`/`DeleteDone`/`ForwardDone`/`ReactionDone` and the
+            // The remaining completions land with the tasks that own their
+            // state. T32 wired the dispatcher end of all of them, so
+            // `EditDone`/`DeleteDone`/`ForwardDone`/`ReactionDone` and the
             // `Io` results genuinely arrive here now — they are no-ops
             // because what the user sees of them is the push update that
             // follows (`MessageContentChanged`, `MessagesDeleted`, ...); it
@@ -670,17 +685,28 @@ impl App {
             TdUpdate::NewMessage(_)
             | TdUpdate::MessagesDeleted { .. }
             | TdUpdate::MessageContentChanged { .. }
-            | TdUpdate::MessageSendSucceeded { .. }
             | TdUpdate::ChatReadOutbox { .. } => {
                 self.dirty = true;
+                conversation::handle_td(&mut self.state, update)
+            }
+            // The send TDLib accepted has now actually gone out. The window
+            // swaps the temporary id for the real one; an upload tracked
+            // under that temporary id is over, whatever it was showing
+            // (see `start_tracking_upload`).
+            TdUpdate::MessageSendSucceeded { old_message_id, .. } => {
+                self.dirty = true;
+                media::complete_upload(&mut self.state, *old_message_id);
                 conversation::handle_td(&mut self.state, update)
             }
             // A send that failed asynchronously, after its RPC already
             // returned `Ok`: the window marks the message failed, the
             // composer takes the held text back (spec §14). Both halves are
             // idempotent about it — see `composer::handle_td`'s dedupe note.
-            TdUpdate::MessageSendFailed { .. } => {
+            // A failed upload stops being in flight just as surely as a
+            // successful one, so its progress entry goes too.
+            TdUpdate::MessageSendFailed { old_message_id, .. } => {
                 self.dirty = true;
+                media::complete_upload(&mut self.state, *old_message_id);
                 let mut effects = conversation::handle_td(&mut self.state, update);
                 effects.extend(composer::handle_td(&mut self.state, update));
                 effects
@@ -745,6 +771,49 @@ impl App {
 
     pub fn state(&self) -> &AppState {
         &self.state
+    }
+}
+
+/// Starts tracking the upload behind an accepted file send, keyed by the
+/// temporary message id `sendMessageFile` just minted (architecture §4.6,
+/// `state/media.rs`'s "Upload tracking"). The entry lives until the send
+/// succeeds or fails — both arms of `route_td` drop it — and is what the
+/// conversation view renders as `↑ name · …` in place of the file card.
+///
+/// Only an accepted send that is still in flight starts one: a message that
+/// came back already `Sent` (TDLib had the file cached) has no upload left
+/// to watch.
+///
+/// KNOWN GAP: the tracked byte count never advances. TDLib reports upload
+/// progress as an ordinary `updateFile` keyed by the *file* id it assigned,
+/// and `UploadProgress` records no file id to match it against — so nothing
+/// can correlate a push back to this message. The bar therefore sits at its
+/// initial value for the life of the upload (indeterminate `…` for a photo,
+/// `0%` for anything that declares a size). Closing it means adding a
+/// `file_id` to `UploadProgress` and matching `media::handle_td`'s
+/// `updateFile` arm against it, both in `state/media.rs`.
+fn start_tracking_upload(state: &mut AppState, chat_id: ChatId, view: &MessageView) {
+    if !matches!(view.send_state, SendState::Sending) {
+        return;
+    }
+    if let Some(total) = upload_total(&view.content) {
+        media::start_upload(state, view.id, chat_id, total);
+    }
+}
+
+/// The declared byte size of a message's file, `None` for content that has
+/// no file to upload at all. A `Photo` carries no size in the model, so it
+/// tracks with a zero total — which the file card renders as the
+/// indeterminate bar rather than as a percentage it would have to invent.
+fn upload_total(content: &MessageContent) -> Option<u64> {
+    match content {
+        MessageContent::Photo { .. } => Some(0),
+        MessageContent::Video { size, .. }
+        | MessageContent::Audio { size, .. }
+        | MessageContent::Document { size, .. } => Some(*size),
+        MessageContent::Text(_)
+        | MessageContent::Sticker { .. }
+        | MessageContent::Unsupported { .. } => None,
     }
 }
 
@@ -1286,6 +1355,7 @@ mod tests {
 mod routing {
     use super::tests::{chat, logged_in, message};
     use super::*;
+    use crate::model::entity::FormattedText;
     use crate::model::ids::MessageId;
     use crate::model::message::MessageCaps;
     use crate::state::conversation::Scroll;
@@ -1614,6 +1684,103 @@ mod routing {
         assert_eq!(app.state().composer.pending_send.as_deref(), Some("hi"));
         assert!(app.state().composer.reply_to.is_none());
         assert_eq!(app.state().composer.input.text, "");
+    }
+
+    /// `Action::Paste` reaches `composer::handle_paste`, which decides
+    /// between an ordinary insert and a send-file offer. (Whether the path
+    /// exists is the app layer's question, not this one's — see
+    /// `composer::looks_like_path`.)
+    #[test]
+    fn paste_routes_to_the_composer() {
+        let mut app = chat_open();
+
+        app.update(Action::Paste("just some words".to_string()));
+        assert_eq!(app.state().composer.input.text, "just some words");
+        assert!(app.state().composer.pending_path_offer.is_none());
+
+        app.update(Action::Paste("/tmp/dropped.png".to_string()));
+        assert_eq!(
+            app.state().composer.pending_path_offer,
+            Some(std::path::PathBuf::from("/tmp/dropped.png")),
+        );
+        assert_eq!(
+            app.state().composer.input.text,
+            "just some words",
+            "an offered path is held, not typed into the buffer"
+        );
+    }
+
+    /// An accepted file send is tracked as an upload under the temporary id
+    /// TDLib minted for it, and stops being tracked the moment the send
+    /// resolves — either way, since a failed upload is no more in flight
+    /// than a finished one.
+    #[test]
+    fn file_send_tracks_an_upload_until_it_resolves() {
+        for resolution in ["succeeded", "failed"] {
+            let mut app = chat_open();
+            let mut optimistic = message(1, 500);
+            optimistic.is_outgoing = true;
+            optimistic.send_state = SendState::Sending;
+            optimistic.content = MessageContent::Document {
+                file_id: crate::model::ids::FileId(3),
+                file_name: "report.pdf".to_string(),
+                size: 4_000,
+                caption: FormattedText {
+                    text: String::new(),
+                    entities: Vec::new(),
+                },
+            };
+
+            app.update(Action::TdResult(TdResult::MessageSent {
+                chat_id: CHAT,
+                outcome: Ok(optimistic.clone()),
+            }));
+
+            let tracked = app.state().media.uploads[&MessageId(500)];
+            assert_eq!(tracked.chat_id, CHAT);
+            assert_eq!(tracked.total, 4_000);
+            assert_eq!(tracked.uploaded, 0);
+
+            let resolved = if resolution == "succeeded" {
+                let mut sent = optimistic.clone();
+                sent.id = MessageId(501);
+                sent.send_state = SendState::Sent;
+                TdUpdate::MessageSendSucceeded {
+                    chat_id: CHAT,
+                    old_message_id: MessageId(500),
+                    message: sent,
+                }
+            } else {
+                TdUpdate::MessageSendFailed {
+                    chat_id: CHAT,
+                    old_message_id: MessageId(500),
+                    error: crate::td::error::TdError::NetTimeout,
+                }
+            };
+            app.update(Action::Td(resolved));
+
+            assert!(
+                app.state().media.uploads.is_empty(),
+                "a {resolution} send has nothing left to upload: {:?}",
+                app.state().media.uploads
+            );
+        }
+    }
+
+    /// A text send starts no upload: there is no file behind it to watch.
+    #[test]
+    fn text_send_tracks_no_upload() {
+        let mut app = chat_open();
+        let mut optimistic = message(1, 500);
+        optimistic.is_outgoing = true;
+        optimistic.send_state = SendState::Sending;
+
+        app.update(Action::TdResult(TdResult::MessageSent {
+            chat_id: CHAT,
+            outcome: Ok(optimistic),
+        }));
+
+        assert!(app.state().media.uploads.is_empty());
     }
 
     #[test]

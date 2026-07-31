@@ -51,6 +51,32 @@
 //!    the real content still sits at the bottom of the pane instead of the
 //!    top.
 //!
+//! ## File cards: two lines, on purpose
+//!
+//! A file-bearing message renders two rows, not one (T40's v1 look):
+//!
+//! ```text
+//! 📎 spec.pdf · 2.4 MB          ← cached identity line (message_layout::file_card)
+//! 📎 spec.pdf · ⏎ download      ← per-frame status line (file_card_line)
+//! ```
+//!
+//! The cached line can never carry the affordance or a progress bar:
+//! `LayoutKey` is `(message_id, width, theme_generation, spoilers_revealed)`
+//! and download progress changes none of them, so anything live baked into
+//! it would freeze at whatever it read the first time that message was laid
+//! out (`render::message_layout`'s "File cards: the static/dynamic split").
+//! Suppressing the cached line instead would mean re-laying-out the whole
+//! message every frame — the one thing the cache exists to avoid. So the
+//! live line is appended below it, like reactions and receipts, and the
+//! name is repeated. A single-line card needs the cache key to grow a
+//! "has a live suffix" notion; that is `cache.rs`'s to add, not this file's.
+//!
+//! Inline images (T38's `render::image::ImageArea`) are not wired here:
+//! `ImageArea` is per-message mutable state that has to outlive a frame, and
+//! this view owns nothing that lives that long — only the `LayoutCache` it
+//! is handed does. Photos therefore render as placeholder cards, which spec
+//! §8.3 requires to always work anyway. See the `T55/polish` marker below.
+//!
 //! ## Deferred seams
 //!
 //! Selection highlighting (T26) and in-chat search-hit highlighting (T47)
@@ -67,13 +93,16 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
-use tgt_core::model::ids::MessageId;
-use tgt_core::model::message::{MessageView, ReactionView, SendState};
+use tgt_core::model::ids::{FileId, MessageId};
+use tgt_core::model::message::{MessageContent, MessageView, ReactionView, SendState};
 use tgt_core::state::conversation::{ConversationState, Scroll};
+use tgt_core::state::media::MediaState;
 use unicode_width::UnicodeWidthStr;
 
 use crate::render::cache::{LayoutCache, LayoutKey};
-use crate::render::message_layout::{LayoutOptions, groups_with, layout_message_opts};
+use crate::render::message_layout::{
+    LayoutOptions, file_card_line, file_card_upload_line, groups_with, layout_message_opts,
+};
 use crate::theme::Theme;
 
 /// Renders the open chat's message window into `area`, border included (the
@@ -96,6 +125,7 @@ pub fn draw(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, cache: &
 
     let rows = build_window(
         convo,
+        &state.media,
         state.theme_generation,
         inner.width,
         inner.height,
@@ -130,6 +160,7 @@ pub fn visible_range(
     let theme = fallback_theme();
     let rows = build_window(
         convo,
+        &state.media,
         state.theme_generation,
         inner.width,
         inner.height,
@@ -185,8 +216,10 @@ struct WindowRow {
 /// `height` rows (padded with blanks at the front if the loaded window is
 /// shorter than the pane) unless `width`, `height`, or the window itself is
 /// empty, in which case it returns nothing.
+#[allow(clippy::too_many_arguments)]
 fn build_window(
     convo: &ConversationState,
+    media: &MediaState,
     theme_generation: u64,
     width: u16,
     height: u16,
@@ -231,6 +264,10 @@ fn build_window(
         // leave stale reaction counts and checkmarks on screen. See the
         // module docs' "Grouped-cache resolution" for the same reasoning
         // applied to grouping.
+        // T55/polish: wire `render::image::ImageArea` here for a downloaded
+        // photo when the terminal has a graphics protocol (see the module
+        // docs for why it can't live in this frame-local walk today).
+        append_file_card(&mut msg_lines, msg, media, width, theme);
         append_reactions(&mut msg_lines, msg, width, theme);
         if msg.is_outgoing {
             append_receipt(&mut msg_lines, msg, convo.last_read_outbox, width, theme);
@@ -377,19 +414,67 @@ fn append_reactions(lines: &mut Vec<Line<'static>>, msg: &MessageView, width: u1
     if msg.reactions.is_empty() {
         return;
     }
-    let content = reaction_spans(&msg.reactions, theme);
-    let content_width = Line::from(content.clone()).width() as u16;
+    lines.push(aligned_row(
+        reaction_spans(&msg.reactions, theme),
+        msg.is_outgoing,
+        width,
+    ));
+}
 
+/// A per-frame row under a message's cached block, aligned to the message's
+/// own side: flush right for own messages (like the rail), indented two
+/// columns for incoming ones (matching the rail-plus-space inset the cached
+/// body lines carry).
+fn aligned_row(content: Vec<Span<'static>>, is_outgoing: bool, width: u16) -> Line<'static> {
     let mut spans = Vec::with_capacity(content.len() + 1);
-    if msg.is_outgoing {
-        let pad = width.saturating_sub(content_width);
-        spans.push(Span::raw(" ".repeat(pad as usize)));
-        spans.extend(content);
+    if is_outgoing {
+        let used = Line::from(content.clone()).width() as u16;
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used) as usize)));
     } else {
         spans.push(Span::raw("  "));
-        spans.extend(content);
     }
-    lines.push(Line::from(spans));
+    spans.extend(content);
+    Line::from(spans)
+}
+
+/// Pushes the live status row for a file-bearing message — the per-frame half
+/// of the two-line card described in the module docs. A message with no file
+/// costs nothing here.
+///
+/// An outgoing message with an upload still tracked under its id shows the
+/// upload bar instead of the download affordance: until the send completes
+/// there is no downloadable file on the other end to offer.
+fn append_file_card(
+    lines: &mut Vec<Line<'static>>,
+    msg: &MessageView,
+    media: &MediaState,
+    width: u16,
+    theme: &Theme,
+) {
+    let line = match media.uploads.get(&msg.id) {
+        Some(progress) => file_card_upload_line(&msg.content, progress, theme),
+        None => {
+            let file = file_id_of(&msg.content).and_then(|id| media.files.get(&id));
+            file_card_line(&msg.content, file, theme)
+        }
+    };
+    if let Some(line) = line {
+        lines.push(aligned_row(line.spans, msg.is_outgoing, width));
+    }
+}
+
+/// The file a message's content carries, if any (mirrors the private helpers
+/// of the same shape in `state/selection.rs` and `state/media.rs`).
+fn file_id_of(content: &MessageContent) -> Option<FileId> {
+    match content {
+        MessageContent::Photo { file_id, .. }
+        | MessageContent::Video { file_id, .. }
+        | MessageContent::Audio { file_id, .. }
+        | MessageContent::Document { file_id, .. } => Some(*file_id),
+        MessageContent::Text(_)
+        | MessageContent::Sticker { .. }
+        | MessageContent::Unsupported { .. } => None,
+    }
 }
 
 fn reaction_spans(reactions: &[ReactionView], theme: &Theme) -> Vec<Span<'static>> {
@@ -494,7 +579,7 @@ mod tests {
     use tgt_core::model::ids::{ChatId, FileId, MessageId, UserId};
     use tgt_core::model::key::KeyBindings;
     use tgt_core::model::message::{
-        MessageCaps, MessageContent, ReactionView, ReplyPreview, SendState, Sender,
+        FileSnapshot, MessageCaps, MessageContent, ReactionView, ReplyPreview, SendState, Sender,
     };
     use tgt_core::model::time::Millis;
     use tgt_core::state::auth::{AuthField, AuthState, InputField};
@@ -746,6 +831,110 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    // --- file cards (T40) -------------------------------------------------
+
+    /// The two-line card the module docs describe: the cached identity line,
+    /// then a live status line that redraws from `MediaState` every frame.
+    #[test]
+    fn file_card_status_line_follows_the_cached_identity_line() {
+        let convo = conversation(
+            vec![doc_msg(
+                1,
+                Sender::User(UserId(2)),
+                "Bob",
+                0,
+                "spec.pdf",
+                2_400,
+            )],
+            Scroll::Bottom,
+        );
+        let mut state = fixture_state(Some(convo));
+
+        let rendered = render_to_string(80, 12, &state);
+        assert!(
+            rendered.contains("spec.pdf · 2.3 KB"),
+            "the cached identity line is missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("⏎ download"),
+            "an untouched file offers to download:\n{rendered}"
+        );
+
+        // Halfway through: the same message, a different `MediaState`. The
+        // cache cannot invalidate on this (nothing in `LayoutKey` changed),
+        // which is exactly why the line is rebuilt per frame.
+        state.media.files.insert(
+            FileId(1),
+            FileSnapshot {
+                id: FileId(1),
+                expected_size: 2_400,
+                downloaded_size: 1_200,
+                is_downloading: true,
+                is_completed: false,
+                local_path: None,
+            },
+        );
+        let rendered = render_to_string(80, 12, &state);
+        assert!(
+            rendered.contains("50%"),
+            "a running download shows its progress:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("⏎ download"),
+            "a running download is not offered again:\n{rendered}"
+        );
+
+        state.media.files.insert(
+            FileId(1),
+            FileSnapshot {
+                id: FileId(1),
+                expected_size: 2_400,
+                downloaded_size: 2_400,
+                is_downloading: false,
+                is_completed: true,
+                local_path: Some(std::path::PathBuf::from("/tmp/spec.pdf")),
+            },
+        );
+        let rendered = render_to_string(80, 12, &state);
+        assert!(
+            rendered.contains("⏎ open"),
+            "a downloaded file offers to open:\n{rendered}"
+        );
+    }
+
+    /// An outgoing message with an upload still in flight shows the upload
+    /// bar instead of a download affordance — there is nothing to fetch back
+    /// from a file that hasn't finished going out.
+    #[test]
+    fn tracked_upload_replaces_the_download_affordance() {
+        let mut msg = doc_msg(1, Sender::User(UserId(3)), "You", 0, "report.pdf", 4_000);
+        msg.is_outgoing = true;
+        msg.send_state = SendState::Sending;
+        let mut state = fixture_state(Some(conversation(vec![msg], Scroll::Bottom)));
+        state.media.uploads.insert(
+            MessageId(1),
+            tgt_core::state::media::UploadProgress {
+                chat_id: CHAT,
+                uploaded: 1_000,
+                total: 4_000,
+            },
+        );
+
+        let rendered = render_to_string(80, 12, &state);
+        assert!(
+            rendered.contains("↑ report.pdf"),
+            "the upload card is missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("25%"),
+            "the upload's progress is missing:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("⏎ download"),
+            "an in-flight upload offers no download:\n{rendered}"
+        );
+    }
+
     // --- bottom-up fill (unit) --------------------------------------------
 
     #[test]
@@ -763,7 +952,15 @@ mod tests {
         let convo = conversation(vec![msg], Scroll::Bottom);
         let mut cache = LayoutCache::new();
 
-        let rows = build_window(&convo, 0, 20, 5, &theme(), &mut cache);
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            20,
+            5,
+            &theme(),
+            &mut cache,
+        );
 
         assert_eq!(rows.len(), 5);
         assert!(rows.iter().all(|r| r.message_id == Some(MessageId(1))));
@@ -785,7 +982,15 @@ mod tests {
         let convo = conversation(vec![msg], Scroll::Bottom);
         let mut cache = LayoutCache::new();
 
-        let rows = build_window(&convo, 0, 40, 10, &theme(), &mut cache);
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            40,
+            10,
+            &theme(),
+            &mut cache,
+        );
 
         assert_eq!(rows.len(), 10);
         assert!(
@@ -807,7 +1012,15 @@ mod tests {
         let convo = conversation(messages, Scroll::Bottom);
         let mut cache = LayoutCache::new();
 
-        let rows = build_window(&convo, 0, 40, 40, &theme(), &mut cache);
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            40,
+            40,
+            &theme(),
+            &mut cache,
+        );
         let rendered: Vec<String> = rows
             .iter()
             .map(|r| {
@@ -853,8 +1066,24 @@ mod tests {
         );
         let mut cache = LayoutCache::new();
 
-        let full = build_window(&convo_no_offset, 0, 40, 10, &theme(), &mut cache);
-        let trimmed = build_window(&convo_offset, 0, 40, 10, &theme(), &mut cache);
+        let full = build_window(
+            &convo_no_offset,
+            &MediaState::default(),
+            0,
+            40,
+            10,
+            &theme(),
+            &mut cache,
+        );
+        let trimmed = build_window(
+            &convo_offset,
+            &MediaState::default(),
+            0,
+            40,
+            10,
+            &theme(),
+            &mut cache,
+        );
 
         let full_count = full.iter().filter(|r| r.message_id.is_some()).count();
         let trimmed_count = trimmed.iter().filter(|r| r.message_id.is_some()).count();
@@ -905,7 +1134,15 @@ mod tests {
         let convo = conversation(vec![msg], Scroll::Bottom);
         let mut cache = LayoutCache::new();
 
-        let rows = build_window(&convo, 0, 40, 10, &theme(), &mut cache);
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            40,
+            10,
+            &theme(),
+            &mut cache,
+        );
         let reaction_row = rows
             .iter()
             .find(|r| r.line.spans.iter().any(|s| s.content.contains('👍')))
@@ -943,7 +1180,15 @@ mod tests {
         convo.last_read_outbox = MessageId(1);
         let mut cache = LayoutCache::new();
 
-        let rows = build_window(&convo, 0, 40, 10, &theme(), &mut cache);
+        let rows = build_window(
+            &convo,
+            &MediaState::default(),
+            0,
+            40,
+            10,
+            &theme(),
+            &mut cache,
+        );
         let texts: Vec<String> = rows
             .iter()
             .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())

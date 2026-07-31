@@ -136,15 +136,10 @@
 //!   call once per frame, the same way `append_reactions` re-derives its row
 //!   every frame instead of trusting the cache.
 //!
-//! `// T40 wires view-side call`: nothing in this crate calls
-//! [`file_card_line`] / [`file_card_upload_line`] yet. Until the
-//! conversation view (owned elsewhere) is wired to call them per frame and
-//! splice the result in place of (or over) the cached static card row, the
-//! on-screen file card keeps showing the static icon/name/size line the
-//! cache has always produced — no worse than before T37, just not yet
-//! carrying a live affordance or progress bar. Baking either of those into
-//! the cache instead would be worse: a permanently stale progress bar. Wiring
-//! the view call is T40's job, not this file's.
+//! `view::conversation` calls them (T40), appending the live line under the
+//! cached identity line rather than replacing it — so a file message renders
+//! as two rows. That module's "File cards: two lines, on purpose" records
+//! why, and what it would take to collapse them into one.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
