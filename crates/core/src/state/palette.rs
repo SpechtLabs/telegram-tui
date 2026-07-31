@@ -71,6 +71,7 @@ use crate::model::key::Key;
 use crate::state::auth::InputField;
 use crate::state::chat_list::ChatListState;
 use crate::state::conversation;
+use crate::state::history::PagingState;
 use crate::td::request::TdRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,15 +201,26 @@ fn invoke_selected(app: &mut AppState) -> Vec<Effect> {
 /// exists, sets `open_chat`), and the caller issues `OpenChat` plus the
 /// first `GetChatHistory` page — the same two effects `chat_list::handle_key`
 /// emits on Enter.
+///
+/// T59 (local-first history): also mirrors `chat_list::open_selected`'s
+/// `only_local: true` request and its `paging` bookkeeping — see that
+/// function's doc comment for why `paging` is set unconditionally rather
+/// than only on first insert.
 fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
     conversation::open(app, chat_id);
+    if let Some(convo) = app.conversations.get_mut(&chat_id) {
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: true,
+        };
+    }
     vec![
         Effect::Td(TdRequest::OpenChat { chat_id }),
         Effect::Td(TdRequest::GetChatHistory {
             chat_id,
             from_message_id: MessageId(0),
             limit: 50,
-            only_local: false,
+            only_local: true,
         }),
     ]
 }
@@ -570,11 +582,41 @@ mod tests {
                 chat_id: ChatId(1),
                 from_message_id: MessageId(0),
                 limit: 50,
-                only_local: false,
+                only_local: true,
             })
         ));
         // Enter closes the palette itself; the focus pop is the router's.
         assert!(app.palette.is_none());
+    }
+
+    /// T59: same local-first contract as `chat_list::open_selected` — see
+    /// that function's `open_chat_requests_local_first` test.
+    #[test]
+    fn open_chat_requests_local_first() {
+        let mut app = fixture_state();
+        insert_chat(&mut app, 1, "Alice", 10);
+        open(&mut app);
+
+        let effects = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Td(TdRequest::GetChatHistory {
+                    chat_id: ChatId(1),
+                    from_message_id: MessageId(0),
+                    limit: 50,
+                    only_local: true,
+                })
+            )),
+            "expected a local-first GetChatHistory request: {effects:?}"
+        );
+        assert_eq!(
+            app.conversations[&ChatId(1)].paging,
+            PagingState::Loading {
+                attempt: 1,
+                only_local: true,
+            }
+        );
     }
 
     #[test]
