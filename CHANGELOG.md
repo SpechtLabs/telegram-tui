@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.1...v0.1.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* **ci:** guarantee rustfmt and clippy regardless of the mise cache ([b168bed](https://github.com/SpechtLabs/telegram-tui/commit/b168bed0cc13a65b77328bab8598481836d45c3e))
+* **ci:** install rustfmt and clippy with the mise rust toolchain ([f1b1291](https://github.com/SpechtLabs/telegram-tui/commit/f1b1291876afac7a1a9f75204f7ef74c224614d0))
+* **ci:** stop the release-please annotation leaking into the tarball name ([9651bd0](https://github.com/SpechtLabs/telegram-tui/commit/9651bd024933818a8f821c7a86b33f0aaac2ad22))
+
 ## [0.1.1](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.0...v0.1.1) (2026-07-31)
 
 
