@@ -675,6 +675,51 @@ never inspects the outcome. That optimistic advance is safe *only because* a
 failed write ends the process. Turning this into a toast re-arms a session-long
 stall in `WaitTdlibParameters` two files away — fix the wizard first.
 
+### 4.4.2 Replacing a closed TDLib client
+
+`authorizationStateClosed` is terminal for a TDLib client instance: nothing
+more can be done with it and only a new client can get back to a usable
+state. It is reached by `logOut` — which is the *only* legal way to abandon a
+QR login, since TDLib refuses `setAuthenticationPhoneNumber` once a QR link
+has been issued — and also whenever TDLib tears a client down on an
+unrecoverable local error. `runtime_loop::Core::restart_client` handles both,
+because it triggers on the phase rather than on "we asked to log out".
+
+Two constraints shape it.
+
+**The receive thread must be joined, not merely stopped.** `tdlib_rs::receive()`
+reads the one global `td_receive` queue shared by every client in the process,
+and our receive loop discards updates whose `@client_id` is not its own — there
+is no way to put one back. Two threads therefore race for one queue and eat
+each other's updates. `Drop` only asks the thread to stop and returns, leaving
+it alive for up to one 2 s `receive()` timeout, which is exactly when the
+replacement is being created; the dying thread can swallow the new client's
+`WaitTdlibParameters`. So `TdlibRuntime::shutdown` joins, and the restart
+awaits it before creating anything. Responses are unaffected: `@extra`
+correlation goes through tdlib-rs's global `OBSERVER`, keyed by a counter
+rather than by client.
+
+**In-flight requests are abandoned deliberately.** `Dispatcher` carries a
+generation counter, bumped by `replace_runtime`. Each spawned request captures
+the generation it was issued under, and `Inner::deliver` drops the completion
+if the generation has moved, with a debug line — a completion naming a chat
+that no longer exists is the swallowed-completions bug in reverse, and a
+silent drop would be the same bug again.
+
+The restart drives the new client back through `WaitTdlibParameters`, which
+arrives as an ordinary `TdUpdate`, so the dispatcher's existing
+`send_tdlib_parameters` issues the request carrying the Keychain key. There is
+no second copy of that path; `replace_runtime` only clears `params_pending` so
+the deferred-issue path behaves as on a cold boot.
+
+**It fires only pre-authorization, on purpose.** See `restart_client`'s doc
+comment: chats load from exactly one place (`state::auth`'s `Ready` arm), so a
+client that never authorized left no account-scoped state behind and replacing
+it is complete on its own. A signed-in client that closes needs `AppState`
+cleared first, which needs a core action that does not exist yet (task #64).
+Restarting without it would render a signed-out user's chat list against a
+fresh unauthenticated client.
+
 ### 4.5 Focus — `core/src/state/focus.rs`
 
 ```rust

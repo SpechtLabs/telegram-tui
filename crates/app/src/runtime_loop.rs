@@ -77,6 +77,21 @@ enum Input {
     DrawDue,
 }
 
+/// Builds a replacement TDLib client after the previous one closed.
+///
+/// A factory rather than a spare instance because creating the real one
+/// starts an OS thread and talks to TDLib, and because `updates()` may only
+/// be called once per instance — so a restart genuinely needs a *new* one,
+/// not a second handle on the old.
+///
+/// Opt-in via [`Core::with_restart`]: `Core::new` is unchanged, so no test
+/// that does not care about restarting has to say anything about it.
+pub type RuntimeFactory = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Arc<dyn TdRuntime>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The main loop minus the terminal. See the module docs.
 pub struct Core {
     app: App,
@@ -108,6 +123,14 @@ pub struct Core {
     /// is up, so a click that arrives before or under either resolves to
     /// nothing rather than to a stale frame's geometry.
     last_hits: HitMap,
+    /// Builds a replacement TDLib client. `None` — the default, and what
+    /// every test that is not about restarting gets — means a client that
+    /// reaches `Closed` stays closed, exactly as before this existed.
+    restart: Option<RuntimeFactory>,
+    /// Whether the *current* client has ever reached `AuthPhase::Ready`.
+    /// Reset with every replacement. See [`Core::apply_td`] for what it
+    /// gates and why the gate is deliberately narrow.
+    authorized: bool,
     /// Whether the terminal's cell size needs (re)measuring before the next
     /// frame. Starts true, so the first frame is drawn against a measured
     /// size rather than `CellSize::FALLBACK`.
@@ -121,6 +144,16 @@ pub struct Core {
 }
 
 impl Core {
+    /// Enables client restarts, using `factory` to build the replacement.
+    ///
+    /// Without this a closed client stays closed, which is what every
+    /// pre-existing caller wants and what they all still get by saying
+    /// nothing.
+    pub fn with_restart(mut self, factory: RuntimeFactory) -> Self {
+        self.restart = Some(factory);
+        self
+    }
+
     /// Takes the runtime's update receiver (once — the trait panics on a
     /// second call) and wires the dispatcher to the action channel.
     pub fn new(
@@ -147,6 +180,8 @@ impl Core {
             quit_rx,
             fatal_rx,
             fatal: None,
+            restart: None,
+            authorized: false,
             tick,
             clock_start: Instant::now(),
             effects: Vec::new(),
@@ -259,7 +294,7 @@ impl Core {
                     self.apply(resolve_pasted_path(action));
                 }
             }
-            Input::Td(update) => self.apply_td(update),
+            Input::Td(update) => self.apply_td(update).await,
             // Nothing to apply: the loop draws on the way back around.
             Input::DrawDue => {}
             Input::Tick(now) => self.apply(Action::Tick { now }),
@@ -284,12 +319,75 @@ impl Core {
     /// dispatcher issues the request (architecture §5.1, and `dispatch.rs`'s
     /// module docs). This is the only place the loop looks inside an update
     /// rather than just forwarding it.
-    fn apply_td(&mut self, update: TdUpdate) {
+    async fn apply_td(&mut self, update: TdUpdate) {
         let needs_parameters = matches!(update, TdUpdate::Auth(AuthPhase::WaitTdlibParameters));
+        if matches!(update, TdUpdate::Auth(AuthPhase::Ready)) {
+            self.authorized = true;
+        }
+        let closed = matches!(update, TdUpdate::Auth(AuthPhase::Closed));
         self.apply(Action::Td(update));
         if needs_parameters {
             self.dispatcher.request_tdlib_parameters();
         }
+        if closed {
+            self.restart_client().await;
+        }
+    }
+
+    /// Replaces a TDLib client that has reached `authorizationStateClosed`,
+    /// which is terminal for that instance — only a new client can get back
+    /// to a usable state.
+    ///
+    /// # Why this declines to fire in the case it most obviously applies to
+    ///
+    /// It restarts **only when the closed client never reached
+    /// `AuthPhase::Ready`**, and that narrowness is deliberate. Chats are
+    /// loaded from exactly one place, `state::auth`'s `Ready` arm, so a
+    /// client that never authorized cannot have left any account-scoped
+    /// state behind: no chats, no conversations, no cached media. Replacing
+    /// it is therefore complete on its own.
+    ///
+    /// A signed-in client that closes — `/logout`, or TDLib tearing itself
+    /// down on a local error — is a different problem. `AppState` still
+    /// holds the previous session's chats, and `tgt-app` cannot clear them
+    /// because `update()` is pure and clearing needs a core action that does
+    /// not exist yet. Restarting anyway would leave the app rendering a
+    /// signed-out user's chat list against a fresh unauthenticated client:
+    /// alive-looking, and showing exactly the content they asked to be rid
+    /// of. Today's behaviour — it visibly stops — is worse in the abstract
+    /// and better in practice, because it is honest.
+    ///
+    /// So this is half a fix on purpose. Task #64 adds the account-state
+    /// reset; widening the condition belongs in that change and not before
+    /// it. If you are here because a restart "obviously should have fired",
+    /// that is the reason, and removing the `authorized` check without the
+    /// reset reintroduces the bug this comment exists to prevent.
+    async fn restart_client(&mut self) {
+        let Some(factory) = self.restart.clone() else {
+            return;
+        };
+        if self.authorized {
+            tracing::warn!(
+                "the tdlib client closed after authorizing; not restarting, because \
+                 account state would survive into the new session (task #64)"
+            );
+            return;
+        }
+
+        // Joined, not merely asked to stop: the receive thread reads a
+        // process-global queue and discards updates belonging to other
+        // clients, so one still running would eat the replacement's
+        // `WaitTdlibParameters`. See `td_runtime::TdlibRuntime::shutdown`.
+        self.dispatcher.runtime().shutdown().await;
+
+        let runtime = factory().await;
+        // Taken before the swap: `updates()` panics on a second call, so if
+        // it is going to fail it should fail before the dispatcher has been
+        // pointed at a runtime whose updates nobody is reading.
+        self.td_updates = runtime.updates();
+        self.dispatcher.replace_runtime(runtime);
+        self.authorized = false;
+        tracing::info!("tdlib client restarted after close");
     }
 }
 
@@ -420,6 +518,7 @@ pub async fn run(
     config: Arc<Mutex<Config>>,
     td_boot: TdBootParams,
     presentation: Presentation,
+    restart: Option<RuntimeFactory>,
 ) -> eyre::Result<()> {
     let Presentation {
         theme,
@@ -429,6 +528,9 @@ pub async fn run(
     } = presentation;
     let (term_events, event_reader_running) = spawn_terminal_event_reader();
     let mut core = Core::new(app, runtime, config, td_boot, term_events, graphics);
+    if let Some(factory) = restart {
+        core = core.with_restart(factory);
+    }
     let mut live_theme = LiveTheme {
         generation: core.app().state().theme_generation,
         theme,

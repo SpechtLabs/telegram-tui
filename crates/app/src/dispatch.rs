@@ -60,7 +60,7 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, watch};
@@ -138,7 +138,15 @@ pub struct Dispatcher {
 
 struct Inner {
     action_tx: mpsc::Sender<Action>,
-    runtime: Arc<dyn TdRuntime>,
+    /// Swappable, because a TDLib client that reaches
+    /// `authorizationStateClosed` is dead and only a *new* client can get
+    /// back to a usable state — see [`Dispatcher::replace_runtime`].
+    /// Cloned out under the lock and never held across an await.
+    runtime: Mutex<Arc<dyn TdRuntime>>,
+    /// Bumped by every [`Dispatcher::replace_runtime`]. A request spawned
+    /// against one client must not deliver its completion into a session
+    /// running on the next one: the chat it names may not exist any more.
+    generation: AtomicU64,
     config: Arc<Mutex<Config>>,
     td_boot: TdBootParams,
     /// TDLib asked for its parameters before credentials existed. Cleared by
@@ -173,7 +181,8 @@ impl Dispatcher {
         let (fatal_tx, fatal_rx) = mpsc::channel(1);
         let inner = Arc::new(Inner {
             action_tx,
-            runtime,
+            runtime: Mutex::new(runtime),
+            generation: AtomicU64::new(0),
             config,
             td_boot,
             params_pending: AtomicBool::new(false),
@@ -181,6 +190,33 @@ impl Dispatcher {
             fatal_tx,
         });
         (Dispatcher { inner, quit_tx }, quit_rx, fatal_rx)
+    }
+
+    /// The client requests are currently issued against, so the loop can
+    /// shut it down before creating its replacement.
+    pub fn runtime(&self) -> Arc<dyn TdRuntime> {
+        self.inner.runtime()
+    }
+
+    /// Swaps in a freshly created TDLib client after the previous one
+    /// reached `Closed`, and returns the generation the new one runs under.
+    ///
+    /// Every request already in flight against the old client is abandoned
+    /// here: the generation moves, so their completions are dropped by
+    /// [`Inner::deliver`] rather than applied to a session that has moved
+    /// on. `params_pending` is cleared because the new client will ask for
+    /// its parameters itself, exactly as on a cold boot, and a stale flag
+    /// would make the deferred-issue path fire a second time.
+    pub fn replace_runtime(&self, runtime: Arc<dyn TdRuntime>) -> u64 {
+        *self
+            .inner
+            .runtime
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = runtime;
+        self.inner.params_pending.store(false, Ordering::SeqCst);
+        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::debug!(generation, "tdlib client replaced");
+        generation
     }
 
     /// Executes one effect. Never blocks: everything with latency is spawned.
@@ -281,16 +317,20 @@ impl Inner {
     }
 
     async fn execute_td(&self, request: TdRequest) {
+        // Read once, before the await: which client this request belongs to
+        // is fixed at the moment it is issued, and that is what its
+        // completion is checked against.
+        let generation = self.generation.load(Ordering::SeqCst);
         let request = match resolve_outgoing_file(request) {
             Resolved::Send(request) => request,
             Resolved::Failed(failure) => {
-                let _ = self.action_tx.send(failure).await;
+                self.deliver(generation, failure).await;
                 return;
             }
         };
         let completion = completion_for(&request);
         let kind = request.kind();
-        let outcome = self.runtime.request(request).await;
+        let outcome = self.runtime().request(request).await;
 
         if let Err(err) = &outcome {
             // The dispatcher never handles errors beyond logging: the state
@@ -302,7 +342,39 @@ impl Inner {
             tracing::debug!(request = kind, "td response has no completion action yet");
             return;
         };
-        let _ = self.action_tx.send(Action::TdResult(result)).await;
+        self.deliver(generation, Action::TdResult(result)).await;
+    }
+
+    /// The current client, cloned out so the lock is never held across an
+    /// await.
+    fn runtime(&self) -> Arc<dyn TdRuntime> {
+        Arc::clone(
+            &self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    /// Sends a completion, unless the client it was issued against has since
+    /// been replaced.
+    ///
+    /// Dropped completions are logged rather than discarded quietly. A
+    /// silent drop here would be the swallowed-completions bug wearing a
+    /// different hat, and the whole reason this generation check exists is
+    /// that the alternative — applying a dead client's answer to a live
+    /// session — is worse.
+    async fn deliver(&self, generation: u64, action: Action) {
+        let current = self.generation.load(Ordering::SeqCst);
+        if generation != current {
+            tracing::debug!(
+                issued_under = generation,
+                current,
+                "dropping a completion from a replaced tdlib client"
+            );
+            return;
+        }
+        let _ = self.action_tx.send(action).await;
     }
 
     async fn save_config(&self, patch: ConfigPatch) {

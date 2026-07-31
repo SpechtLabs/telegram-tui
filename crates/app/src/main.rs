@@ -208,6 +208,17 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
         // configured in-band, by the `SetTdlibParameters` the dispatcher
         // sends when TDLib reports `WaitTdlibParameters`.
         let runtime: Arc<dyn TdRuntime> = Arc::new(TdlibRuntime::new().await);
+        // Abandoning a QR login is only possible via `logOut`, which ends in
+        // `authorizationStateClosed` — terminal for that client instance, so
+        // getting back to a usable login needs a fresh one. See
+        // `runtime_loop::Core::restart_client` for why it only fires
+        // pre-authorization.
+        let restart: runtime_loop::RuntimeFactory = Arc::new(|| {
+            Box::pin(async {
+                let runtime: Arc<dyn TdRuntime> = Arc::new(TdlibRuntime::new().await);
+                runtime
+            })
+        });
         runtime_loop::run(
             app,
             &mut terminal,
@@ -220,6 +231,7 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
                 graphics,
                 measure_cell: graphics::cell_size,
             },
+            Some(restart),
         )
         .await
     });

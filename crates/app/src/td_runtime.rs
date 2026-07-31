@@ -161,7 +161,7 @@ impl TdlibRuntime {
     /// through tdlib-rs's global `OBSERVER`, keyed by a counter rather than
     /// by client, so whichever thread receives a response notifies the right
     /// waiter.
-    pub async fn shutdown(&self) {
+    async fn shutdown_and_join(&self) {
         self.receiving.store(false, Ordering::Release);
         let handle = self
             .receive_thread
@@ -529,6 +529,10 @@ impl TdlibRuntime {
 impl TdRuntime for TdlibRuntime {
     async fn request(&self, req: TdRequest) -> Result<TdResponse, TdError> {
         self.execute(req).await
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_and_join().await;
     }
 
     fn updates(&self) -> mpsc::Receiver<TdUpdate> {

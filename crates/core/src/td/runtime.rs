@@ -10,8 +10,19 @@ use tokio::sync::mpsc;
 #[async_trait]
 pub trait TdRuntime: Send + Sync + 'static {
     async fn request(&self, req: TdRequest) -> Result<TdResponse, TdError>;
-    /// Called exactly once by the runtime loop at boot; panics on second call.
+    /// Called exactly once per runtime instance by the runtime loop; panics
+    /// on a second call.
     fn updates(&self) -> mpsc::Receiver<TdUpdate>;
+
+    /// Releases whatever the implementation must release before another
+    /// runtime can be created in the same process, and waits for it.
+    ///
+    /// Defaulted to nothing because most implementations have nothing to
+    /// release — `FakeTd` owns a channel and no threads. The real one does:
+    /// its receive thread reads a process-global queue and discards updates
+    /// belonging to other clients, so a replacement created while it still
+    /// runs would lose updates to it. See `tgt_app::td_runtime`.
+    async fn shutdown(&self) {}
 }
 
 #[cfg(test)]

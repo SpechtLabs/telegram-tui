@@ -75,6 +75,31 @@ impl Harness {
     /// Boots an app with credentials already configured (the my.telegram.org
     /// wizard is a separate path, covered by `state::auth`'s unit tests)
     /// against a `FakeTd` replaying `fixture`.
+    /// [`Harness::new`] plus a replacement client for the loop to restart
+    /// into, driving `next`. Returns the replacement so a test can assert on
+    /// what it received.
+    ///
+    /// The factory hands out that one instance and then refuses: a second
+    /// restart in a test that scripted one would otherwise wait on a
+    /// `FakeTd` nobody wrote a script for, and time out saying nothing
+    /// useful.
+    fn with_restart(fixture: &str, next: &str) -> (Harness, Arc<FakeTd>) {
+        let replacement = Arc::new(FakeTd::from_jsonl(next).expect("fixture is valid JSONL"));
+        let slot = Mutex::new(Some(Arc::clone(&replacement)));
+        let factory: runtime_loop::RuntimeFactory = Arc::new(move || {
+            let runtime = slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .expect("this test scripted exactly one restart");
+            Box::pin(async move { runtime as Arc<dyn TdRuntime> })
+        });
+
+        let mut harness = Harness::new(fixture);
+        harness.core = harness.core.with_restart(factory);
+        (harness, replacement)
+    }
+
     fn new(fixture: &str) -> Harness {
         let fake = Arc::new(FakeTd::from_jsonl(fixture).expect("fixture is valid JSONL"));
         let (keys, key_events) = mpsc::channel::<Event>(64);
@@ -498,4 +523,193 @@ fn regenerate_fixtures() {
         std::fs::write(&path, to_jsonl(&script))
             .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
     }
+}
+
+/// The script the first client runs: QR-first login all the way to a real
+/// link, then the `logOut` that abandoning it requires, then the close that
+/// makes the client unusable.
+fn qr_then_abandon_script() -> Vec<ScriptStep> {
+    vec![
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitTdlibParameters)),
+        ScriptStep::Await {
+            expect: expect("SetTdlibParameters"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitPhoneNumber)),
+        ScriptStep::Await {
+            expect: expect("RequestQrCodeAuthentication"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        // The link really arrives, which is what makes this the interesting
+        // case: from here TDLib refuses setAuthenticationPhoneNumber, so
+        // logOut is the only legal way out (state::auth module docs).
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitOtherDeviceConfirmation {
+            link: "tg://login?token=AAAA".to_string(),
+        })),
+        ScriptStep::Await {
+            expect: expect("LogOut"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::LoggingOut)),
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::Closing)),
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::Closed)),
+    ]
+}
+
+/// The replacement client: a fresh login that goes through on the phone
+/// number the user already typed. No `RequestQrCodeAuthentication` here —
+/// `auth.method` survives the restart as `Phone`, so `state::auth`'s
+/// one-shot guard leaves the new `WaitPhoneNumber` alone.
+fn restarted_phone_script() -> Vec<ScriptStep> {
+    vec![
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitTdlibParameters)),
+        ScriptStep::Await {
+            expect: expect("SetTdlibParameters"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitPhoneNumber)),
+        ScriptStep::Await {
+            expect: expect("SetAuthenticationPhoneNumber"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitCode {
+            delivery_hint: "SMS to +4***78".to_string(),
+            length: 5,
+        })),
+        ScriptStep::Await {
+            expect: expect("CheckAuthenticationCode"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::Ready)),
+        ScriptStep::Await {
+            expect: expect("LoadChats"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+    ]
+}
+
+/// The regression `082ec9c` introduced and this fixes: a user who wants to
+/// sign in by phone after the QR link has rendered. Abandoning the QR login
+/// needs `logOut`, which ends in `authorizationStateClosed` — terminal for
+/// that client — so before this the user was stranded and the docs told
+/// them to quit and restart the app.
+///
+/// End to end, without a network: QR shown, escape to phone, client
+/// restarted, phone submitted against the new client, `Ready`.
+#[tokio::test]
+async fn abandoning_a_qr_login_restarts_the_client_and_phone_login_completes() {
+    let (mut app, replacement) = Harness::with_restart(
+        &to_jsonl(&qr_then_abandon_script()),
+        &to_jsonl(&restarted_phone_script()),
+    );
+
+    app.advance_until("the QR link", |core, _| {
+        matches!(
+            core.app().state().auth.phase,
+            AuthPhase::WaitOtherDeviceConfirmation { .. }
+        )
+    })
+    .await;
+
+    // Down highlights "sign in with phone number instead", Enter reveals the
+    // field; submitting from here is what fires the logOut.
+    app.press(KeyCode::Down).await;
+    app.press(KeyCode::Enter).await;
+    app.advance_until("the phone field", |core, _| {
+        core.app().state().auth.method == Some(LoginMethod::Phone)
+    })
+    .await;
+    app.type_text("+4915112345678").await;
+    app.press(KeyCode::Enter).await;
+
+    // The old client takes the logOut and closes.
+    app.advance_until("the logOut to reach the first client", |_, fake| {
+        fake.received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::LogOut))
+    })
+    .await;
+
+    // The replacement is created and driven from scratch: its own
+    // SetTdlibParameters proves the restart happened *and* that the
+    // parameters go through the dispatcher's single issuance path rather
+    // than a second copy bolted onto the restart.
+    app.advance_until("the new client to be configured", |_, _| {
+        replacement
+            .received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::SetTdlibParameters(_)))
+    })
+    .await;
+
+    // The typed number survived the restart (state::auth keeps it on
+    // purpose), so the user presses Enter rather than retyping it.
+    app.advance_until("the phone screen to come back", |core, _| {
+        core.app().state().auth.method == Some(LoginMethod::Phone)
+            && core.app().state().auth.phase == AuthPhase::WaitPhoneNumber
+    })
+    .await;
+    app.press(KeyCode::Enter).await;
+
+    app.advance_until_phase(
+        "the code prompt from the new client",
+        AuthPhase::WaitCode {
+            delivery_hint: "SMS to +4***78".to_string(),
+            length: 5,
+        },
+    )
+    .await;
+    app.type_text("54321").await;
+    app.press(KeyCode::Enter).await;
+
+    app.advance_until("the main screen", |core, _| {
+        core.app().state().screen == Screen::Main
+    })
+    .await;
+
+    assert!(
+        replacement
+            .received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::SetAuthenticationPhoneNumber { .. })),
+        "the phone number must have gone to the new client, not the dead one"
+    );
+    assert!(
+        !replacement
+            .received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::RequestQrCodeAuthentication)),
+        "the restarted client must not re-enter the QR flow the user just left"
+    );
+}
+
+/// `Closed` is not only reachable by asking for it: TDLib emits it after
+/// `close()` and when it tears a client down on an unrecoverable local
+/// error. Triggering the restart on the phase rather than on "we sent a
+/// logOut" makes this crash recovery too, so it is tested that way — no
+/// `LogOut` anywhere in the script, the client simply dies.
+#[tokio::test]
+async fn a_client_that_closes_on_its_own_is_replaced() {
+    let died = vec![
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitTdlibParameters)),
+        ScriptStep::Await {
+            expect: expect("SetTdlibParameters"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::Closed)),
+    ];
+
+    let (mut app, replacement) =
+        Harness::with_restart(&to_jsonl(&died), &to_jsonl(&restarted_phone_script()));
+
+    app.advance_until("the replacement to be configured", |_, _| {
+        replacement
+            .received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::SetTdlibParameters(_)))
+    })
+    .await;
+
+    app.advance_until_phase("a usable login screen again", AuthPhase::WaitPhoneNumber)
+        .await;
 }

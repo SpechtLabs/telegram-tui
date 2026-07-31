@@ -116,6 +116,15 @@ The same discipline covers terminal alerts: `notify::alert` takes no content par
 
 Before softening this: `state::auth::submit_credentials` advances the wizard before the write is dispatched and never checks the outcome, and `save_config` only sends TDLib its parameters after a successful write. The optimistic advance is safe only because the failure is fatal; make it a toast and login stalls for the whole session with nothing on screen.
 
+### Restarting the TDLib client
+
+`AuthPhase::Closed` is terminal for a client instance; `runtime_loop::Core::restart_client` builds a replacement (architecture §4.4.2). Two traps, both already paid for:
+
+- `tdlib_rs::receive()` reads one **process-global** queue and our loop *discards* updates for other client ids. So the old receive thread must be **joined** (`TdlibRuntime::shutdown`) before the new client is created, or it eats the replacement's `WaitTdlibParameters`. `Drop` deliberately does not join — that is for process exit.
+- Requests in flight against the old client are dropped by generation (`Dispatcher::replace_runtime` bumps it, `Inner::deliver` checks it) and the drop is logged.
+
+The restart fires **only when the closed client never reached `Ready`**. That is not an oversight: clearing account-scoped `AppState` needs a core action that does not exist yet (task #64), and restarting without it renders a signed-out user's chats against a fresh client. Do not widen the condition without that reset.
+
 ## Gotchas
 
 These bit during implementation and are recorded in `docs/architecture.md`:
