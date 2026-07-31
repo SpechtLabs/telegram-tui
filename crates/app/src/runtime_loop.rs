@@ -338,40 +338,35 @@ impl Core {
     /// which is terminal for that instance — only a new client can get back
     /// to a usable state.
     ///
-    /// # Why this declines to fire in the case it most obviously applies to
+    /// # It fires for every close, and the account state goes with it
     ///
-    /// It restarts **only when the closed client never reached
-    /// `AuthPhase::Ready`**, and that narrowness is deliberate. Chats are
-    /// loaded from exactly one place, `state::auth`'s `Ready` arm, so a
-    /// client that never authorized cannot have left any account-scoped
-    /// state behind: no chats, no conversations, no cached media. Replacing
-    /// it is therefore complete on its own.
+    /// This used to restart **only** when the closed client had never
+    /// reached `AuthPhase::Ready`, and the reason is worth keeping rather
+    /// than deleting, because the obvious "simplification" is to reintroduce
+    /// it or to drop the reset below and keep the restart.
     ///
-    /// A signed-in client that closes — `/logout`, or TDLib tearing itself
-    /// down on a local error — is a different problem. `AppState` still
-    /// holds the previous session's chats, and `tgt-app` cannot clear them
-    /// because `update()` is pure and clearing needs a core action that does
-    /// not exist yet. Restarting anyway would leave the app rendering a
-    /// signed-out user's chat list against a fresh unauthenticated client:
-    /// alive-looking, and showing exactly the content they asked to be rid
-    /// of. Today's behaviour — it visibly stops — is worse in the abstract
-    /// and better in practice, because it is honest.
+    /// Replacing a signed-in client without clearing `AppState` leaves the
+    /// app rendering the previous account's chat list against a fresh,
+    /// unauthenticated client: alive-looking, and showing exactly the
+    /// content the user asked to be rid of. That is worse than the old
+    /// dead-end, which at least stopped visibly. `tgt-app` cannot clear that
+    /// state itself — `update()` is pure — so until `Action::AccountReset`
+    /// existed the honest move was to decline.
     ///
-    /// So this is half a fix on purpose. Task #64 adds the account-state
-    /// reset; widening the condition belongs in that change and not before
-    /// it. If you are here because a restart "obviously should have fired",
-    /// that is the reason, and removing the `authorized` check without the
-    /// reset reintroduces the bug this comment exists to prevent.
+    /// It exists now, and is dispatched here *before* the swap, so the two
+    /// are one operation. Do not separate them: a restart without the reset
+    /// is the bug described above, and a reset without a restart empties the
+    /// screen for a client that is still dead.
     async fn restart_client(&mut self) {
         let Some(factory) = self.restart.clone() else {
             return;
         };
+        // Everything the closed client's account left behind goes before
+        // the new one can report anything, so no frame is ever drawn with a
+        // signed-out user's chats against a fresh client. `update()` owns
+        // the clearing; this only asks for it.
         if self.authorized {
-            tracing::warn!(
-                "the tdlib client closed after authorizing; not restarting, because \
-                 account state would survive into the new session (task #64)"
-            );
-            return;
+            self.apply(Action::AccountReset);
         }
 
         // Joined, not merely asked to stop: the receive thread reads a

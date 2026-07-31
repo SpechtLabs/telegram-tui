@@ -564,6 +564,17 @@ pub enum Action {
     TdResult(TdResult),
     /// Completion of a dispatched non-TDLib effect.
     Io(IoResult),
+    /// The TDLib client was replaced and everything the previous account
+    /// left behind must go (§4.4.2). Emitted by `tgt-app` immediately
+    /// before it swaps the runtime, because `update()` is pure and the app
+    /// layer cannot clear `AppState` itself.
+    ///
+    /// Clears what belonged to the *account*: chats, conversations, open
+    /// chat, media, presence, composer, selection, and any overlay standing
+    /// on top of them. Keeps what belongs to the *session*: theme,
+    /// bindings, telemetry mode and salt, consent, terminal size, clock —
+    /// none of which the sign-out invalidates.
+    AccountReset,
 }
 
 /// Domain-specific completions: the dispatcher maps (request, response) pairs

@@ -43,6 +43,14 @@ pub enum Action {
     TdResult(TdResult),
     /// Completion of a dispatched non-TDLib effect.
     Io(IoResult),
+    /// The TDLib client was replaced; drop everything the previous account
+    /// left behind. See `AppState::reset_account` and architecture §4.4.2.
+    ///
+    /// Emitted by `tgt-app` immediately before it swaps the runtime.
+    /// `update()` is pure, so the app layer cannot clear `AppState` itself —
+    /// which is exactly why this variant exists rather than the restart
+    /// reaching in.
+    AccountReset,
 }
 
 /// Domain-specific completions: the dispatcher maps (request, response) pairs

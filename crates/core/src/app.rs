@@ -131,6 +131,56 @@ pub struct App {
     dirty: bool,
 }
 
+impl AppState {
+    /// Drops everything the signed-out account left behind, keeping what
+    /// belongs to this session (architecture §4.4.2).
+    ///
+    /// The split is by *ownership*, not by convenience. Chats, conversations,
+    /// media and presence describe the account that just went away; theme,
+    /// bindings, terminal size, telemetry settings and the HMAC salt describe
+    /// this run of the program and survive a sign-out untouched. The salt in
+    /// particular must survive: regenerating it would silently change every
+    /// `chat.hash` the install has ever produced, which is `tgt telemetry
+    /// reset-id`'s job and nobody else's.
+    ///
+    /// Overlays go too. A palette, a modal or an in-chat search standing over
+    /// a chat list that no longer exists would be pointing at rows that are
+    /// gone, so focus returns to the chat list and the stack is emptied.
+    ///
+    /// Deliberately field-by-field rather than `*self = AppState::new(..)`:
+    /// the compiler cannot tell us we forgot one either way, but this form
+    /// puts every field in front of whoever adds the next one, and a new
+    /// account-scoped field left out of here is a bug that shows up as
+    /// someone else's chat still on screen.
+    pub fn reset_account(&mut self) {
+        // Account-scoped: everything below described the previous account.
+        self.chat_list = ChatListState::default();
+        self.conversations.clear();
+        self.open_chat = None;
+        self.composer = ComposerState::default();
+        self.media = MediaState::default();
+        self.presence = PresenceState::default();
+        self.toasts = ToastState::default();
+
+        // Overlays over data that no longer exists.
+        self.palette = None;
+        self.chat_search = None;
+        self.modal_ui = None;
+        self.focus = FocusStack::new(Focus::ChatList);
+
+        // The client is unauthenticated again, so the screen follows it back
+        // to the wizard. `auth` itself is deliberately NOT cleared: T77 keeps
+        // a typed phone number across a QR-escape restart on purpose, so the
+        // user presses Enter rather than retyping. `handle_td` overwrites the
+        // phase when the new client reports one.
+        self.screen = Screen::Auth;
+
+        // Session-scoped and untouched: theme_name, theme_generation,
+        // bindings, width, height, layout_breakpoint_cols, telemetry_mode,
+        // telemetry_salt, crash_reports_available, consent, connection, now.
+    }
+}
+
 impl App {
     pub fn new(boot: Boot) -> Self {
         let screen = if boot.consent_needed {
@@ -253,6 +303,11 @@ impl App {
                 self.state.height = height;
                 self.dirty = true;
                 conversation::close_if_now_hidden(&self.state, was_visible)
+            }
+            Action::AccountReset => {
+                self.state.reset_account();
+                self.dirty = true;
+                Vec::new()
             }
             Action::Key(key) => self.route_key(key),
             // Bracketed paste. `handle_paste` decides between inserting the
@@ -1463,6 +1518,84 @@ mod tests {
     use crate::state::chat_list::visible_rows;
     use crate::td::error::TdError;
     use crate::td::request::TdRequest;
+
+    /// The reset that makes a signed-in restart safe (architecture §4.4.2).
+    ///
+    /// Split by ownership: what described the account goes, what describes
+    /// this run of the program stays. The session half matters as much as
+    /// the account half — losing the theme or the terminal size on a logout
+    /// would be a visible regression, and regenerating `telemetry_salt`
+    /// would silently rewrite every `chat.hash` this install has produced,
+    /// which is `tgt telemetry reset-id`'s job alone.
+    #[test]
+    fn account_reset_drops_the_account_and_keeps_the_session() {
+        let mut app = App::new(boot_fixture());
+        let chat = ChatId(7);
+
+        // Stand a full signed-in session up: a chat, an open conversation,
+        // an upload in flight, and an overlay on top of all of it.
+        app.state.screen = Screen::Main;
+        crate::state::conversation::open(&mut app.state, chat);
+        crate::state::media::start_upload(&mut app.state, MessageId(-1), chat, 100);
+        crate::state::palette::open(&mut app.state);
+        app.state.focus.push(Focus::Composer);
+        app.state.theme_generation = 3;
+
+        // Captured rather than hardcoded: the assertion is "a sign-out does
+        // not touch this", which stays true if the fixture changes.
+        let telemetry_before = app.state().telemetry_mode;
+        let salt_before = app.state().telemetry_salt;
+
+        let effects = app.update(Action::AccountReset);
+        assert!(effects.is_empty(), "the reset asks for no I/O: {effects:?}");
+        let state = app.state();
+
+        // Gone: everything that described the account that just signed out.
+        assert!(
+            state.conversations.is_empty(),
+            "chats must not survive a sign-out"
+        );
+        assert_eq!(state.open_chat, None);
+        assert!(state.media.uploads.is_empty());
+        assert!(
+            state.palette.is_none(),
+            "an overlay over a gone chat list must close"
+        );
+        assert_eq!(*state.focus.current(), Focus::ChatList);
+        assert_eq!(
+            state.screen,
+            Screen::Auth,
+            "the client is unauthenticated again, so the screen follows it"
+        );
+
+        // Kept: everything that describes this run rather than that account.
+        assert_eq!(state.theme_name, "dark");
+        assert_eq!(state.theme_generation, 3);
+        assert_eq!(state.width, 120);
+        assert_eq!(state.height, 40);
+        assert_eq!(state.telemetry_salt, salt_before);
+        assert_eq!(state.telemetry_mode, telemetry_before);
+        assert_eq!(state.layout_breakpoint_cols, 100);
+    }
+
+    /// The typed phone number is deliberately kept: T77 escapes a QR login
+    /// by logging out, which closes the client, and the whole point of that
+    /// path is that the number is still there when the phone field returns.
+    #[test]
+    fn account_reset_keeps_a_half_finished_login() {
+        let mut app = App::new(boot_fixture());
+        app.state.auth.phone.text = "+4915112345678".to_string();
+        app.state.auth.method = Some(crate::state::auth::LoginMethod::Phone);
+
+        app.update(Action::AccountReset);
+
+        assert_eq!(app.state().auth.phone.text, "+4915112345678");
+        assert_eq!(
+            app.state().auth.method,
+            Some(crate::state::auth::LoginMethod::Phone),
+            "clearing this would send the user back to the QR screen they just left"
+        );
+    }
 
     pub(super) fn boot_fixture() -> Boot {
         Boot {

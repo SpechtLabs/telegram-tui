@@ -38,6 +38,8 @@ use tokio::time::timeout;
 
 use tgt_core::app::{App, Boot, Screen};
 use tgt_core::effect::TelemetryMode;
+use tgt_core::model::chat::{ChatKind, ChatListId, ChatPositionEntry, ChatView};
+use tgt_core::model::ids::ChatId;
 use tgt_core::model::key::KeyBindings;
 use tgt_core::model::time::Millis;
 use tgt_core::state::auth::{AuthField, LoginMethod};
@@ -712,4 +714,77 @@ async fn a_client_that_closes_on_its_own_is_replaced() {
 
     app.advance_until_phase("a usable login screen again", AuthPhase::WaitPhoneNumber)
         .await;
+}
+
+/// The case #63 deliberately left dead-ending, and the one a user actually
+/// reaches: `/logout` from a signed-in session.
+///
+/// It closes the client, which is terminal, so the restart has to fire — and
+/// the previous account's chats must not survive into the new session. Before
+/// `Action::AccountReset` this either stopped visibly (correct but useless)
+/// or would have rendered a signed-out user's chat list against a fresh
+/// unauthenticated client, which is worse.
+#[tokio::test]
+async fn logging_out_while_signed_in_restarts_and_forgets_the_account() {
+    let signed_in = vec![
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitTdlibParameters)),
+        ScriptStep::Await {
+            expect: expect("SetTdlibParameters"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::Ready)),
+        ScriptStep::Await {
+            expect: expect("LoadChats"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
+        // A chat arrives, so there is real account state to lose.
+        ScriptStep::Emit(TdUpdate::NewChat(ChatView {
+            id: ChatId(4242),
+            kind: ChatKind::Private,
+            title: "Ada".to_string(),
+            positions: vec![ChatPositionEntry {
+                list: ChatListId::Main,
+                order: 100,
+                is_pinned: false,
+            }],
+            unread_count: 0,
+            unread_mention_count: 0,
+            last_message: None,
+            is_muted: false,
+        })),
+        // …then the session ends the way a user ends it.
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::LoggingOut)),
+        ScriptStep::Emit(TdUpdate::Auth(AuthPhase::Closed)),
+    ];
+
+    let (mut app, replacement) =
+        Harness::with_restart(&to_jsonl(&signed_in), &to_jsonl(&restarted_phone_script()));
+
+    app.advance_until("the chat to arrive", |core, _| {
+        !core.app().state().chat_list.chats.is_empty()
+    })
+    .await;
+    assert_eq!(app.core.app().state().screen, Screen::Main);
+
+    // The close must produce a replacement rather than a dead end.
+    app.advance_until("the new client to be configured", |_, _| {
+        replacement
+            .received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::SetTdlibParameters(_)))
+    })
+    .await;
+
+    let state = app.core.app().state();
+    assert!(
+        state.chat_list.chats.is_empty(),
+        "the signed-out account's chats must not survive into the new session"
+    );
+    assert!(state.conversations.is_empty());
+    assert_eq!(state.open_chat, None);
+    assert_ne!(
+        state.screen,
+        Screen::Main,
+        "a fresh unauthenticated client must not be showing the main screen"
+    );
 }
