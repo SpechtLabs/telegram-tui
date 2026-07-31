@@ -25,11 +25,13 @@ env:
 
 jobs:
   check:
-    # macOS is the supported platform and the only one a release is built for
-    # (see release.yaml). Linux and Windows are experimental: they are built
-    # and tested here so a port regression is caught, but nobody has run the
-    # client on them. A failure on any of the three is a real failure — an
-    # ignored job would be worse than no job.
+    # macOS and Linux both ship release artifacts (see release.yaml), on both
+    # architectures. Windows is built and tested here and nowhere else: its
+    # loader has no rpath equivalent, so the relocatable bin/ + lib/ layout the
+    # release depends on has no Windows spelling, and nobody has run the client
+    # there. Building it anyway catches a port regression at the point it is
+    # introduced. A failure on any of the three is a real failure — an ignored
+    # job would be worse than no job.
     name: Checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:

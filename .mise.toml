@@ -89,11 +89,15 @@ description = "Run the client from source"
 run = "cargo run -p tgt-app"
 
 [tasks.package]
-description = "Build dist/ with the relocatable binary, its dylib, and a tarball"
+description = "Build dist/ with the relocatable binary, its TDLib, and a tarball"
+# Set TARGET to package for a rust triple other than the host's. The release
+# workflow builds every published target on a runner of its own architecture,
+# so it never has to.
 run = "./scripts/package.sh"
 
-# Unix-shaped: it lays out bin/ + ../lib for the @rpath/$ORIGIN loader. macOS
-# is the only platform with a release artifact, so this is not made portable.
+# Unix-shaped: it lays out bin/ + ../lib for the @rpath/$ORIGIN loader, which
+# is exactly the tree package.sh proves relocatable. Windows ships no artifact
+# and has no rpath, so this is not made portable to it.
 [tasks.install]
 description = "Install tgt into $TGT_PREFIX (default ~/.local): bin/tgt + lib/libtdjson"
 depends = ["package"]
@@ -103,9 +107,11 @@ set -eu
 TGT_PREFIX="${TGT_PREFIX:-$HOME/.local}"
 install -d "$TGT_PREFIX/bin" "$TGT_PREFIX/lib"
 install -m 755 dist/tgt/bin/tgt "$TGT_PREFIX/bin/tgt"
-# Both the versioned dylib (what the binary's LC_LOAD_DYLIB actually names)
-# and the unversioned alias ship together; see architecture.md §9.2.
-cp -f dist/tgt/lib/libtdjson*.dylib "$TGT_PREFIX/lib/"
+# Everything package.sh put in lib/: the versioned library (what the binary's
+# LC_LOAD_DYLIB / DT_NEEDED actually names), the unversioned alias, and on
+# Linux the bundled C++ runtime TDLib needs. `-a` keeps the alias a symlink.
+# See architecture.md §9.2.
+cp -a dist/tgt/lib/. "$TGT_PREFIX/lib/"
 echo "installed $("$TGT_PREFIX/bin/tgt" --version) to $TGT_PREFIX/bin/tgt"
 case ":$PATH:" in
   *":$TGT_PREFIX/bin:"*) ;;
@@ -113,15 +119,19 @@ case ":$PATH:" in
 esac
 '''
 
-# Unix-shaped: it lays out bin/ + ../lib for the @rpath/$ORIGIN loader. macOS
-# is the only platform with a release artifact, so this is not made portable.
 [tasks.uninstall]
-description = "Remove tgt and its dylib from $TGT_PREFIX"
+description = "Remove tgt and the libraries it was installed with from $TGT_PREFIX"
 shell = "bash -c"
 run = '''
 set -eu
 TGT_PREFIX="${TGT_PREFIX:-$HOME/.local}"
-rm -f "$TGT_PREFIX/bin/tgt" "$TGT_PREFIX"/lib/libtdjson*.dylib
+# Exactly the set `install` copies in: TDLib under either platform's naming,
+# plus the C++ runtime bundled beside it on Linux.
+rm -f "$TGT_PREFIX/bin/tgt" \
+      "$TGT_PREFIX"/lib/libtdjson* \
+      "$TGT_PREFIX"/lib/libc++.so.1 \
+      "$TGT_PREFIX"/lib/libc++abi.so.1 \
+      "$TGT_PREFIX"/lib/libunwind.so.1
 echo "removed tgt from $TGT_PREFIX"
 '''
 
