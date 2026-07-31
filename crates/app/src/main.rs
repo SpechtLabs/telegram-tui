@@ -31,6 +31,7 @@ use tgt_core::app::{App, Boot};
 use tgt_core::effect::TelemetryMode;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_ui::theme::Theme;
+use tgt_ui::theme::loader;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -129,7 +130,7 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let app = App::new(boot_from(&config, &cli, terminal.size()?, identity.salt));
-    let theme = Theme::default_dark();
+    let theme = resolve_theme(&config.theme);
     // Shared with the dispatcher, which applies `Effect::SaveConfig` patches
     // and reads the credentials back when TDLib asks for its parameters.
     let config = Arc::new(Mutex::new(config));
@@ -229,6 +230,64 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
     }
+}
+
+/// Resolves `[app].theme` (spec §7.2 / architecture §4.9) to a `Theme`:
+/// `tgt_ui::theme::loader::builtin` first, then a user file at
+/// `<config_dir>/themes/<name>.toml`, then `Theme::default_dark` — every
+/// failure in the file path (missing file, malformed TOML, a bad color)
+/// falls back to `default_dark` with a local warning rather than failing
+/// startup, matching `config.rs`'s "never brick the app over a config
+/// mistake" stance. Truecolor vs. 256-color degradation is decided here too
+/// (`COLORTERM` containing `"truecolor"` or `"24bit"`), since detecting the
+/// terminal's capability is this call site's job, not the loader's (module
+/// docs on `tgt_ui::theme::loader`).
+///
+/// Live theme *toggling* (re-resolving mid-session, e.g. from the command
+/// palette) is deferred: the palette's `ToggleTheme` stays a no-op for now.
+fn resolve_theme(theme_name: &str) -> Theme {
+    let theme = loader::builtin(theme_name).unwrap_or_else(|| match theme_file_path(theme_name) {
+        Ok(path) => match loader::load_theme(&path) {
+            Ok(theme) => theme,
+            Err(err) => {
+                tracing::warn!(
+                    theme = %theme_name,
+                    path = %path.display(),
+                    error = %err,
+                    "could not load theme file; using default_dark"
+                );
+                Theme::default_dark()
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                theme = %theme_name,
+                error = %err,
+                "could not determine the theme file path; using default_dark"
+            );
+            Theme::default_dark()
+        }
+    });
+
+    let truecolor = std::env::var("COLORTERM")
+        .map(|value| value.contains("truecolor") || value.contains("24bit"))
+        .unwrap_or(false);
+    loader::for_terminal(theme, truecolor)
+}
+
+/// `<config_dir>/telegram-tui/themes/<name>.toml` — same base directory as
+/// `config.rs`'s `config_path` (kept separate rather than exposed from
+/// `config.rs`, since only this call site needs it).
+fn theme_file_path(name: &str) -> eyre::Result<std::path::PathBuf> {
+    use etcetera::BaseStrategy;
+
+    let strategy = etcetera::choose_base_strategy()
+        .map_err(|err| eyre::eyre!("could not determine the config directory: {err}"))?;
+    Ok(strategy
+        .config_dir()
+        .join("telegram-tui")
+        .join("themes")
+        .join(format!("{name}.toml")))
 }
 
 /// Projects the loaded config (plus the CLI flag and the terminal size) into

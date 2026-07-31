@@ -1,1 +1,429 @@
-//! Implemented by a later task; see docs/plan.md.
+//! Theme file loading — architecture.md §4.9, spec §7.2.
+//!
+//! Path resolution (`<config_dir>/themes/<name>.toml`) and the
+//! builtin-then-file-then-default fallback chain are the caller's job —
+//! see `crates/app/src/main.rs::resolve_theme`, the sole call site this
+//! task wires. This module only turns bytes into a `Theme` or a reason it
+//! couldn't.
+//!
+//! # Parsing rules
+//!
+//! - A color value is either `"#rrggbb"` (hex, case-insensitive) or a named
+//!   ANSI color: `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+//!   `cyan`, `white`, `gray`/`grey`, each with a `bright_`-prefixed variant
+//!   (`bright_red`, `bright_black`, ...). Ratatui's `Color` only has 16
+//!   named slots for 18 candidate names, so `white`/`gray`/`grey` share one
+//!   axis on purpose: `white`, `gray` and `grey` all mean the same dim ANSI
+//!   white (`Color::Gray`), and their `bright_` forms all mean pure
+//!   `Color::White` — `gray`/`grey` exist as the more intuitive spelling
+//!   for readers who don't think of "white" as dim by default.
+//! - Unknown top-level keys warn (`tracing::warn!`, local log only — spec
+//!   §12's config philosophy applies here too) and are otherwise ignored,
+//!   so a theme file written for a newer binary doesn't break an older one.
+//! - A token key that is simply absent falls back to
+//!   `Theme::default_dark`'s value for that token, silently — friendlier
+//!   than a hard failure for someone who only wants to override a couple of
+//!   colors, and consistent with `config.rs`'s "missing means default"
+//!   stance.
+//! - A present-but-unparseable value (bad hex, unrecognized name, wrong
+//!   TOML type) fails the *whole* load with `ThemeLoadError::BadColor`,
+//!   carrying both the offending key and its raw value so the caller's
+//!   warning is actionable — a half-applied theme would be a worse
+//!   surprise than falling back to `default_dark` entirely.
+//! - `sender_palette`, if present, must be an array of exactly 8 color
+//!   values; any other length is also a `BadColor` (key `"sender_palette"`,
+//!   or `"sender_palette[i]"` for a bad element).
+
+use std::path::Path;
+
+use ratatui::style::Color;
+
+use crate::theme::Theme;
+
+/// Failure loading a user theme file. `main.rs`'s call site treats every
+/// variant the same way — fall back to `Theme::default_dark` with a local
+/// warning — but callers that want a more specific message can match on it.
+#[derive(Debug)]
+pub enum ThemeLoadError {
+    Io(std::io::Error),
+    Parse(String),
+    BadColor { key: String, value: String },
+}
+
+impl std::fmt::Display for ThemeLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThemeLoadError::Io(err) => write!(f, "could not read theme file: {err}"),
+            ThemeLoadError::Parse(msg) => write!(f, "could not parse theme file: {msg}"),
+            ThemeLoadError::BadColor { key, value } => {
+                write!(f, "invalid color for `{key}`: {value:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ThemeLoadError {}
+
+impl From<std::io::Error> for ThemeLoadError {
+    fn from(err: std::io::Error) -> Self {
+        ThemeLoadError::Io(err)
+    }
+}
+
+/// The 12 semantic token keys, in `Theme` field order. `sender_palette` is
+/// handled separately since it's an array, not a scalar color.
+const TOKEN_KEYS: &[&str] = &[
+    "accent",
+    "accent_dim",
+    "text",
+    "text_muted",
+    "surface",
+    "surface_raised",
+    "success",
+    "warning",
+    "danger",
+    "selection",
+    "rail_own",
+    "rail_other",
+];
+
+/// Parses a user theme TOML file at `path`. Same token names as `Theme`'s
+/// fields, plus `sender_palette` (an array of 8). See module docs for the
+/// value grammar and the missing/unknown-key fallback rules.
+pub fn load_theme(path: &Path) -> Result<Theme, ThemeLoadError> {
+    let text = std::fs::read_to_string(path)?;
+    parse(&text)
+}
+
+/// A built-in theme by name, or `None` if `name` isn't one telegram-tui
+/// ships — the caller falls through to `load_theme` on `None`.
+pub fn builtin(name: &str) -> Option<Theme> {
+    match name {
+        "default" | "default_dark" => Some(Theme::default_dark()),
+        _ => None,
+    }
+}
+
+/// Truecolor → 256-color degradation, selected by the caller's terminal
+/// capability probe (`COLORTERM`, read at the `main.rs` call site — this
+/// module stays free of environment access so it stays unit-testable).
+/// `truecolor = true` returns `theme` unchanged; otherwise `theme.degraded()`.
+pub fn for_terminal(theme: Theme, truecolor: bool) -> Theme {
+    if truecolor { theme } else { theme.degraded() }
+}
+
+fn parse(text: &str) -> Result<Theme, ThemeLoadError> {
+    let root: toml::Table =
+        toml::from_str(text).map_err(|err| ThemeLoadError::Parse(err.to_string()))?;
+    let mut theme = Theme::default_dark();
+
+    for (key, value) in &root {
+        match key.as_str() {
+            "sender_palette" => theme.sender_palette = parse_palette(value)?,
+            k if TOKEN_KEYS.contains(&k) => set_token(&mut theme, k, parse_color_value(k, value)?),
+            other => {
+                tracing::warn!(key = %other, "unknown key in theme file; ignoring");
+            }
+        }
+    }
+
+    Ok(theme)
+}
+
+fn set_token(theme: &mut Theme, key: &str, color: Color) {
+    match key {
+        "accent" => theme.accent = color,
+        "accent_dim" => theme.accent_dim = color,
+        "text" => theme.text = color,
+        "text_muted" => theme.text_muted = color,
+        "surface" => theme.surface = color,
+        "surface_raised" => theme.surface_raised = color,
+        "success" => theme.success = color,
+        "warning" => theme.warning = color,
+        "danger" => theme.danger = color,
+        "selection" => theme.selection = color,
+        "rail_own" => theme.rail_own = color,
+        "rail_other" => theme.rail_other = color,
+        _ => unreachable!("set_token called with non-token key {key:?}"),
+    }
+}
+
+fn parse_palette(value: &toml::Value) -> Result<[Color; 8], ThemeLoadError> {
+    let array = value.as_array().ok_or_else(|| ThemeLoadError::BadColor {
+        key: "sender_palette".to_string(),
+        value: value.to_string(),
+    })?;
+    if array.len() != 8 {
+        return Err(ThemeLoadError::BadColor {
+            key: "sender_palette".to_string(),
+            value: format!("expected 8 entries, found {}", array.len()),
+        });
+    }
+    let mut colors = [Color::Reset; 8];
+    for (i, entry) in array.iter().enumerate() {
+        colors[i] = parse_color_value(&format!("sender_palette[{i}]"), entry)?;
+    }
+    Ok(colors)
+}
+
+fn parse_color_value(key: &str, value: &toml::Value) -> Result<Color, ThemeLoadError> {
+    let raw = value.as_str().ok_or_else(|| ThemeLoadError::BadColor {
+        key: key.to_string(),
+        value: value.to_string(),
+    })?;
+    parse_color_str(raw).ok_or_else(|| ThemeLoadError::BadColor {
+        key: key.to_string(),
+        value: raw.to_string(),
+    })
+}
+
+/// `"#rrggbb"` or a named ANSI color (see module docs). `None` on anything
+/// else, leaving the caller to attach the key.
+fn parse_color_str(raw: &str) -> Option<Color> {
+    let trimmed = raw.trim();
+    match trimmed.strip_prefix('#') {
+        Some(hex) => parse_hex(hex),
+        None => parse_named(trimmed),
+    }
+}
+
+fn parse_hex(hex: &str) -> Option<Color> {
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+fn parse_named(name: &str) -> Option<Color> {
+    let lower = name.to_ascii_lowercase();
+    let (bright, base) = match lower
+        .strip_prefix("bright_")
+        .or_else(|| lower.strip_prefix("bright-"))
+    {
+        Some(rest) => (true, rest),
+        None => (false, lower.as_str()),
+    };
+    match (base, bright) {
+        ("black", false) => Some(Color::Black),
+        ("black", true) => Some(Color::DarkGray),
+        ("red", false) => Some(Color::Red),
+        ("red", true) => Some(Color::LightRed),
+        ("green", false) => Some(Color::Green),
+        ("green", true) => Some(Color::LightGreen),
+        ("yellow", false) => Some(Color::Yellow),
+        ("yellow", true) => Some(Color::LightYellow),
+        ("blue", false) => Some(Color::Blue),
+        ("blue", true) => Some(Color::LightBlue),
+        ("magenta", false) => Some(Color::Magenta),
+        ("magenta", true) => Some(Color::LightMagenta),
+        ("cyan", false) => Some(Color::Cyan),
+        ("cyan", true) => Some(Color::LightCyan),
+        ("white" | "gray" | "grey", false) => Some(Color::Gray),
+        ("white" | "gray" | "grey", true) => Some(Color::White),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::text::Line;
+    use tgt_core::model::ids::MessageId;
+
+    use super::*;
+    use crate::render::cache::{LayoutCache, LayoutKey};
+
+    // `r##"..."##` (not `r#"..."#`) because the fixtures contain `"#rrggbb"`
+    // literals: a bare `"#` inside a single-hash raw string would close it
+    // early.
+    const FULL_THEME_TOML: &str = r##"
+        accent = "#61afef"
+        accent_dim = "bright_blue"
+        text = "#dcdfe4"
+        text_muted = "gray"
+        surface = "#181a20"
+        surface_raised = "black"
+        success = "#98c379"
+        warning = "bright_yellow"
+        danger = "#e06c75"
+        selection = "magenta"
+        rail_own = "#3a698f"
+        rail_other = "bright_cyan"
+
+        sender_palette = [
+            "#e06c75",
+            "bright_red",
+            "#e5c07b",
+            "green",
+            "#56b6c2",
+            "blue",
+            "#c678dd",
+            "bright_magenta",
+        ]
+    "##;
+
+    #[test]
+    fn parses_all_twelve_tokens_plus_palette() {
+        let theme = parse(FULL_THEME_TOML).expect("fixture must parse");
+
+        assert_eq!(theme.accent, Color::Rgb(0x61, 0xaf, 0xef));
+        assert_eq!(theme.accent_dim, Color::LightBlue);
+        assert_eq!(theme.text, Color::Rgb(0xdc, 0xdf, 0xe4));
+        assert_eq!(theme.text_muted, Color::Gray);
+        assert_eq!(theme.surface, Color::Rgb(0x18, 0x1a, 0x20));
+        assert_eq!(theme.surface_raised, Color::Black);
+        assert_eq!(theme.success, Color::Rgb(0x98, 0xc3, 0x79));
+        assert_eq!(theme.warning, Color::LightYellow);
+        assert_eq!(theme.danger, Color::Rgb(0xe0, 0x6c, 0x75));
+        assert_eq!(theme.selection, Color::Magenta);
+        assert_eq!(theme.rail_own, Color::Rgb(0x3a, 0x69, 0x8f));
+        assert_eq!(theme.rail_other, Color::LightCyan);
+
+        assert_eq!(
+            theme.sender_palette,
+            [
+                Color::Rgb(0xe0, 0x6c, 0x75),
+                Color::LightRed,
+                Color::Rgb(0xe5, 0xc0, 0x7b),
+                Color::Green,
+                Color::Rgb(0x56, 0xb6, 0xc2),
+                Color::Blue,
+                Color::Rgb(0xc6, 0x78, 0xdd),
+                Color::LightMagenta,
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_keys_fall_back_to_default_dark() {
+        let default = Theme::default_dark();
+        let theme = parse("accent = \"#ff00ff\"").expect("fixture must parse");
+
+        // Only `accent` was overridden; every other token keeps
+        // `default_dark`'s value rather than erroring on the missing keys.
+        assert_eq!(theme.accent, Color::Rgb(0xff, 0x00, 0xff));
+        assert_eq!(theme.text, default.text);
+        assert_eq!(theme.surface, default.surface);
+        assert_eq!(theme.sender_palette, default.sender_palette);
+    }
+
+    #[test]
+    fn unknown_key_warns_not_fails() {
+        let toml = "accent = \"#61afef\"\nthis_key_does_not_exist = \"whatever\"\n";
+
+        let theme = parse(toml).expect("unknown key must warn, not fail the load");
+        assert_eq!(theme.accent, Color::Rgb(0x61, 0xaf, 0xef));
+    }
+
+    #[test]
+    fn bad_color_reports_key_and_value() {
+        let toml = "accent = \"not-a-color\"";
+
+        match parse(toml) {
+            Err(ThemeLoadError::BadColor { key, value }) => {
+                assert_eq!(key, "accent");
+                assert_eq!(value, "not-a-color");
+            }
+            other => panic!("expected BadColor{{key, value}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bad_color_reports_key_and_value_for_bad_hex() {
+        let toml = "danger = \"#gg0000\"";
+
+        match parse(toml) {
+            Err(ThemeLoadError::BadColor { key, value }) => {
+                assert_eq!(key, "danger");
+                assert_eq!(value, "#gg0000");
+            }
+            other => panic!("expected BadColor{{key, value}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sender_palette_wrong_length_is_bad_color() {
+        let toml = "sender_palette = [\"red\", \"blue\"]";
+
+        match parse(toml) {
+            Err(ThemeLoadError::BadColor { key, value }) => {
+                assert_eq!(key, "sender_palette");
+                assert!(
+                    value.contains('2'),
+                    "value should mention the found length: {value}"
+                );
+            }
+            other => panic!("expected BadColor{{key, value}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_resolves_default_and_default_dark_only() {
+        assert!(builtin("default").is_some());
+        assert!(builtin("default_dark").is_some());
+        assert!(builtin("nonexistent-theme").is_none());
+    }
+
+    #[test]
+    fn degraded_maps_rgb_to_nearest_256() {
+        let theme = Theme::default_dark();
+
+        // Spot-check the accent token: Rgb(97, 175, 239) -> cube steps
+        // (2, 3, 5) -> 16 + 36*2 + 6*3 + 5 = 111 (see Theme::degraded's
+        // rounding formula in ui/src/theme/mod.rs).
+        let degraded = for_terminal(theme.clone(), false);
+        assert_eq!(degraded.accent, Color::Indexed(111));
+
+        // truecolor = true must not touch the color at all.
+        let kept = for_terminal(theme.clone(), true);
+        assert_eq!(kept.accent, theme.accent);
+    }
+
+    /// The plan names this test `theme_change_bumps_generation_and_clears_cache`,
+    /// but live theme toggling isn't wired yet (see architecture.md §4.9's
+    /// staging note and this task's main.rs wiring, which only picks a
+    /// theme once at startup) — there is no runtime "theme change" event to
+    /// bump anything. What *does* exist, and is exercised here instead: (1)
+    /// two themes loaded from different sources really do differ, so a
+    /// hypothetical generation bump would matter, and (2) `LayoutKey`'s
+    /// `theme_generation` field already makes the cache treat different
+    /// generations as different entries (the mechanism `theme_generation`
+    /// exists to drive), independent of every other key field.
+    #[test]
+    fn loaded_themes_differ_and_theme_generation_key_component_misses_independently() {
+        let default = Theme::default_dark();
+        let custom = parse("accent = \"#ff00ff\"").expect("fixture must parse");
+
+        assert_ne!(
+            default.accent, custom.accent,
+            "a loaded theme must actually differ from default_dark for the cache-miss below to mean anything"
+        );
+
+        let mut cache = LayoutCache::new();
+        let base_key = LayoutKey {
+            message_id: MessageId(1),
+            width: 80,
+            theme_generation: 0,
+            spoilers_revealed: false,
+        };
+        let other_generation_key = LayoutKey {
+            theme_generation: 1,
+            ..base_key
+        };
+
+        cache.get_or_insert_with(base_key, || vec![Line::from("styled with default")]);
+
+        let mut called = false;
+        cache.get_or_insert_with(other_generation_key, || {
+            called = true;
+            vec![Line::from("styled with custom")]
+        });
+
+        assert!(
+            called,
+            "a different theme_generation must miss the cache even with every other key field unchanged"
+        );
+    }
+}
