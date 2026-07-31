@@ -11,12 +11,7 @@ use tgt_core::app::{AppState, Screen};
 use crate::render::cache::LayoutCache;
 use crate::theme::Theme;
 
-// `cache` is unused here: no view under `Screen` reads from it yet. T23
-// wires the conversation view's `get_or_insert_with` calls through it; this
-// arity exists now so every caller (runtime_loop, tests) already threads the
-// cache and doesn't need a signature-breaking follow-up change at T23.
 pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
-    let _ = cache;
     match state.screen {
         // The auth wizard owns the whole frame; it is a screen, not a pane.
         Screen::Auth => view::auth::draw(state, theme, f),
@@ -24,7 +19,7 @@ pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCa
         // consent screen exists nothing ever sets that screen (main.rs boots
         // with `consent_needed: false`), so falling through to the shell is
         // unreachable rather than wrong.
-        Screen::Consent | Screen::Main => view::root::draw(state, theme, f),
+        Screen::Consent | Screen::Main => view::root::draw(state, theme, f, cache),
     }
 }
 

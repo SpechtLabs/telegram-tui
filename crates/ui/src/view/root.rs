@@ -8,12 +8,15 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
 
+use crate::render::cache::LayoutCache;
 use crate::theme::Theme;
-use crate::view::{header, hint_bar};
+use crate::view::{chat_list, conversation, header, hint_bar};
 
 const SIDEBAR_WIDTH: u16 = 30;
 
-pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
+/// `cache` is threaded down to the conversation pane, the only view that lays
+/// messages out and therefore the only one that can hit or fill it.
+pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme.surface)), area);
 
@@ -30,20 +33,12 @@ pub fn draw(state: &AppState, theme: &Theme, f: &mut Frame) {
         Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
             .areas(content_area);
 
-    draw_sidebar(sidebar_area, theme, f);
-    draw_main(main_area, state, theme, f);
+    chat_list::draw(sidebar_area, state, theme, f);
+    draw_main(main_area, state, theme, f, cache);
     hint_bar::draw(hint_area, theme, f);
 }
 
-fn draw_sidebar(area: Rect, theme: &Theme, f: &mut Frame) {
-    let block = Block::bordered()
-        .title("CHATS")
-        .title_style(Style::new().fg(theme.text))
-        .border_style(Style::new().fg(theme.text_muted));
-    f.render_widget(block, area);
-}
-
-fn draw_main(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
+fn draw_main(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache) {
     let [header_area, conversation_area, composer_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -52,10 +47,7 @@ fn draw_main(area: Rect, state: &AppState, theme: &Theme, f: &mut Frame) {
     .areas(area);
 
     header::draw(header_area, state, theme, f);
-
-    // Message viewport: empty until T23 wires the conversation view in.
-    let conversation_block = Block::bordered().border_style(Style::new().fg(theme.text_muted));
-    f.render_widget(conversation_block, conversation_area);
+    conversation::draw(conversation_area, state, theme, f, cache);
 
     // Composer placeholder: real input handling lands in T30.
     let composer_block = Block::bordered().border_style(Style::new().fg(theme.text_muted));

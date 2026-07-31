@@ -28,6 +28,8 @@ use tokio::sync::{mpsc, watch};
 
 use tgt_core::action::{Action, IoErrorKind, IoResult, TdResult};
 use tgt_core::effect::{ConfigPatch, Effect};
+use tgt_core::model::ids::ChatId;
+use tgt_core::model::message::MessageView;
 use tgt_core::td::error::TdError;
 use tgt_core::td::request::{TdRequest, TdResponse, TdlibParams};
 use tgt_core::td::runtime::TdRuntime;
@@ -222,12 +224,24 @@ impl Inner {
 
 /// Which `TdResult` a request's response becomes. The mapping is by request
 /// kind alone — the domain context rides in the variant, so there are no
-/// correlation tokens to keep (architecture §8).
+/// correlation tokens to keep (architecture §8). What the domain cannot
+/// recover from the response alone travels in the variant instead:
+/// `getChatHistory` answers with a bare message list, so the chat it belongs
+/// to and the `only_local` flag it was asked with are copied out of the
+/// request here. The paging machine needs both (spec §5.2: an empty *local*
+/// response means something different from an empty remote one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Completion {
     Auth,
     Chats,
+    History {
+        chat_id: ChatId,
+        only_local: bool,
+    },
     LogOut,
+    /// Executed for its effect inside TDLib; whatever state it changes comes
+    /// back as a push update, so there is no completion action to send.
+    FireAndForget,
     /// Owned by a milestone that has not landed yet.
     Unwired,
 }
@@ -240,9 +254,23 @@ fn completion_for(request: &TdRequest) -> Completion {
         | TdRequest::CheckAuthenticationPassword { .. }
         | TdRequest::RequestQrCodeAuthentication => Completion::Auth,
         TdRequest::LoadChats { .. } => Completion::Chats,
+        TdRequest::GetChatHistory {
+            chat_id,
+            only_local,
+            ..
+        } => Completion::History {
+            chat_id: *chat_id,
+            only_local: *only_local,
+        },
+        // `openChat`/`closeChat` move TDLib's per-chat update subscription;
+        // `viewMessages` marks messages read. All three are answered with a
+        // bare `Ok` and their consequences arrive as updates.
+        TdRequest::OpenChat { .. }
+        | TdRequest::CloseChat { .. }
+        | TdRequest::ViewMessages { .. } => Completion::FireAndForget,
         TdRequest::LogOut => Completion::LogOut,
-        // History, send, edit, delete, forward, reactions, downloads and
-        // search complete into their own variants from T24 on.
+        // Send, edit, delete, forward, reactions, downloads and search
+        // complete into their own variants from M4 on.
         _ => Completion::Unwired,
     }
 }
@@ -251,14 +279,43 @@ fn map_completion(
     completion: Completion,
     outcome: Result<TdResponse, TdError>,
 ) -> Option<TdResult> {
-    // Every completion wired so far only cares whether the request was
-    // accepted: the state that follows arrives as a push update.
-    let outcome = outcome.map(|_| ());
     match completion {
-        Completion::Auth => Some(TdResult::AuthRequestDone { outcome }),
-        Completion::Chats => Some(TdResult::ChatsLoaded { outcome }),
-        Completion::LogOut => Some(TdResult::LogOutDone { outcome }),
-        Completion::Unwired => None,
+        Completion::Auth => Some(TdResult::AuthRequestDone {
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::Chats => Some(TdResult::ChatsLoaded {
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::LogOut => Some(TdResult::LogOutDone {
+            outcome: outcome.map(|_| ()),
+        }),
+        Completion::History {
+            chat_id,
+            only_local,
+        } => Some(TdResult::HistoryLoaded {
+            chat_id,
+            only_local,
+            outcome: outcome.map(messages_of),
+        }),
+        Completion::FireAndForget | Completion::Unwired => None,
+    }
+}
+
+/// A `getChatHistory` that answers with anything other than a message list is
+/// reported as an empty page rather than dropped: empty is a value the paging
+/// machine has a rule for (retry — it is never proof of end-of-history), and
+/// swallowing the completion instead would strand `PagingState::Loading` with
+/// nothing to move it along.
+fn messages_of(response: TdResponse) -> Vec<MessageView> {
+    match response {
+        TdResponse::Messages { messages } => messages,
+        other => {
+            tracing::debug!(
+                response = ?std::mem::discriminant(&other),
+                "getChatHistory answered with a non-Messages response; treated as an empty page"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -278,7 +335,30 @@ fn effect_kind(effect: &Effect) -> &'static str {
 mod tests {
     use super::*;
     use tgt_core::model::chat::ChatListId;
-    use tgt_core::td::fake::FakeTd;
+    use tgt_core::model::entity::FormattedText;
+    use tgt_core::model::ids::{MessageId, UserId};
+    use tgt_core::model::message::{MessageCaps, MessageContent, SendState, Sender};
+    use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
+
+    fn message(chat_id: ChatId, id: i64) -> MessageView {
+        MessageView {
+            id: MessageId(id),
+            chat_id,
+            sender: Sender::User(UserId(1)),
+            sender_name: "Ada".to_string(),
+            is_outgoing: false,
+            date: 1_700_000_000 + id,
+            content: MessageContent::Text(FormattedText {
+                text: format!("message {id}"),
+                entities: Vec::new(),
+            }),
+            reply_to: None,
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            caps: MessageCaps::default(),
+            is_edited: false,
+        }
+    }
 
     fn fake_runtime(fixture: &str) -> Arc<FakeTd> {
         Arc::new(FakeTd::from_jsonl(fixture).expect("fixture parses"))
@@ -352,6 +432,88 @@ mod tests {
             action_rx.recv().await.expect("completion action"),
             Action::TdResult(TdResult::ChatsLoaded { outcome: Ok(()) })
         ));
+    }
+
+    #[tokio::test]
+    async fn get_chat_history_completes_with_the_request_context_attached() {
+        let messages = vec![message(ChatId(9), 100), message(ChatId(9), 101)];
+        let script = ScriptStep::Await {
+            expect: RequestMatcher::Kind("GetChatHistory".to_string()),
+            respond: RespondWith::Ok(TdResponse::Messages {
+                messages: messages.clone(),
+            }),
+        };
+        let fixture = serde_json::to_string(&script).unwrap();
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(fake_runtime(&fixture), Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::GetChatHistory {
+            chat_id: ChatId(9),
+            from_message_id: tgt_core::model::ids::MessageId(0),
+            limit: 50,
+            only_local: false,
+        }));
+
+        let action = action_rx.recv().await.expect("completion action");
+        // The response is a bare message list: which chat it belongs to and
+        // which flag it was asked with can only come from the request.
+        let Action::TdResult(TdResult::HistoryLoaded {
+            chat_id,
+            only_local,
+            outcome,
+        }) = action
+        else {
+            panic!("expected HistoryLoaded, got {action:?}");
+        };
+        assert_eq!(chat_id, ChatId(9));
+        assert!(!only_local);
+        assert_eq!(outcome.unwrap(), messages);
+    }
+
+    #[tokio::test]
+    async fn history_response_without_messages_is_an_empty_page_not_a_dropped_completion() {
+        // `FakeTd` answers an unscripted request with a bare `Ok`. The paging
+        // machine must still hear about it (spec §5.2), as an empty page.
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(fake_runtime(""), Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::GetChatHistory {
+            chat_id: ChatId(9),
+            from_message_id: tgt_core::model::ids::MessageId(0),
+            limit: 50,
+            only_local: true,
+        }));
+
+        let action = action_rx.recv().await.expect("completion action");
+        assert!(matches!(
+            action,
+            Action::TdResult(TdResult::HistoryLoaded {
+                chat_id: ChatId(9),
+                only_local: true,
+                outcome: Ok(ref msgs),
+            }) if msgs.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn view_messages_reaches_tdlib_without_a_completion_action() {
+        let fake = fake_runtime("");
+        let (dispatcher, mut action_rx, _quit_rx) =
+            dispatcher_with(Arc::clone(&fake) as Arc<dyn TdRuntime>, Config::default());
+
+        dispatcher.dispatch(Effect::Td(TdRequest::ViewMessages {
+            chat_id: ChatId(9),
+            message_ids: vec![tgt_core::model::ids::MessageId(1)],
+        }));
+
+        for _ in 0..50 {
+            if !fake.received().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(fake.received().len(), 1);
+        assert!(action_rx.try_recv().is_err());
     }
 
     #[tokio::test]
