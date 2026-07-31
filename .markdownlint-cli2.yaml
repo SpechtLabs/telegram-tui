@@ -1,0 +1,52 @@
+config:
+  # Default state for all rules
+  default: true
+
+  # MD013: Disable line length rule
+  MD013: false
+  MD024: false
+  MD038: false
+  MD060: false
+
+  # MD014: The `terminal` container parses a leading `$ ` to tell a command
+  # apart from its output, so command-only blocks inside one are deliberate.
+  MD014: false
+
+  # MD033: Allow the small set of inline HTML the theme's components need
+  MD033:
+    allowed_elements:
+      - div
+      - br
+      - p
+      - img
+      - kbd
+
+  # MD036: Allow bold labels used as pseudo-headings. The CLI reference
+  # deliberately uses **Synopsis** / **Description** / **Flags** as compact
+  # per-command labels rather than headings, to keep them out of the page TOC.
+  MD036: false
+
+  # MD040: Require language specification for fenced code blocks
+  # All code blocks must have a language tag for syntax highlighting
+  MD040: true
+
+  # MD046: Disable code block style rule
+  # The `terminal` and `cast` containers wrap fenced blocks in indented
+  # context, which trips the consistency check.
+  MD046: false
+
+# The documentation website is what this config governs, and the workflow's
+# markdownlint job runs the same glob.
+globs:
+  - "docs/**/*.md"
+
+ignores:
+  - "docs/node_modules/**"
+  # Engineering documents, not website content. The architecture contract, the
+  # build plan, the design language, and the product spec live in the repo for
+  # contributors; they are excluded from the built site via `pagePatterns` in
+  # docs/.vuepress/config.ts and follow their own formatting conventions.
+  - "docs/architecture.md"
+  - "docs/plan.md"
+  - "docs/design-language.md"
+  - "docs/superpowers/**"

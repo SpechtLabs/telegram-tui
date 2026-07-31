@@ -3,3 +3,9 @@
 *.pdb
 dist/
 .env.local
+
+# Documentation website build output and dependencies
+docs/node_modules/
+docs/.vuepress/.cache/
+docs/.vuepress/.temp/
+docs/.vuepress/dist/
