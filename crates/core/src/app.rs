@@ -14,7 +14,7 @@ use crate::state::composer::{self, ComposerState};
 use crate::state::consent::{ConsentChoice, ConsentState};
 use crate::state::conversation::{self, ConversationState};
 use crate::state::focus::{Focus, FocusStack};
-use crate::state::media::MediaState;
+use crate::state::media::{self, MediaState};
 use crate::state::modal::{self, ModalState};
 use crate::state::palette::PaletteState;
 use crate::state::presence::{self, PresenceState};
@@ -256,6 +256,15 @@ impl App {
             }) => {
                 self.dirty = true;
                 selection::handle_td_result(&mut self.state, chat_id, message_id, &outcome)
+            }
+            // `DownloadFile`'s answer: on `Ok` the file table gets its first
+            // (or updated) snapshot — same shape as the `updateFile` push
+            // below, so always render-worthy either way (a failure at least
+            // clears the optimistic `is_downloading` bit, per
+            // `media::handle_td_result`'s doc comment).
+            Action::TdResult(TdResult::DownloadStarted { file_id, outcome }) => {
+                self.dirty = true;
+                media::handle_td_result(&mut self.state, file_id, &outcome)
             }
             // Paste and the remaining completions land with the tasks that
             // own their state. T32 wired the dispatcher end of all of them,
@@ -715,8 +724,15 @@ impl App {
                 }
                 effects
             }
-            // File updates arrive with M6.
-            _ => Vec::new(),
+            // `updateFile`: the download/upload progress table, plus (inside
+            // `media::handle_td`) any open selection's Download→Open chip
+            // flip. Always render-worthy — a progress bar or a completed
+            // download both change what the message row shows, and neither
+            // is worth the bookkeeping to detect a no-op push here.
+            TdUpdate::File(_) => {
+                self.dirty = true;
+                media::handle_td(&mut self.state, update)
+            }
         }
     }
 
