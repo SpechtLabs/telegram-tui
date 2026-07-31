@@ -2418,6 +2418,38 @@ actually trigger a page today, jumping to an unloaded quote will not
 either; that is a pre-existing `state::search` question, not a new one this
 amendment introduces.
 
+### 7.5.2 `CloseChat` when the conversation stops being visible, not just when it changes (T77 task #70, 2026-07-31)
+
+`close_previous_chat` (task #6, §7.5.1's neighbor) fires when `open_chat`
+itself changes — switching chats. It cannot see the case this amendment
+closes: the *same* chat staying `open_chat`, but no longer actually on
+screen, because focus moved back to the chat list while `view::root`'s
+single-pane stack was showing the conversation. Two transitions can do that
+with no chat switch at all: `Esc` back to the list, and a resize that
+crosses the breakpoint with focus already on the list (two-pane shows both
+panes regardless of focus, so landing there before a shrink is ordinary).
+
+```rust
+// core/src/app.rs
+pub fn conversation_pane_visible(state: &AppState) -> bool;
+```
+
+A pure function of `screen`, `open_chat`, `width`, `layout_breakpoint_cols`
+and `focus` — all `AppState` fields already, not a fact core has to import
+from the view. `view::root` calls it too, replacing what used to be its own
+inline copy of the same three-field comparison (`showing_chat_list`) — one
+implementation rather than two that could drift apart. `escape()` changed
+its return type from `bool` to `Option<Vec<Effect>>` to carry the resulting
+`CloseChat` (matching every other `route_*_key` in the table, which this
+brings it in line with); `Action::Resize` snapshots the predicate before
+updating `width`, since the predicate itself reads the field the action is
+about to change.
+
+`quit` and `logOut` were checked and deliberately excluded: neither passes
+through `escape()` or `Action::Resize`, and both tear down the whole
+session regardless, so there is nothing for a `CloseChat` to accomplish
+ahead of it.
+
 ## 8. Decisions the spec delegated
 
 | Decision | Choice | Rationale |

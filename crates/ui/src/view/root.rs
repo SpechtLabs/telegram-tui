@@ -21,20 +21,23 @@
 //! the *padded* rects: the map has to describe the cells that were actually
 //! painted.
 //!
-//! Which single-pane screen shows is a pure function of state: no open chat,
-//! or focus still on the chat list / its filter, shows the list; otherwise
-//! (a chat is open and focus has moved off the list, i.e. onto the composer
-//! or selection mode) shows the conversation behind a breadcrumb. `Esc`'s
-//! "back to the chat list" is core's job (T28's `escape`, which swaps the
-//! focus base back to `Focus::ChatList` without touching `open_chat`) — this
-//! view only reads the result.
+//! Which single-pane screen shows is `tgt_core::app::conversation_pane_visible`
+//! (T77 task #70): no open chat, or focus still on the chat list / its
+//! filter, shows the list; otherwise (a chat is open and focus has moved
+//! off the list, i.e. onto the composer or selection mode) shows the
+//! conversation behind a breadcrumb. `Esc`'s "back to the chat list" is
+//! core's job (`escape`, which swaps the focus base back to
+//! `Focus::ChatList` and — since that function's own signature change —
+//! also closes the chat with TDLib exactly when this view would stop
+//! drawing it); this view only reads the result, via the same shared
+//! function core uses to decide that.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use tgt_core::app::AppState;
+use tgt_core::app::{AppState, conversation_pane_visible};
 use tgt_core::model::hit::{HitTarget, ScrollArea};
 use tgt_core::state::focus::Focus;
 
@@ -254,8 +257,12 @@ fn draw_single_pane(
     rs: &mut RenderState,
     hits: &mut HitMap,
 ) {
-    let showing_chat_list = state.open_chat.is_none()
-        || matches!(state.focus.current(), Focus::ChatList | Focus::ChatFilter);
+    // `conversation_pane_visible` (architecture §7.5.1's neighbor, T77 task
+    // #70): core needs the identical fact to decide whether leaving the
+    // conversation side should tell TDLib the chat is no longer open, so it
+    // lives there and this calls it rather than keeping a second copy of
+    // the same three-field comparison that could drift from it.
+    let showing_chat_list = !conversation_pane_visible(state);
 
     if showing_chat_list {
         let [list_area, bottom_area] =

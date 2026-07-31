@@ -90,7 +90,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::app::AppState;
+use crate::app::{AppState, conversation_pane_visible};
 use crate::effect::Effect;
 use crate::model::entity::EntityKind;
 use crate::model::ids::{ChatId, MessageId};
@@ -248,6 +248,28 @@ pub fn close_previous_chat(app: &AppState, new_chat_id: ChatId) -> Vec<Effect> {
             vec![Effect::Td(TdRequest::CloseChat { chat_id: previous })]
         }
         _ => Vec::new(),
+    }
+}
+
+/// `CloseChat` if a transition took the open chat from visible to
+/// not-visible without the user ever picking a different chat (task #70):
+/// `Esc` back to the single-pane chat list, or a resize that crosses the
+/// breakpoint with focus still on the chat list. `was_visible` is the
+/// caller's own snapshot of [`conversation_pane_visible`] from *before*
+/// whatever it just did — this only reads the state *after*, so the two
+/// together are the transition. Distinct from [`close_previous_chat`]: that
+/// one fires when a different chat is about to become the one that is
+/// open; this one fires when the same chat stops being visible without
+/// `open_chat` itself ever changing, which `close_previous_chat`'s
+/// before/after diff on `open_chat` cannot see at all.
+pub fn close_if_now_hidden(app: &AppState, was_visible: bool) -> Vec<Effect> {
+    let Some(chat_id) = app.open_chat else {
+        return Vec::new();
+    };
+    if was_visible && !conversation_pane_visible(app) {
+        vec![Effect::Td(TdRequest::CloseChat { chat_id })]
+    } else {
+        Vec::new()
     }
 }
 
@@ -1216,6 +1238,35 @@ mod tests {
             effects[0],
             Effect::Td(TdRequest::CloseChat { chat_id: CHAT })
         ));
+    }
+
+    #[test]
+    fn close_if_now_hidden_fires_only_on_a_visible_to_hidden_transition() {
+        let mut app = fixture_state();
+        // No chat open at all: nothing to close, whatever the snapshot says.
+        assert!(close_if_now_hidden(&app, true).is_empty());
+
+        open(&mut app, CHAT);
+        // Single-pane, focus on the list: not visible right now.
+        app.width = 80;
+        app.layout_breakpoint_cols = 100;
+        app.focus = FocusStack::new(Focus::ChatList);
+
+        // Was visible before, hidden now: the transition this exists for.
+        let effects = close_if_now_hidden(&app, true);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Td(TdRequest::CloseChat { chat_id: CHAT })
+        ));
+
+        // Was already hidden: no transition, nothing to close.
+        assert!(close_if_now_hidden(&app, false).is_empty());
+
+        // Visible both before and after (focus back on the composer): also
+        // no transition.
+        app.focus = FocusStack::new(Focus::Composer);
+        assert!(close_if_now_hidden(&app, true).is_empty());
     }
 
     fn msg_with_spoiler(id: i64) -> MessageView {

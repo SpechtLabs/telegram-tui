@@ -96,6 +96,35 @@ pub struct Boot {
     pub auto_download_photos: bool,
 }
 
+/// Whether the conversation pane — not the chat list — is what's actually
+/// on screen right now (architecture §7.5.1's neighbor, T77 task #70).
+///
+/// Two-pane draws the sidebar and the conversation together regardless of
+/// focus, so a chat being open is enough there. Below the breakpoint,
+/// `view::root`'s single-pane stack shows the conversation only once a chat
+/// is open *and* focus has left the chat list / its filter — otherwise the
+/// list fills the screen and the conversation is not drawn at all. Both
+/// `escape()`'s "back to the list" transition and a resize crossing the
+/// breakpoint (`Action::Resize`) can flip this without the user ever
+/// picking a different chat, and both need to know when they did: TDLib's
+/// `openChat` governs a subscription for a chat believed to be actively
+/// viewed, and this client can only ever be looking at one place at a time.
+///
+/// A single implementation rather than two that could drift: `view::root`
+/// calls this too, in place of reimplementing the same three-field
+/// comparison — `width`, `layout_breakpoint_cols` and `focus` are already
+/// `AppState` fields, not a UI-only fact core would otherwise have to
+/// reach for.
+pub fn conversation_pane_visible(state: &AppState) -> bool {
+    if state.screen != Screen::Main || state.open_chat.is_none() {
+        return false;
+    }
+    if state.width >= state.layout_breakpoint_cols {
+        return true;
+    }
+    !matches!(state.focus.current(), Focus::ChatList | Focus::ChatFilter)
+}
+
 #[derive(Debug)]
 pub struct App {
     state: AppState,
@@ -213,10 +242,17 @@ impl App {
                 effects
             }
             Action::Resize { width, height } => {
+                // Crossing the breakpoint downward with focus still on the
+                // chat list can stop rendering the open chat without any
+                // key press at all (task #70): a resize is exactly as
+                // capable of hiding the conversation as `Esc` is, and
+                // `conversation_pane_visible` reads `width` itself, so the
+                // snapshot has to come from *before* it changes below.
+                let was_visible = conversation_pane_visible(&self.state);
                 self.state.width = width;
                 self.state.height = height;
                 self.dirty = true;
-                Vec::new()
+                conversation::close_if_now_hidden(&self.state, was_visible)
             }
             Action::Key(key) => self.route_key(key),
             // Bracketed paste. `handle_paste` decides between inserting the
@@ -508,7 +544,7 @@ impl App {
         //    `None` for it (chat_list while filtering, selection mode) so
         //    that the one stack rule lives in one place.
         if key == Key::Esc {
-            return self.escape().then(Vec::new);
+            return self.escape();
         }
 
         if self.state.screen != Screen::Main {
@@ -777,9 +813,12 @@ impl App {
     }
 
     /// `Esc` pops exactly one level and never the base (architecture §4.5).
-    /// Returns whether it was claimed.
+    /// Returns `None` if unclaimed, mirroring every `route_*_key` below —
+    /// this used to just report whether it was claimed, but the single-pane
+    /// "back to the list" transition can now emit `CloseChat` (task #70), so
+    /// it needs the same effect-carrying shape as the rest of the table.
     ///
-    /// Two things sit above that rule, in this order:
+    /// Two things sit above the pop rule, in this order:
     ///
     /// 1. **A toast, if any is showing** (spec §6.4: toasts are "dismissible
     ///    with `esc`"). They are not on the focus stack at all, so the two
@@ -796,17 +835,24 @@ impl App {
     ///    table, so the archive case is asked here explicitly — otherwise
     ///    the generic rule below would run first and `Esc` would leave the
     ///    conversation instead of the archive.
-    fn escape(&mut self) -> bool {
+    fn escape(&mut self) -> Option<Vec<Effect>> {
         if toasts::dismiss_newest(&mut self.state) {
             self.dirty = true;
-            return true;
+            return Some(Vec::new());
         }
         if matches!(self.state.focus.current(), Focus::ChatList)
             && chat_list::handle_key(&mut self.state, Key::Esc).is_some()
         {
             self.dirty = true;
-            return true;
+            return Some(Vec::new());
         }
+
+        // Snapshot before the match: only the `_` arm's `replace_base` can
+        // possibly change it (module docs), but reading it once up here
+        // rather than duplicated in that one arm keeps the diff-and-close
+        // pattern identical to `Action::Resize`'s.
+        let was_visible = conversation_pane_visible(&self.state);
+        let mut effects = Vec::new();
 
         match self.state.focus.current().clone() {
             // Leaving selection mode drops the selection: T26 splits the
@@ -846,14 +892,21 @@ impl App {
                     // the single-pane stack layout (spec §6.1) and the way
                     // out of the conversation in the two-pane one. The base
                     // is swapped, not popped: the stack floor still holds.
+                    //
+                    // In two-pane this changes nothing `conversation_pane_
+                    // visible` cares about (it stays visible regardless of
+                    // focus there); in single-pane it is exactly the
+                    // transition that stops rendering the conversation, so
+                    // the close check below is what actually fires here.
                     self.state.focus.replace_base(Focus::ChatList);
                 } else {
-                    return false;
+                    return None;
                 }
             }
         }
+        effects.extend(conversation::close_if_now_hidden(&self.state, was_visible));
         self.dirty = true;
-        true
+        Some(effects)
     }
 
     /// Pane movement (spec §6.2): `←`/`→` move, `tab`/`shift+tab` cycle.
@@ -2978,6 +3031,107 @@ mod routing {
             Some(NEWEST),
             "right-click selects the containing message, not the quoted one"
         );
+    }
+
+    // --- conversation_pane_visible / task #70 ------------------------------
+
+    #[test]
+    fn conversation_pane_visible_true_in_two_pane_regardless_of_focus() {
+        let app = chat_open(); // width 120 >= breakpoint 100: two-pane.
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert!(conversation_pane_visible(app.state()));
+    }
+
+    #[test]
+    fn conversation_pane_visible_requires_an_open_chat() {
+        let app = logged_in();
+        assert!(app.state().open_chat.is_none());
+        assert!(!conversation_pane_visible(app.state()));
+    }
+
+    /// The exact fact `draw_single_pane` renders on, restated as an
+    /// assertion rather than trusted by construction: below the breakpoint,
+    /// visibility tracks focus (list vs. everything else), where above it
+    /// visibility never does (previous test).
+    #[test]
+    fn conversation_pane_visible_tracks_focus_only_below_the_breakpoint() {
+        let mut app = chat_open();
+        app.update(Action::Resize {
+            width: 80,
+            height: 40,
+        });
+        assert!(
+            conversation_pane_visible(app.state()),
+            "focus is still Composer: the conversation should still be up"
+        );
+
+        app.update(Action::Key(Key::Esc));
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert!(!conversation_pane_visible(app.state()));
+    }
+
+    /// The scenario task #70 exists for: `Esc` back to the chat list in
+    /// single-pane stops rendering the conversation, so TDLib has to be
+    /// told. Two-pane keeps rendering it regardless of focus, so the same
+    /// key must emit nothing.
+    #[test]
+    fn esc_to_chat_list_closes_the_chat_in_single_pane_but_not_two_pane() {
+        let mut single = chat_open();
+        single.update(Action::Resize {
+            width: 80,
+            height: 40,
+        });
+        single.take_dirty();
+        let effects = single.update(Action::Key(Key::Esc));
+        assert_eq!(*single.state().focus.current(), Focus::ChatList);
+        assert_eq!(describe(&effects), ["Td(CloseChat)"]);
+
+        let mut two = chat_open(); // width 120: never resized, stays two-pane.
+        two.take_dirty();
+        let effects = two.update(Action::Key(Key::Esc));
+        assert_eq!(*two.state().focus.current(), Focus::ChatList);
+        assert!(
+            effects.is_empty(),
+            "the conversation is still on screen in two-pane: nothing to close"
+        );
+    }
+
+    /// Team lead's follow-up scenario: shrinking the terminal across the
+    /// breakpoint can hide the conversation with no key pressed at all, if
+    /// focus already happens to be on the chat list from before the resize
+    /// (two-pane shows both panes regardless of focus, so that is a normal
+    /// thing to have done there).
+    #[test]
+    fn resize_across_the_breakpoint_closes_a_now_hidden_chat() {
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Esc)); // focus -> ChatList, still two-pane.
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert!(conversation_pane_visible(app.state()));
+        app.take_dirty();
+
+        let effects = app.update(Action::Resize {
+            width: 80,
+            height: 40,
+        });
+        assert!(!conversation_pane_visible(app.state()));
+        assert_eq!(describe(&effects), ["Td(CloseChat)"]);
+    }
+
+    /// The same resize with focus left on the composer never hides the
+    /// conversation (single-pane still shows it), so it must emit nothing —
+    /// proving the resize handler is not just unconditionally closing on
+    /// every resize while a chat happens to be open.
+    #[test]
+    fn resize_across_the_breakpoint_emits_nothing_when_still_visible() {
+        let mut app = chat_open();
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+
+        let effects = app.update(Action::Resize {
+            width: 80,
+            height: 40,
+        });
+        assert!(conversation_pane_visible(app.state()));
+        assert!(effects.is_empty());
     }
 
     #[test]
