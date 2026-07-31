@@ -1553,6 +1553,8 @@ pub struct Theme {
     pub selection: Color,
     pub rail_own: Color,
     pub rail_other: Color,
+    /// Rules, separators, panel edges. Always dimmer than `text_muted`.
+    pub border: Color,
     /// Curated palette for deterministic per-sender accents.
     pub sender_palette: [Color; 8],
 }
@@ -1674,9 +1676,34 @@ use crate::theme::Theme;
 pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCache);
 ```
 
-Staging note (orchestrator, M1): until T21 creates `LayoutCache`, `view` is
-`view(state, theme, f)` — T21/T23 add the `cache` parameter together with the
-type. T08's runtime loop calls whichever arity currently exists.
+### 4.9.1 Render state (T63 amendment)
+
+Drawing needs three pieces of state that outlive a frame: the layout cache, the
+per-message inline-image handles, and the terminal's graphics capability. They
+travel together rather than as three parameters:
+
+```rust
+// ui/src/render/state.rs
+pub struct RenderState {
+    pub cache: LayoutCache,
+    /// Per-message `ImageArea`s. Protocol cells must be invalidated on scroll
+    /// or resize or they ghost (spec §8.3).
+    pub images: ImageStore,
+    /// `None` on terminals without a graphics protocol: every photo then falls
+    /// back to the one-line card (docs/design-language.md §4).
+    pub graphics: Option<crate::render::image::Capability>,
+}
+
+pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, rs: &mut RenderState) -> HitMap;
+```
+
+`tgt-app` owns the probe (`graphics::probe()`) and maps its `GraphicsProtocol`
+into `ui`'s `Capability` when constructing `RenderState`; the ui crate never
+reads the environment.
+
+Visual conventions (chrome, hierarchy, message and attachment rendering,
+selection, themes) are specified in `docs/design-language.md`, which supersedes
+the decoration implied by spec §6.1's mock.
 
 ---
 

@@ -19,6 +19,9 @@ pub struct Theme {
     pub selection: Color,
     pub rail_own: Color,
     pub rail_other: Color,
+    /// Rules, separators and panel edges. Always dimmer than `text_muted`:
+    /// chrome must never compete with content (docs/design-language.md §1).
+    pub border: Color,
     /// Curated palette for deterministic per-sender accents.
     pub sender_palette: [Color; 8],
 }
@@ -39,6 +42,7 @@ impl Theme {
             selection: Color::Rgb(49, 59, 79),
             rail_own: Color::Rgb(58, 105, 143),
             rail_other: Color::Rgb(97, 175, 239),
+            border: Color::Rgb(52, 57, 68),
             sender_palette: [
                 Color::Rgb(224, 108, 117), // red
                 Color::Rgb(209, 154, 102), // orange
@@ -72,6 +76,7 @@ impl Theme {
             selection: degrade(self.selection),
             rail_own: degrade(self.rail_own),
             rail_other: degrade(self.rail_other),
+            border: degrade(self.border),
             sender_palette: self.sender_palette.map(degrade),
         }
     }
