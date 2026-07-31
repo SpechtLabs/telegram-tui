@@ -1,0 +1,11 @@
+---
+source: crates/ui/src/render/message_layout.rs
+expression: rendered(&lines)
+---
+Alice · 22:13
+▏ bold italic underline strike ███████ code link url
+▏ mention hashtag
+▏ ── rust ──
+▏   fn main() {}
+▏ ──
+▏ ▎ a wise quote

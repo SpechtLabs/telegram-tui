@@ -56,20 +56,66 @@
 //! zone is a later polish concern; formatting local time here would make every
 //! layout test depend on the machine's `TZ`.
 //!
-//! ## Milestone scope
+//! ## Full entity set (T33)
 //!
-//! Styled entities this milestone: bold, italic, code, url/text_url. The
-//! remaining kinds (underline, strikethrough, spoiler, pre, blockquote,
-//! mention, hashtag) render as plain body text; T33 fills in the arms of
-//! [`entity_style`] without touching the slicing around it. Delivery ticks,
-//! reactions, and real download affordances on file cards are likewise later
-//! tasks (T33, T37).
+//! Every [`EntityKind`] now renders (spec §8.1): bold, italic, underline,
+//! strikethrough, code, url/text_url, mention, hashtag resolve through
+//! [`entity_style`] and the inline cut-point mechanism in [`styled_spans`]
+//! unchanged from T20. Two kinds need more than a `Style`:
+//!
+//! - **Spoiler** is inline but text-mutating: [`styled_spans`] takes a
+//!   `spoilers_revealed` flag (see "Reveal state" below) and, for any run
+//!   covered by a `Spoiler` entity while hidden, substitutes the rendered
+//!   text with `'█'` (U+2588 FULL BLOCK) — one block per *display column* of
+//!   the original grapheme (via `unicode-width`), so wrapping and alignment
+//!   downstream never see a length mismatch. Revealed spoilers keep their
+//!   real text and get `theme.surface_raised` as a background instead.
+//! - **Pre** and **Blockquote** are block-level: a code block needs a
+//!   language-label rule above and below it, a blockquote needs a prefix
+//!   glyph on every wrapped line, and both need their content re-wrapped at
+//!   a *narrower* width than the surrounding paragraph (their indent eats
+//!   into `inner`). That does not fit the inline cut-point model (which
+//!   produces spans, not extra lines/indentation), so [`text_lines`] first
+//!   calls [`split_blocks`] to slice the message's `FormattedText` into an
+//!   ordered run of plain-text and block segments — each block segment gets
+//!   its own re-based `FormattedText` (entity offsets shifted to be relative
+//!   to the slice) so nested inline formatting inside a quote or code block
+//!   still resolves through the normal [`styled_spans`] path. Plain segments
+//!   feed the pre-existing paragraph wrapper unchanged. This keeps the
+//!   function pure (no state, no I/O) and keeps the inline mechanism free of
+//!   block-layout concerns. A `Pre`/`Blockquote` nested inside another block
+//!   is not split further (real Telegram entities do not nest that way); if
+//!   one somehow slips through un-split, [`entity_style`] still gives it a
+//!   reasonable inline fallback rather than rendering unstyled.
+//!
+//! ## Reveal state and the opts API
+//!
+//! Spoiler reveal is tracked per-*message* (`ConversationState::revealed_spoilers:
+//! BTreeSet<MessageId>`, keyed into the layout cache as
+//! `LayoutKey::spoilers_revealed`), not per-span — a message's spoilers are
+//! all hidden or all shown together. But the architecture §4.9 signature
+//! (`layout_message(msg, width, theme)`) has no way to receive that bit.
+//! [`layout_message_opts`] is the real entry point now:
+//!
+//! ```text
+//! layout_message_opts(msg, width, theme, LayoutOptions { grouped, spoilers_revealed })
+//! ```
+//!
+//! [`layout_message`] and [`layout_message_grouped`] remain and keep their
+//! exact prior behavior (`spoilers_revealed: false`) as thin wrappers, so
+//! every existing call site keeps compiling and rendering unchanged. The
+//! conversation view (T23/T35) is expected to switch its cache-filling call
+//! to `layout_message_opts` with the real `revealed_spoilers` bit in its own
+//! task; until then messages render with spoilers hidden regardless of
+//! `ConversationState`, matching today's (pre-T33) on-screen behavior.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
-use tgt_core::model::entity::{EntityKind, FormattedText};
+use tgt_core::model::entity::{EntityKind, FormattedText, TextEntity};
 use tgt_core::model::message::{MessageContent, MessageView};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::render::offsets::utf16_span_to_byte_range;
 use crate::render::wrap::wrap_spans;
@@ -85,18 +131,54 @@ const RAIL: &str = "▏";
 /// Columns the rail and its adjoining space take on every body line.
 const RAIL_COLS: u16 = 2;
 
+/// Per-call rendering choices [`layout_message_opts`] cannot infer from
+/// `(msg, width, theme)` alone. See the module docs' "Reveal state and the
+/// opts API".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutOptions {
+    /// Omit the "Sender · HH:MM" header (this message groups under the
+    /// preceding one). Equivalent to choosing [`layout_message_grouped`]
+    /// over [`layout_message`].
+    pub grouped: bool,
+    /// Render this message's spoiler entities as real text (with a subtle
+    /// background) instead of filled blocks.
+    pub spoilers_revealed: bool,
+}
+
 /// Lay out a message including its "Sender · HH:MM" header.
 ///
-/// This is the architecture §4.9 signature, verbatim. Use
+/// This is the architecture §4.9 signature, verbatim: spoilers always render
+/// hidden. Use [`layout_message_opts`] to control reveal state, or
 /// [`layout_message_grouped`] for a message continuing the block above it.
 pub fn layout_message(msg: &MessageView, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    layout(msg, width, theme, true)
+    layout_message_opts(msg, width, theme, LayoutOptions::default())
 }
 
 /// Lay out a message that groups under the preceding message's header: same
-/// body, reply preview, and rail, no header line.
+/// body, reply preview, and rail, no header line. Spoilers always render
+/// hidden; use [`layout_message_opts`] to control reveal state.
 pub fn layout_message_grouped(msg: &MessageView, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    layout(msg, width, theme, false)
+    layout_message_opts(
+        msg,
+        width,
+        theme,
+        LayoutOptions {
+            grouped: true,
+            ..LayoutOptions::default()
+        },
+    )
+}
+
+/// Lay out a message with full control over grouping and spoiler reveal
+/// state. The real entry point behind [`layout_message`] and
+/// [`layout_message_grouped`] — see the module docs.
+pub fn layout_message_opts(
+    msg: &MessageView,
+    width: u16,
+    theme: &Theme,
+    opts: LayoutOptions,
+) -> Vec<Line<'static>> {
+    layout(msg, width, theme, !opts.grouped, opts.spoilers_revealed)
 }
 
 /// Whether `next` groups under `prev`'s header: same sender, same direction,
@@ -108,7 +190,13 @@ pub fn groups_with(prev: &MessageView, next: &MessageView) -> bool {
         && (0..=GROUP_WINDOW_SECS).contains(&next.date.saturating_sub(prev.date))
 }
 
-fn layout(msg: &MessageView, width: u16, theme: &Theme, with_header: bool) -> Vec<Line<'static>> {
+fn layout(
+    msg: &MessageView,
+    width: u16,
+    theme: &Theme,
+    with_header: bool,
+    spoilers_revealed: bool,
+) -> Vec<Line<'static>> {
     // Every body line reserves the rail column plus its separating space, so
     // the text block is `width - 2` wide. `wrap_spans` treats 0 as 1, but the
     // padding arithmetic below reads more clearly with the floor applied here.
@@ -145,7 +233,7 @@ fn layout(msg: &MessageView, width: u16, theme: &Theme, with_header: bool) -> Ve
         }
     }
 
-    for line in body(msg, inner, theme) {
+    for line in body(msg, inner, theme, spoilers_revealed) {
         lines.push(place(line, inner, own, Some(rail_style)));
     }
 
@@ -184,11 +272,16 @@ fn format_time_utc(unix_secs: i64) -> String {
 
 /// Content-dependent body lines, wrapped to `inner` columns but not yet
 /// railed or aligned.
-fn body(msg: &MessageView, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn body(
+    msg: &MessageView,
+    inner: u16,
+    theme: &Theme,
+    spoilers_revealed: bool,
+) -> Vec<Line<'static>> {
     let base = Style::new().fg(theme.text);
 
     match &msg.content {
-        MessageContent::Text(text) => text_lines(text, base, inner, theme),
+        MessageContent::Text(text) => text_lines(text, base, inner, theme, spoilers_revealed),
         MessageContent::Photo {
             width,
             height,
@@ -198,7 +291,7 @@ fn body(msg: &MessageView, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
             // A photo has no file name or size in the model; its dimensions
             // are the useful identifier until T38 renders it inline.
             let mut lines = file_card(&format!("photo {width}×{height}"), None, inner, theme);
-            lines.extend(text_lines(caption, base, inner, theme));
+            lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
             lines
         }
         MessageContent::Video {
@@ -208,7 +301,7 @@ fn body(msg: &MessageView, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
             ..
         } => {
             let mut lines = file_card(file_name, Some(*size), inner, theme);
-            lines.extend(text_lines(caption, base, inner, theme));
+            lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
             lines
         }
         MessageContent::Audio {
@@ -221,7 +314,7 @@ fn body(msg: &MessageView, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
             ..
         } => {
             let mut lines = file_card(file_name, Some(*size), inner, theme);
-            lines.extend(text_lines(caption, base, inner, theme));
+            lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
             lines
         }
         MessageContent::Sticker { emoji } => {
@@ -239,11 +332,256 @@ fn body(msg: &MessageView, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
 
 /// A `FormattedText` -> styled, wrapped lines. Empty text yields no lines (an
 /// absent caption must not cost a blank row).
-fn text_lines(text: &FormattedText, base: Style, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
+///
+/// Splits into plain and block ([`EntityKind::Pre`] / [`EntityKind::Blockquote`])
+/// segments first (see the module docs); each renders through its own path
+/// and the results concatenate in document order.
+fn text_lines(
+    text: &FormattedText,
+    base: Style,
+    inner: u16,
+    theme: &Theme,
+    spoilers_revealed: bool,
+) -> Vec<Line<'static>> {
     if text.text.is_empty() {
         return Vec::new();
     }
-    wrap_paragraphs(styled_spans(text, base, theme), inner)
+    let mut lines = Vec::new();
+    for segment in split_blocks(text) {
+        match segment.kind {
+            SegmentKind::Plain => lines.extend(wrap_paragraphs(
+                styled_spans(&segment.text, base, theme, spoilers_revealed),
+                inner,
+            )),
+            SegmentKind::Pre(language) => {
+                lines.extend(pre_block_lines(
+                    &segment.text,
+                    language,
+                    inner,
+                    theme,
+                    spoilers_revealed,
+                ));
+            }
+            SegmentKind::Blockquote => {
+                lines.extend(blockquote_lines(
+                    &segment.text,
+                    inner,
+                    theme,
+                    spoilers_revealed,
+                ));
+            }
+        }
+    }
+    lines
+}
+
+/// One contiguous run of a message's text: either ordinary inline-formatted
+/// text, or the content of a `Pre`/`Blockquote` block (with a re-based
+/// `FormattedText` — entity offsets shifted so they read as if the slice
+/// were its own message).
+struct Segment {
+    text: FormattedText,
+    kind: SegmentKind,
+}
+
+enum SegmentKind {
+    Plain,
+    Pre(Option<String>),
+    Blockquote,
+}
+
+/// Slice `text` into an ordered run of [`Segment`]s at every top-level
+/// `Pre`/`Blockquote` entity boundary. See the module docs' "Full entity set"
+/// section for why this exists instead of folding these kinds into
+/// [`styled_spans`].
+///
+/// A malformed block entity (invalid span, or overlapping a block already
+/// claimed) is dropped — its text still renders, as part of whichever plain
+/// segment covers it, exactly like any other invalid entity in this module.
+/// `Pre`/`Blockquote` entities nested inside another block are not
+/// recursively split; their text still renders (as part of the outer
+/// block's re-based `FormattedText`), just without their own rule/prefix
+/// treatment.
+fn split_blocks(text: &FormattedText) -> Vec<Segment> {
+    let raw = text.text.as_str();
+
+    let mut blocks: Vec<(Range<usize>, u32, u32, SegmentKind)> = Vec::new();
+    for entity in &text.entities {
+        let kind = match &entity.kind {
+            EntityKind::Pre { language } => SegmentKind::Pre(language.clone()),
+            EntityKind::Blockquote => SegmentKind::Blockquote,
+            _ => continue,
+        };
+        let Some(range) = utf16_span_to_byte_range(raw, entity.offset_utf16, entity.length_utf16)
+        else {
+            continue;
+        };
+        if range.is_empty() {
+            continue;
+        }
+        blocks.push((range, entity.offset_utf16, entity.length_utf16, kind));
+    }
+    blocks.sort_by_key(|(range, ..)| range.start);
+
+    let mut segments = Vec::new();
+    let mut byte_pos = 0usize;
+    let mut utf16_pos = 0u32;
+
+    for (range, utf16_off, utf16_len, kind) in blocks {
+        if range.start < byte_pos {
+            continue; // overlaps a block already claimed; malformed, drop it.
+        }
+
+        // The plain run before this block, minus its one separating
+        // newline (if any) so the block's own rule/prefix line supplies the
+        // visual break instead of `wrap_paragraphs` adding a spurious blank
+        // line for a paragraph that ends in "\n" with nothing after it.
+        let mut plain_end = range.start;
+        if plain_end > byte_pos && raw.as_bytes()[plain_end - 1] == b'\n' {
+            plain_end -= 1;
+        }
+        if plain_end > byte_pos {
+            segments.push(sub_segment(
+                text,
+                byte_pos,
+                plain_end,
+                utf16_pos,
+                SegmentKind::Plain,
+            ));
+        }
+
+        segments.push(sub_segment(text, range.start, range.end, utf16_off, kind));
+
+        byte_pos = range.end;
+        utf16_pos = utf16_off + utf16_len;
+        // Symmetric trim on the way out: skip the newline that separates
+        // this block from whatever follows.
+        if raw.as_bytes().get(byte_pos) == Some(&b'\n') {
+            byte_pos += 1;
+            utf16_pos += 1;
+        }
+    }
+
+    if byte_pos < raw.len() {
+        segments.push(sub_segment(
+            text,
+            byte_pos,
+            raw.len(),
+            utf16_pos,
+            SegmentKind::Plain,
+        ));
+    }
+    if segments.is_empty() {
+        segments.push(sub_segment(text, 0, raw.len(), 0, SegmentKind::Plain));
+    }
+    segments
+}
+
+/// Build one [`Segment`] covering `raw[start_byte..end_byte]`, re-basing
+/// every entity fully contained in that byte range to be relative to it
+/// (`start_utf16` is the UTF-16 offset of `start_byte`, known exactly from
+/// the caller's walk rather than re-derived). `Pre`/`Blockquote` entities are
+/// never copied into the re-based set — they define segments, they are not
+/// inline styling within one (see `split_blocks`'s no-nesting note).
+fn sub_segment(
+    text: &FormattedText,
+    start_byte: usize,
+    end_byte: usize,
+    start_utf16: u32,
+    kind: SegmentKind,
+) -> Segment {
+    let raw = text.text.as_str();
+    let sub_text = raw[start_byte..end_byte].to_string();
+
+    let mut entities = Vec::new();
+    for entity in &text.entities {
+        if matches!(entity.kind, EntityKind::Pre { .. } | EntityKind::Blockquote) {
+            continue;
+        }
+        let Some(range) = utf16_span_to_byte_range(raw, entity.offset_utf16, entity.length_utf16)
+        else {
+            continue;
+        };
+        if range.is_empty() || range.start < start_byte || range.end > end_byte {
+            continue;
+        }
+        entities.push(TextEntity {
+            offset_utf16: entity.offset_utf16.saturating_sub(start_utf16),
+            length_utf16: entity.length_utf16,
+            kind: entity.kind.clone(),
+        });
+    }
+
+    Segment {
+        text: FormattedText {
+            text: sub_text,
+            entities,
+        },
+        kind,
+    }
+}
+
+/// A `pre` code block: a dim top rule carrying the language label (omitted
+/// when `language` is `None`), the content in [`EntityKind::Code`] styling
+/// wrapped at a narrower width (the block indent eats into `inner`), and a
+/// dim bottom rule.
+fn pre_block_lines(
+    text: &FormattedText,
+    language: Option<String>,
+    inner: u16,
+    theme: &Theme,
+    spoilers_revealed: bool,
+) -> Vec<Line<'static>> {
+    const INDENT: u16 = 2;
+    let dim = Style::new().fg(theme.text_muted);
+    let code_style = Style::new().bg(theme.surface_raised).fg(theme.text);
+    let code_width = inner.saturating_sub(INDENT).max(1);
+
+    let mut lines = Vec::with_capacity(4);
+    let rule = match language.filter(|lang| !lang.is_empty()) {
+        Some(lang) => format!("── {lang} ──"),
+        None => "──".to_string(),
+    };
+    lines.push(Line::from(vec![Span::styled(rule, dim)]));
+
+    for line in wrap_paragraphs(
+        styled_spans(text, code_style, theme, spoilers_revealed),
+        code_width,
+    ) {
+        let mut spans = vec![Span::raw(" ".repeat(INDENT as usize))];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(vec![Span::styled("──".to_string(), dim)]));
+    lines
+}
+
+/// A blockquote: every wrapped line prefixed with a dim `▎ `, content in
+/// `text_muted` (nested entities inside the quote still resolve through
+/// [`styled_spans`] and merge over that base).
+fn blockquote_lines(
+    text: &FormattedText,
+    inner: u16,
+    theme: &Theme,
+    spoilers_revealed: bool,
+) -> Vec<Line<'static>> {
+    const PREFIX: &str = "▎ ";
+    let prefix_width = PREFIX.width() as u16;
+    let muted = Style::new().fg(theme.text_muted);
+    let content_width = inner.saturating_sub(prefix_width).max(1);
+
+    wrap_paragraphs(
+        styled_spans(text, muted, theme, spoilers_revealed),
+        content_width,
+    )
+    .into_iter()
+    .map(|line| {
+        let mut spans = vec![Span::styled(PREFIX, muted)];
+        spans.extend(line.spans);
+        Line::from(spans)
+    })
+    .collect()
 }
 
 /// The placeholder card of spec §7.1:
@@ -290,13 +628,26 @@ fn format_size(bytes: u64) -> String {
 /// Overlap and nesting resolve by cutting the text at every entity boundary
 /// and patching the styles of all entities covering each resulting run, in
 /// document order. Non-conflicting attributes therefore merge (bold inside a
-/// link is bold *and* underlined) while conflicting ones are last-wins. T33
-/// extends this with the kinds needing structural treatment (blockquote, pre
-/// with a language label, spoilers).
-fn styled_spans(text: &FormattedText, base: Style, theme: &Theme) -> Vec<Span<'static>> {
+/// link is bold *and* underlined) while conflicting ones are last-wins.
+///
+/// `Spoiler` is the one kind that mutates text rather than only styling it:
+/// while `!spoilers_revealed`, any run fully covered by a `Spoiler` entity
+/// has its text replaced with `'█'` — one block per display column of the
+/// original grapheme (grapheme- and width-aware, like `render::wrap`, so a
+/// hidden run costs exactly as many columns as the text it hides) — in
+/// `theme.text_muted`, overriding whatever else `entity_style` computed for
+/// that run (nested formatting inside a hidden spoiler is moot: the text
+/// isn't shown). Revealed spoilers take the normal merge path.
+fn styled_spans(
+    text: &FormattedText,
+    base: Style,
+    theme: &Theme,
+    spoilers_revealed: bool,
+) -> Vec<Span<'static>> {
     let raw = text.text.as_str();
 
     let mut resolved: Vec<(Range<usize>, Style)> = Vec::new();
+    let mut hidden_spoiler_ranges: Vec<Range<usize>> = Vec::new();
     for entity in &text.entities {
         let Some(range) = utf16_span_to_byte_range(raw, entity.offset_utf16, entity.length_utf16)
         else {
@@ -310,10 +661,10 @@ fn styled_spans(text: &FormattedText, base: Style, theme: &Theme) -> Vec<Span<'s
         if range.is_empty() {
             continue;
         }
-        let Some(style) = entity_style(&entity.kind, theme) else {
-            continue;
-        };
-        resolved.push((range, style));
+        if matches!(entity.kind, EntityKind::Spoiler) && !spoilers_revealed {
+            hidden_spoiler_ranges.push(range.clone());
+        }
+        resolved.push((range, entity_style(&entity.kind, theme, spoilers_revealed)));
     }
 
     if resolved.is_empty() {
@@ -336,6 +687,19 @@ fn styled_spans(text: &FormattedText, base: Style, theme: &Theme) -> Vec<Span<'s
     let mut spans = Vec::with_capacity(cuts.len().saturating_sub(1));
     for pair in cuts.windows(2) {
         let (start, end) = (pair[0], pair[1]);
+
+        let hidden = hidden_spoiler_ranges
+            .iter()
+            .any(|r| r.start <= start && end <= r.end);
+        if hidden {
+            let blocks: String = raw[start..end]
+                .graphemes(true)
+                .map(|g| "█".repeat(g.width().max(1)))
+                .collect();
+            spans.push(Span::styled(blocks, Style::new().fg(theme.text_muted)));
+            continue;
+        }
+
         let mut style = base;
         for (range, covering) in &resolved {
             if range.start <= start && end <= range.end {
@@ -347,31 +711,41 @@ fn styled_spans(text: &FormattedText, base: Style, theme: &Theme) -> Vec<Span<'s
     spans
 }
 
-/// Entity kind -> style, or `None` for the kinds this milestone renders plain.
+/// Entity kind -> inline style (spec §8.1's full entity set).
 ///
-/// T33 extends this match. The arms are exhaustive (no wildcard) so that a new
-/// `EntityKind` variant fails to compile until someone decides how it renders.
-fn entity_style(kind: &EntityKind, theme: &Theme) -> Option<Style> {
+/// The arms are exhaustive (no wildcard) so a new `EntityKind` variant fails
+/// to compile until someone decides how it renders. `Pre` and `Blockquote`
+/// are normally handled structurally by `split_blocks` and never reach this
+/// function during regular layout (see the module docs); their arms here are
+/// a defensive fallback (still styled, never plain) for the case where one
+/// slips through un-split. `Spoiler`'s hidden-text substitution is
+/// `styled_spans`'s job, not this function's — this only supplies the style
+/// for the (visible-either-way) revealed case and the un-substituted base
+/// case the caller patches over.
+fn entity_style(kind: &EntityKind, theme: &Theme, spoilers_revealed: bool) -> Style {
     match kind {
-        EntityKind::Bold => Some(Style::new().add_modifier(Modifier::BOLD)),
-        EntityKind::Italic => Some(Style::new().add_modifier(Modifier::ITALIC)),
+        EntityKind::Bold => Style::new().add_modifier(Modifier::BOLD),
+        EntityKind::Italic => Style::new().add_modifier(Modifier::ITALIC),
+        EntityKind::Underline => Style::new().add_modifier(Modifier::UNDERLINED),
+        EntityKind::Strikethrough => Style::new().add_modifier(Modifier::CROSSED_OUT),
         // A terminal has no second font to switch to; the raised surface is
-        // what sets inline code apart from body text.
-        EntityKind::Code => Some(Style::new().bg(theme.surface_raised).fg(theme.text)),
-        EntityKind::Url | EntityKind::TextUrl { .. } => Some(
-            Style::new()
-                .fg(theme.accent)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        // TODO(T33): underline, strikethrough, spoiler (filled block until
-        // revealed), pre with a language label, blockquote, mention, hashtag.
-        EntityKind::Underline
-        | EntityKind::Strikethrough
-        | EntityKind::Spoiler
-        | EntityKind::Pre { .. }
-        | EntityKind::Blockquote
-        | EntityKind::Mention
-        | EntityKind::Hashtag => None,
+        // what sets inline code (and a `pre` block's content) apart from
+        // body text.
+        EntityKind::Code | EntityKind::Pre { .. } => {
+            Style::new().bg(theme.surface_raised).fg(theme.text)
+        }
+        EntityKind::Url | EntityKind::TextUrl { .. } => Style::new()
+            .fg(theme.accent)
+            .add_modifier(Modifier::UNDERLINED),
+        EntityKind::Mention | EntityKind::Hashtag => Style::new().fg(theme.accent),
+        EntityKind::Blockquote => Style::new().fg(theme.text_muted),
+        // Hidden spoilers never reach this style (`styled_spans` overrides
+        // with the block-substitution path); revealed ones get a subtle
+        // background so the (real) text still reads as "was a spoiler".
+        EntityKind::Spoiler if spoilers_revealed => {
+            Style::new().bg(theme.surface_raised).fg(theme.text)
+        }
+        EntityKind::Spoiler => Style::new().fg(theme.text_muted),
     }
 }
 
@@ -880,18 +1254,385 @@ mod tests {
     }
 
     #[test]
-    fn unstyled_entity_kinds_render_as_plain_text() {
-        // T33's kinds must not swallow their own text this milestone.
+    fn styled_entity_kinds_preserve_their_text() {
+        // Every T33 entity kind styles its run without mutating it, *except*
+        // Spoiler, which deliberately hides its text until revealed — see
+        // `spoiler_hidden_until_revealed_key_changes` below for that one.
+        for kind in [
+            EntityKind::Underline,
+            EntityKind::Strikethrough,
+            EntityKind::Mention,
+            EntityKind::Hashtag,
+        ] {
+            let msg = text_message(
+                "hidden entity text",
+                vec![TextEntity {
+                    offset_utf16: 7,
+                    length_utf16: 6,
+                    kind,
+                }],
+            );
+            let lines = layout_message(&msg, 80, &theme());
+            assert_eq!(without_rail(&lines[1]), "hidden entity text");
+        }
+    }
+
+    #[test]
+    fn underline_and_strikethrough_apply_their_modifiers() {
         let msg = text_message(
-            "hidden spoiler text",
+            "under strike plain",
+            vec![
+                TextEntity {
+                    offset_utf16: 0,
+                    length_utf16: 5,
+                    kind: EntityKind::Underline,
+                },
+                TextEntity {
+                    offset_utf16: 6,
+                    length_utf16: 6,
+                    kind: EntityKind::Strikethrough,
+                },
+            ],
+        );
+        let lines = layout_message(&msg, 80, &theme());
+        assert_eq!(
+            spans_with_modifier(&lines, Modifier::UNDERLINED),
+            vec!["under"]
+        );
+        assert_eq!(
+            spans_with_modifier(&lines, Modifier::CROSSED_OUT),
+            vec!["strike"]
+        );
+    }
+
+    #[test]
+    fn mention_and_hashtag_get_the_accent_color() {
+        let theme = theme();
+        let msg = text_message(
+            "ping alice about #topic",
+            vec![
+                TextEntity {
+                    offset_utf16: 5,
+                    length_utf16: 5,
+                    kind: EntityKind::Mention,
+                },
+                TextEntity {
+                    offset_utf16: 17,
+                    length_utf16: 6,
+                    kind: EntityKind::Hashtag,
+                },
+            ],
+        );
+        let lines = layout_message(&msg, 80, &theme);
+        let accented: Vec<&str> = lines[1]
+            .spans
+            .iter()
+            .filter(|s| s.style.fg == Some(theme.accent))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(accented, vec!["alice", "#topic"]);
+    }
+
+    /// spec §8.1: "Spoilers render as a filled block until revealed". Hidden
+    /// and revealed renderings must differ, the hidden run must be made of
+    /// `'█'` alone, and it must cost exactly as many display columns as the
+    /// text it hides (grapheme- and width-aware, so a wide character hides
+    /// behind two blocks, not one) — this is what keeps wrapping/alignment
+    /// sound regardless of reveal state. Reveal is keyed per-message
+    /// (`LayoutOptions::spoilers_revealed`), matching `LayoutKey`.
+    #[test]
+    fn spoiler_hidden_until_revealed_key_changes() {
+        let theme = theme();
+        let secret = "你好"; // two wide (display-width-2) graphemes.
+        let raw = format!("word {secret} more");
+        let offset = raw.find(secret).expect("fixture contains the secret") as u32;
+        let msg = text_message(
+            &raw,
             vec![TextEntity {
-                offset_utf16: 7,
-                length_utf16: 7,
+                offset_utf16: offset,
+                length_utf16: secret.chars().count() as u32,
                 kind: EntityKind::Spoiler,
             }],
         );
+
+        let hidden = layout_message_opts(
+            &msg,
+            80,
+            &theme,
+            LayoutOptions {
+                spoilers_revealed: false,
+                ..LayoutOptions::default()
+            },
+        );
+        let revealed = layout_message_opts(
+            &msg,
+            80,
+            &theme,
+            LayoutOptions {
+                spoilers_revealed: true,
+                ..LayoutOptions::default()
+            },
+        );
+
+        assert_ne!(rendered(&hidden), rendered(&revealed));
+
+        let hidden_span = hidden[1]
+            .spans
+            .iter()
+            .find(|s| !s.content.is_empty() && s.content.chars().all(|c| c == '█'))
+            .expect("no block-substituted span in the hidden rendering");
+        assert_eq!(
+            UnicodeWidthStr::width(hidden_span.content.as_ref()),
+            UnicodeWidthStr::width(secret)
+        );
+        assert_eq!(hidden_span.style, Style::new().fg(theme.text_muted));
+
+        let revealed_span = revealed[1]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == secret)
+            .expect("no revealed span carrying the real text");
+        assert_eq!(revealed_span.style.bg, Some(theme.surface_raised));
+    }
+
+    #[test]
+    fn pre_block_shows_language_label() {
+        let theme = theme();
+        let msg = text_message(
+            "fn main() {}",
+            vec![TextEntity {
+                offset_utf16: 0,
+                length_utf16: 12,
+                kind: EntityKind::Pre {
+                    language: Some("rust".to_string()),
+                },
+            }],
+        );
+        let lines = layout_message(&msg, 60, &theme);
+        let text = rendered(&lines);
+
+        assert!(text.contains("── rust ──"), "{text}");
+        let code_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref().contains("fn main"))
+            .expect("no code-styled span");
+        assert_eq!(code_span.style.bg, Some(theme.surface_raised));
+    }
+
+    #[test]
+    fn pre_block_without_language_omits_the_label() {
+        let msg = text_message(
+            "echo hi",
+            vec![TextEntity {
+                offset_utf16: 0,
+                length_utf16: 7,
+                kind: EntityKind::Pre { language: None },
+            }],
+        );
+        let lines = layout_message(&msg, 60, &theme());
+        let text = rendered(&lines);
+        assert!(text.contains("──"), "{text}");
+        assert!(!text.contains("rust"));
+    }
+
+    #[test]
+    fn blockquote_prefixes_every_line_with_a_dim_marker() {
+        let theme = theme();
+        let msg = text_message(
+            "a wise quote",
+            vec![TextEntity {
+                offset_utf16: 0,
+                length_utf16: 12,
+                kind: EntityKind::Blockquote,
+            }],
+        );
+        let lines = layout_message(&msg, 60, &theme);
+        let quote_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("a wise quote"))
+            .expect("no blockquote line");
+        assert!(line_text(quote_line).contains("▎"));
+        let text_span = quote_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("wise"))
+            .expect("no span carrying the quote text");
+        assert_eq!(text_span.style.fg, Some(theme.text_muted));
+    }
+
+    /// spec §7.1: "a single dimmed line, truncated to one line". A very long
+    /// excerpt at a narrow width must still cost exactly one reply-preview
+    /// row, entirely in `theme.text_muted`.
+    #[test]
+    fn reply_quote_single_dimmed_line() {
+        let theme = theme();
+        let mut msg = text_message("ok", vec![]);
+        msg.reply_to = Some(ReplyPreview {
+            message_id: MessageId(0),
+            sender_name: "You".to_string(),
+            excerpt: "a very long excerpt that would wrap across several lines at this width if it were not truncated first".to_string(),
+        });
+
+        let lines = layout_message(&msg, 24, &theme);
+
+        // lines[0] header, lines[1] the one reply-preview row, lines[2] the
+        // first body row — if truncation failed the excerpt would still be
+        // wrapping into lines[2].
+        assert_eq!(line_text(&lines[2]), "▏ ok");
+        let reply_line = &lines[1];
+        assert!(line_text(reply_line).starts_with("▏ ↳ "));
+        for span in &reply_line.spans[2..] {
+            assert_eq!(span.style, Style::new().fg(theme.text_muted));
+        }
+    }
+
+    #[test]
+    fn nested_bold_italic_compose() {
+        // "bold italic" is Bold; "italic" (its tail) is also Italic. The
+        // overlap must come out both bold and italic, not one replacing the
+        // other.
+        let msg = text_message(
+            "very bold italic text",
+            vec![
+                TextEntity {
+                    offset_utf16: 5,
+                    length_utf16: 11,
+                    kind: EntityKind::Bold,
+                },
+                TextEntity {
+                    offset_utf16: 10,
+                    length_utf16: 6,
+                    kind: EntityKind::Italic,
+                },
+            ],
+        );
         let lines = layout_message(&msg, 80, &theme());
-        assert_eq!(without_rail(&lines[1]), "hidden spoiler text");
+
+        let overlap = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "italic")
+            .expect("no span for the overlap");
+        assert!(overlap.style.add_modifier.contains(Modifier::BOLD));
+        assert!(overlap.style.add_modifier.contains(Modifier::ITALIC));
+
+        let bold_only = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "bold ")
+            .expect("no span for the bold-only run");
+        assert!(bold_only.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!bold_only.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    /// Fixture exercising every `EntityKind` at once: the inline kinds on
+    /// one line, a `pre` block and a `blockquote` each on their own line.
+    fn every_entity_message() -> MessageView {
+        let line1 = "bold italic underline strike spoiler code link url mention hashtag";
+        let line2 = "fn main() {}";
+        let line3 = "a wise quote";
+        let raw = format!("{line1}\n{line2}\n{line3}");
+
+        let find = |needle: &str| raw.find(needle).expect(needle) as u32;
+        let len = |needle: &str| needle.chars().count() as u32; // ASCII fixture only.
+
+        let entities = vec![
+            TextEntity {
+                offset_utf16: find("bold"),
+                length_utf16: len("bold"),
+                kind: EntityKind::Bold,
+            },
+            TextEntity {
+                offset_utf16: find("italic"),
+                length_utf16: len("italic"),
+                kind: EntityKind::Italic,
+            },
+            TextEntity {
+                offset_utf16: find("underline"),
+                length_utf16: len("underline"),
+                kind: EntityKind::Underline,
+            },
+            TextEntity {
+                offset_utf16: find("strike"),
+                length_utf16: len("strike"),
+                kind: EntityKind::Strikethrough,
+            },
+            TextEntity {
+                offset_utf16: find("spoiler"),
+                length_utf16: len("spoiler"),
+                kind: EntityKind::Spoiler,
+            },
+            TextEntity {
+                offset_utf16: find("code"),
+                length_utf16: len("code"),
+                kind: EntityKind::Code,
+            },
+            TextEntity {
+                offset_utf16: find("link"),
+                length_utf16: len("link"),
+                kind: EntityKind::TextUrl {
+                    url: "https://example.com".to_string(),
+                },
+            },
+            TextEntity {
+                offset_utf16: find("url"),
+                length_utf16: len("url"),
+                kind: EntityKind::Url,
+            },
+            TextEntity {
+                offset_utf16: find("mention"),
+                length_utf16: len("mention"),
+                kind: EntityKind::Mention,
+            },
+            TextEntity {
+                offset_utf16: find("hashtag"),
+                length_utf16: len("hashtag"),
+                kind: EntityKind::Hashtag,
+            },
+            TextEntity {
+                offset_utf16: find(line2),
+                length_utf16: len(line2),
+                kind: EntityKind::Pre {
+                    language: Some("rust".to_string()),
+                },
+            },
+            TextEntity {
+                offset_utf16: find(line3),
+                length_utf16: len(line3),
+                kind: EntityKind::Blockquote,
+            },
+        ];
+
+        text_message(&raw, entities)
+    }
+
+    #[test]
+    fn every_entity_kind_snapshot_hidden_spoiler() {
+        let lines = layout_message_opts(
+            &every_entity_message(),
+            60,
+            &theme(),
+            LayoutOptions {
+                spoilers_revealed: false,
+                ..LayoutOptions::default()
+            },
+        );
+        insta::assert_snapshot!(rendered(&lines));
+    }
+
+    #[test]
+    fn every_entity_kind_snapshot_revealed_spoiler() {
+        let lines = layout_message_opts(
+            &every_entity_message(),
+            60,
+            &theme(),
+            LayoutOptions {
+                spoilers_revealed: true,
+                ..LayoutOptions::default()
+            },
+        );
+        insta::assert_snapshot!(rendered(&lines));
     }
 
     #[test]
