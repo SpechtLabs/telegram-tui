@@ -231,13 +231,23 @@ impl Config {
 
     /// Atomically writes the current config to disk as a freshly rendered,
     /// commented TOML document (see module docs).
-    pub fn save(&self) -> eyre::Result<()> {
-        let path = config_path()?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| eyre::eyre!("config path {} has no parent directory", path.display()))?;
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    ///
+    /// Failure here is fatal to the run — see [`unwritable`] for why, and
+    /// `dispatch::save_config` for the path the error takes out of the app.
+    pub fn save(&self) -> Result<(), human_errors::Error> {
+        self.save_to(&config_path().map_err(|err| unwritable_unknown_path(&err))?)
+    }
+
+    /// [`Config::save`] against an explicit path, so the tests can exercise
+    /// the failure without a process-wide `$XDG_CONFIG_HOME` override.
+    fn save_to(&self, path: &std::path::Path) -> Result<(), human_errors::Error> {
+        let parent = path.parent().ok_or_else(|| {
+            unwritable(
+                path,
+                std::io::Error::other("the config path has no parent directory"),
+            )
+        })?;
+        std::fs::create_dir_all(parent).map_err(|err| unwritable(path, err))?;
 
         // Unique-enough per process; concurrent saves from the same process
         // to the same config file are not a case this app produces (one
@@ -245,15 +255,8 @@ impl Config {
         // avoid colliding with a previous run's leftover temp file.
         let tmp_path = parent.join(format!(".{CONFIG_FILE}.tmp-{}", std::process::id()));
         std::fs::write(&tmp_path, self.render())
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &path).with_context(|| {
-            format!(
-                "failed to move {} into place at {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
-        Ok(())
+            .map_err(|err| unwritable(path, err))
+            .and_then(|()| std::fs::rename(&tmp_path, path).map_err(|err| unwritable(path, err)))
     }
 
     /// Renders the current values as the commented TOML document written on
@@ -350,6 +353,59 @@ impl Config {
     }
 }
 
+/// The error that ends the run when the config cannot be written.
+///
+/// # Why this is fatal rather than a toast
+///
+/// Everything `Effect::SaveConfig` persists is something the app then acts
+/// as if it has: the api credentials the auth wizard just collected, the
+/// consent answer, the theme. A write that fails silently leaves the app
+/// running against state that exists only in memory and will be gone at the
+/// next launch — and in the credentials case it is worse than cosmetic,
+/// because `dispatch::save_config` only sends TDLib its parameters after a
+/// successful write, so a failed one strands the client in
+/// `WaitTdlibParameters` with a login screen that never proceeds. The user's
+/// words: "if it fails to write the config, we're screwed anyway".
+///
+/// **Load-bearing consequence, for anyone thinking of softening this back to
+/// a toast:** `tgt_core::state::auth::submit_credentials` advances the wizard
+/// and clears its field error the moment both fields *parse*, before the
+/// write is dispatched, and it never looks at the outcome. That optimistic
+/// advance is only safe because a failed write ends the process here. Turn
+/// this into a toast and you re-arm a session-long stall in
+/// `WaitTdlibParameters`, two files away, with nothing on screen to explain
+/// it — fix the wizard first.
+///
+/// The path is in the message rather than the advice because `human-errors`
+/// takes advice as `&'static [&'static str]`, and a remedy a user cannot act
+/// on ("check the directory") is exactly what naming the location avoids.
+fn unwritable(path: &std::path::Path, cause: std::io::Error) -> human_errors::Error {
+    human_errors::wrap_user(
+        cause,
+        format!("We couldn't save your configuration to {}.", path.display()),
+        // Listed least-likely first on purpose: `human-errors` collects
+        // advice from the whole cause chain and renders it in reverse, so
+        // this order puts the permission check — the fix in most cases — at
+        // the top of what the user actually reads. Check the rendered output
+        // if you edit this, not the array.
+        &[
+            "If the file is owned by another user, remove it or fix its ownership, then run tgt again.",
+            "Check that the disk isn't full and isn't mounted read-only.",
+            "Check that the directory exists and that you have permission to write to it.",
+        ],
+    )
+}
+
+/// The same failure before a path is even known — `etcetera` could not tell
+/// us where the config directory is, which on a unix system means `$HOME` is
+/// unset or unreadable.
+fn unwritable_unknown_path(cause: &eyre::Report) -> human_errors::Error {
+    human_errors::user(
+        format!("We couldn't work out where your configuration file should live: {cause}"),
+        &["Check that HOME (or XDG_CONFIG_HOME) is set to a directory you can write to."],
+    )
+}
+
 /// Renders `s` as a valid, properly escaped TOML string literal.
 fn toml_string(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
@@ -413,13 +469,14 @@ pub fn load() -> eyre::Result<Config> {
             .with_context(|| format!("failed to read {}", path.display()))?;
         parse(&text).with_context(|| format!("failed to parse {}", path.display()))?
     } else {
+        // Same failure as `save()`, same message: not being able to write
+        // the config is fatal wherever it happens, and on a first run it is
+        // the very first thing the app does. This one aborts before the
+        // terminal is ever touched, so it needs no channel back to the loop
+        // — `run_tui`'s `?` is enough — but the user sees the same actionable
+        // text either way.
         let defaults = Config::default();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        std::fs::write(&path, defaults.render())
-            .with_context(|| format!("failed to write default config to {}", path.display()))?;
+        defaults.save_to(&path)?;
         defaults
     };
 
@@ -678,19 +735,24 @@ fn apply_env_overrides(cfg: &mut Config) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
-    // Config loading touches several process-wide env vars (the config-dir
-    // override plus the literal override vars below). Serialize every test
-    // that mutates any of them so parallel `cargo test` runs don't race each
-    // other; tolerate poisoning from a prior panicking test rather than
-    // cascading failures.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    /// Config loading touches several process-wide env vars (the config-dir
+    /// override plus the literal override vars below). Serialize every test
+    /// that mutates any of them so parallel `cargo test` runs don't race
+    /// each other.
+    ///
+    /// This delegates to `logging::tests::env_lock` rather than owning a
+    /// second mutex. It used to own one, and the two locks did not know
+    /// about each other: `otel`, `telemetry_cli` and `dispatch` take
+    /// logging's, this module took its own, and both set `XDG_CONFIG_HOME`.
+    /// Everything was serialized against the wrong half of the test suite,
+    /// which stayed invisible until a `dispatch` test started pointing that
+    /// variable at a deliberately unwritable directory and this module's
+    /// `apply_patch_roundtrips` failed trying to save into it. One lock, or
+    /// the guarantee is theatre.
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+        crate::logging::tests::env_lock()
     }
 
     /// Redirects `etcetera`'s notion of the OS config directory into `path`
@@ -1191,6 +1253,59 @@ mod tests {
         assert_eq!(reloaded.telemetry_mode, TelemetryMode::On);
 
         clear_related_env();
+    }
+
+    /// The whole reason `human-errors` is a dependency: a message that says
+    /// "failed to save config" with no location and no remedy is not worth
+    /// the crate. This pins the two things a user needs — where we tried to
+    /// write, and what they can do about it.
+    #[test]
+    fn an_unwritable_config_names_the_path_and_says_what_to_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A regular file standing where the config *directory* should be, so
+        // every write beneath it fails with NotADirectory. It is the
+        // reproducible stand-in for the cases users actually hit (a
+        // read-only directory, a full disk, a root-owned file), all of which
+        // arrive here as the same io::Error.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("telegram-tui").join("config.toml");
+
+        let err = Config::default()
+            .save_to(&path)
+            .expect_err("writing beneath a regular file cannot succeed");
+        let message = err.message();
+
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the message must name the path we tried to write:\n{message}"
+        );
+        assert!(
+            message.contains("To try and fix this"),
+            "the message must carry advice:\n{message}"
+        );
+        assert!(
+            message.contains("permission to write"),
+            "and the advice must be actionable:\n{message}"
+        );
+        assert!(
+            message.contains("This was caused by"),
+            "and must keep the underlying cause:\n{message}"
+        );
+    }
+
+    /// A successful save still works through the same path, so the error
+    /// plumbing above cannot be passing by never writing anything.
+    #[test]
+    fn save_to_writes_a_loadable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("telegram-tui").join("config.toml");
+
+        Config::default().save_to(&path).expect("a writable path");
+
+        let text = std::fs::read_to_string(&path).expect("the file is there");
+        let parsed = parse(&text).expect("what we write, we can read back");
+        assert_eq!(parsed, Config::default());
     }
 
     #[test]

@@ -34,7 +34,7 @@ toml = "=1.1.4"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
-tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["sentry"] }
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["sentry", "human_errors"] }
 # Named directly only to turn features on. `tracing-batteries` depends on
 # sentry with `default-features = false`, which drops `panic`, `backtrace`,
 # `contexts` and `debug-images` — i.e. everything that makes a *crash*
@@ -43,6 +43,13 @@ tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batterie
 # integrations without a second copy of the crate. The wiring still goes
 # through the battery (`crash.rs`); this entry only widens the feature set.
 # `reqwest` + `rustls` are the transport, matching batteries' own choice.
+# Actionable, user-facing errors for the one failure the app cannot continue
+# past: not being able to write its own config (spec §12). The `backtraces`
+# feature and the exact version match what `tracing-batteries` resolves, so
+# its `human_errors` battery feature and this share one copy of the crate —
+# which is what lets `Session::record_human_error` take our error natively,
+# cause chain and all.
+human-errors = { version = "=0.2.4", features = ["backtraces"] }
 sentry = { version = "=0.48.5", default-features = false, features = ["panic", "backtrace", "contexts", "debug-images", "release-health", "reqwest", "rustls"] }
 # The OTLP stack `tracing-batteries` also wraps, driven directly: its
 # `OpenTelemetry` battery installs its own global subscriber and filters only

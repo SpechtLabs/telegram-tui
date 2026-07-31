@@ -42,8 +42,13 @@ use dispatch::TdBootParams;
 use td_runtime::TdlibRuntime;
 
 fn main() -> eyre::Result<()> {
-    let cli = Cli::parse();
+    match dispatch_cli(Cli::parse()) {
+        Ok(()) => Ok(()),
+        Err(report) => Err(report_to_user(report)),
+    }
+}
 
+fn dispatch_cli(cli: Cli) -> eyre::Result<()> {
     if let Some(Command::Telemetry { action }) = &cli.command {
         // Neither subcommand starts the TUI, so stdout is fair game (spec
         // §13.3's "nothing but the file logger while the TUI is active"
@@ -57,6 +62,30 @@ fn main() -> eyre::Result<()> {
     }
 
     run_tui(cli)
+}
+
+/// Prints a `human_errors::Error` as itself and exits, rather than letting
+/// `color_eyre` render it.
+///
+/// Everything that reaches here has already restored the terminal and
+/// flushed the log — `run_tui`'s guards drop as it returns — so stderr is
+/// usable, which is the whole reason the fatal config write travels back up
+/// the loop instead of printing where it happens.
+///
+/// The bypass exists because `color_eyre` would append its source chain and
+/// a `Location: crates/app/src/config.rs:479` to a message that already
+/// carries its cause and its remedy. That location is useful for a panic and
+/// noise for a user who needs to know their config directory isn't writable.
+/// Every other error keeps the full `color_eyre` report, backtrace and all.
+fn report_to_user(report: eyre::Report) -> eyre::Report {
+    let Some(err) = report.downcast_ref::<human_errors::Error>() else {
+        return report;
+    };
+    eprintln!("{}", err.message());
+    // 1 rather than a `?` return: returning would print the report a second
+    // time, under `Error:`, which is exactly what this function exists to
+    // avoid.
+    std::process::exit(1);
 }
 
 /// The effective telemetry master switch for this run, applying the one
@@ -207,7 +236,8 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
     // `main` unseen. A panic needs none of this: the panic integration's
     // hook has already captured it by the time control reaches here, if it
     // reaches here at all.
-    let outcome = outcome.map_err(color_eyre::Report::from);
+    // `runtime_loop::run` already returns an `eyre::Result`, so the run's
+    // failure — including a fatal config write — arrives as a `Report`.
     if let (Err(report), Some(reporter)) = (&outcome, &crash_reporter) {
         reporter.record_fatal_error(report);
     }

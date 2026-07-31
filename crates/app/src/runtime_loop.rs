@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use color_eyre::eyre;
 use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::DefaultTerminal;
 use ratatui::backend::Backend;
@@ -54,6 +55,10 @@ const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 pub enum Step {
     Continue,
     Quit,
+    /// A config write failed. The error itself is parked in
+    /// [`Core::fatal`] rather than carried here, so `Step` stays
+    /// comparable — the loop only needs to know it must stop.
+    Fatal,
 }
 
 /// One iteration's input, produced inside `select!` and handled outside it so
@@ -61,6 +66,9 @@ pub enum Step {
 /// mutable borrow of one field).
 enum Input {
     Quit,
+    /// A config write failed; the run ends with this error. See
+    /// `config::unwritable`.
+    Fatal(human_errors::Error),
     Action(Action),
     Term(Event),
     Td(TdUpdate),
@@ -77,6 +85,9 @@ pub struct Core {
     td_updates: mpsc::Receiver<TdUpdate>,
     dispatcher: Dispatcher,
     quit_rx: watch::Receiver<bool>,
+    fatal_rx: mpsc::Receiver<human_errors::Error>,
+    /// Set by the step that saw [`Step::Fatal`]; taken by [`run`].
+    fatal: Option<human_errors::Error>,
     tick: time::Interval,
     /// The only clock read outside `core`: `App::update` receives time
     /// exclusively via `Action::Tick { now }`, anchored to loop start.
@@ -122,7 +133,7 @@ impl Core {
     ) -> Self {
         let (action_tx, action_rx) = mpsc::channel::<Action>(ACTION_CHANNEL_CAPACITY);
         let td_updates = runtime.updates();
-        let (dispatcher, quit_rx) = Dispatcher::new(action_tx, runtime, config, td_boot);
+        let (dispatcher, quit_rx, fatal_rx) = Dispatcher::new(action_tx, runtime, config, td_boot);
 
         let mut tick = time::interval(TICK_PERIOD);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -134,6 +145,8 @@ impl Core {
             td_updates,
             dispatcher,
             quit_rx,
+            fatal_rx,
+            fatal: None,
             tick,
             clock_start: Instant::now(),
             effects: Vec::new(),
@@ -181,6 +194,7 @@ impl Core {
                 td_updates,
                 tick,
                 quit_rx,
+                fatal_rx,
                 ..
             } = self;
 
@@ -198,6 +212,10 @@ impl Core {
                 // the quit signal; a closed channel means the dispatcher is
                 // gone, which is also the end of the loop.
                 _ = quit_rx.changed() => Input::Quit,
+                // A failed config write. Ranked with quit rather than with
+                // the action stream: it is not something `update()` gets a
+                // say in, it is the run ending.
+                Some(err) = fatal_rx.recv() => Input::Fatal(err),
                 Some(action) = action_rx.recv() => Input::Action(action),
                 Some(event) = term_events.recv() => Input::Term(event),
                 Some(update) = td_updates.recv() => Input::Td(update),
@@ -209,6 +227,10 @@ impl Core {
 
         match input {
             Input::Quit => return Step::Quit,
+            Input::Fatal(err) => {
+                self.fatal = Some(err);
+                return Step::Fatal;
+            }
             Input::Action(action) => self.apply(action),
             // Mouse events are the one kind `tgt_ui::input::map_event` can't
             // translate on its own: they only mean something relative to the
@@ -398,7 +420,7 @@ pub async fn run(
     config: Arc<Mutex<Config>>,
     td_boot: TdBootParams,
     presentation: Presentation,
-) -> io::Result<()> {
+) -> eyre::Result<()> {
     let Presentation {
         theme,
         resolve_theme,
@@ -436,7 +458,16 @@ pub async fn run(
     }
 
     event_reader_running.store(false, Ordering::Relaxed);
-    Ok(())
+
+    // Deliberately after the loop rather than from inside it: the caller
+    // still has to drop its `TerminalGuard` before anything prints, and
+    // returning here is what lets it. Nothing is drawn on this path — the
+    // frame on screen is whatever the last successful draw left, and it is
+    // about to be replaced by the restored shell.
+    match core.fatal.take() {
+        Some(err) => Err(err.into()),
+        None => Ok(()),
+    }
 }
 
 /// Coalesces draws to at most one per [`DRAW_GATE`] without ever losing one.

@@ -110,6 +110,12 @@ The Sentry DSN comes from `option_env!("TGT_SENTRY_DSN")`, which only the releas
 
 The same discipline covers terminal alerts: `notify::alert` takes no content parameters at all, so no sender name or message text can ride an `OSC 777` into a multiplexer log.
 
+### A failed config write ends the run
+
+`Effect::SaveConfig` failing is fatal, not a toast (architecture §4.4.1). The error is a `human_errors::Error` built by `config::unwritable`, which names the path and carries advice; it travels `dispatch::save_config` → `fatal_tx` → `runtime_loop::run` → `run_tui`, so the `TerminalGuard` restores the terminal before `main::report_to_user` prints it. Never print it where it happens — the TUI still owns the screen there.
+
+Before softening this: `state::auth::submit_credentials` advances the wizard before the write is dispatched and never checks the outcome, and `save_config` only sends TDLib its parameters after a successful write. The optimistic advance is safe only because the failure is fatal; make it a toast and login stalls for the whole session with nothing on screen.
+
 ## Gotchas
 
 These bit during implementation and are recorded in `docs/architecture.md`:

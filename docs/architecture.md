@@ -114,9 +114,9 @@ is a candidate for editing.
 |---|---|
 | `main.rs` | Entry: CLI parse, config load, panic hook, consent gating, terminal setup/teardown |
 | `cli.rs` | `clap` definitions: `tgt`, `--no-telemetry`, `tgt telemetry show|reset-id` |
-| `config.rs` | TOML config load/generate (`etcetera` paths), unknown-key warnings, `ConfigPatch` application |
+| `config.rs` | TOML config load/generate (`etcetera` paths), unknown-key warnings, `ConfigPatch` application, the fatal-write error |
 | `keychain.rs` | 32-byte DB encryption key via `keyring` (macOS Keychain); generate-on-first-run |
-| `runtime_loop.rs` | The `tokio::select!` main loop: action channel, terminal events, tick, coalesced draw |
+| `runtime_loop.rs` | The `tokio::select!` main loop: action channel, terminal events, tick, coalesced draw, fatal-error return |
 | `dispatch.rs` | `Effect` → async execution; completion re-enters as `Action::TdResult`/`Action::Io` |
 | `td_runtime.rs` | `TdlibRuntime`: tdlib-rs client, `spawn_blocking` receive loop, type mapping both directions |
 | `graphics.rs` | Terminal graphics protocol probe at startup (kitty/iterm2/sixel/none) |
@@ -637,6 +637,43 @@ pub enum ConfigPatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryMode { On, Off }
 ```
+
+### 4.4.1 A failed config write is fatal
+
+`Effect::SaveConfig` persists things the app then behaves as if it has: the
+api credentials the auth wizard just collected, the consent answer, the theme.
+A write that fails silently leaves the session running against state that
+exists only in memory, and in the credentials case it is worse than cosmetic —
+`dispatch::save_config` only sends TDLib its parameters *after* a successful
+write, so a failed one strands the client in `WaitTdlibParameters` with a login
+screen that never proceeds and nothing on screen to explain why. So the write
+failing ends the run, with a `human_errors::Error` that names the path and
+what to do about it.
+
+The path the error takes is the whole design:
+
+```
+dispatch::save_config          write fails; builds config::unwritable(path, cause)
+  -> fatal_tx (mpsc, cap 1)    NOT printed here: the TUI still owns the screen
+  -> runtime_loop step         Input::Fatal -> Step::Fatal, parked in Core::fatal
+  -> runtime_loop::run         returns Err after the loop, drawing nothing
+  -> run_tui                   TerminalGuard drops: raw mode off, screen restored
+  -> crash::record_fatal_error downcast to human_errors::Error -> record_human_error
+  -> main::report_to_user      prints err.message() to a usable shell, exit 1
+```
+
+Printing at the point of failure would put the message into cells the renderer
+believes it owns, which is the exact failure an actionable message exists to
+prevent. `main::report_to_user` bypasses `color_eyre` for this one error type,
+because its `Location:` line is useful for a panic and noise for a user whose
+config directory isn't writable.
+
+**Load-bearing, for anyone softening this back to a toast:**
+`state::auth::submit_credentials` advances the wizard and clears its field
+error the moment both fields *parse*, before the write is dispatched, and it
+never inspects the outcome. That optimistic advance is safe *only because* a
+failed write ends the process. Turning this into a toast re-arms a session-long
+stall in `WaitTdlibParameters` two files away — fix the wizard first.
 
 ### 4.5 Focus — `core/src/state/focus.rs`
 

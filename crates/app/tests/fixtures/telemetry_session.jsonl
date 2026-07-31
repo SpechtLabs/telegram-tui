@@ -1,6 +1,7 @@
 {"Emit":{"Auth":"WaitTdlibParameters"}}
 {"Await":{"expect":{"Kind":"SetTdlibParameters"},"respond":{"Ok":"Ok"}}}
 {"Emit":{"Auth":"WaitPhoneNumber"}}
+{"Await":{"expect":{"Kind":"RequestQrCodeAuthentication"},"respond":{"Ok":"Ok"}}}
 {"Await":{"expect":{"Kind":"SetAuthenticationPhoneNumber"},"respond":{"Ok":"Ok"}}}
 {"Emit":{"Auth":{"WaitCode":{"delivery_hint":"SMS to +4***78","length":5}}}}
 {"Await":{"expect":{"Kind":"CheckAuthenticationCode"},"respond":{"Ok":"Ok"}}}

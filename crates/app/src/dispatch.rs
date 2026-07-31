@@ -144,6 +144,12 @@ struct Inner {
     /// TDLib asked for its parameters before credentials existed. Cleared by
     /// whoever fires the deferred request (see module docs).
     params_pending: AtomicBool,
+    /// Carries a fatal config-write failure back to `runtime_loop::run`,
+    /// which returns it out through `run_tui`'s `TerminalGuard` so the
+    /// message prints to a restored shell rather than into the alternate
+    /// screen. Capacity one: the first failure ends the run, and anything
+    /// after it is the same failure again.
+    fatal_tx: mpsc::Sender<human_errors::Error>,
     /// Probed once, at construction: the heuristic reads `TERM_PROGRAM`,
     /// which cannot change under a running process, and an alert is not the
     /// place to be re-reading the environment.
@@ -158,8 +164,13 @@ impl Dispatcher {
         runtime: Arc<dyn TdRuntime>,
         config: Arc<Mutex<Config>>,
         td_boot: TdBootParams,
-    ) -> (Self, watch::Receiver<bool>) {
+    ) -> (
+        Self,
+        watch::Receiver<bool>,
+        mpsc::Receiver<human_errors::Error>,
+    ) {
         let (quit_tx, quit_rx) = watch::channel(false);
+        let (fatal_tx, fatal_rx) = mpsc::channel(1);
         let inner = Arc::new(Inner {
             action_tx,
             runtime,
@@ -167,8 +178,9 @@ impl Dispatcher {
             td_boot,
             params_pending: AtomicBool::new(false),
             supports_osc777: crate::notify::supports_osc777(),
+            fatal_tx,
         });
-        (Dispatcher { inner, quit_tx }, quit_rx)
+        (Dispatcher { inner, quit_tx }, quit_rx, fatal_rx)
     }
 
     /// Executes one effect. Never blocks: everything with latency is spawned.
@@ -305,27 +317,52 @@ impl Inner {
         })
         .await;
 
-        let outcome = match saved {
-            Ok(Ok(())) => Ok(()),
+        // A config write that fails ends the run. See `config::unwritable`
+        // for why, including the load-bearing note about the auth wizard —
+        // read it before changing this to anything softer.
+        //
+        // The error goes back to `runtime_loop::run` rather than being
+        // printed or `panic!`ed here: this task runs while the TUI still
+        // owns the alternate screen, so anything written now lands in cells
+        // the renderer believes it owns, and a message the user cannot read
+        // is the exact failure an actionable message exists to prevent.
+        let fatal = match saved {
+            Ok(Ok(())) => None,
             Ok(Err(err)) => {
-                tracing::warn!(error = %err, "could not save the config");
-                Err(IoErrorKind::Other)
+                tracing::error!(error = %err, "could not save the config; aborting");
+                Some(err)
             }
+            // The blocking task panicked or was cancelled. The config is in
+            // an unknown state and the process is already unwell; treat it
+            // the same way rather than carrying on as if the write happened.
             Err(err) => {
-                tracing::warn!(error = %err, "the config save task did not finish");
-                Err(IoErrorKind::Other)
+                tracing::error!(error = %err, "the config save task did not finish; aborting");
+                Some(human_errors::system(
+                    format!("We couldn't save your configuration: {err}"),
+                    &[
+                        "This is a bug. Please report it with the log from ~/.local/state/telegram-tui/.",
+                    ],
+                ))
             }
         };
-        let saved_ok = outcome.is_ok();
+
+        if let Some(err) = fatal {
+            // `try_send` rather than `send`: the channel holds one error and
+            // the loop is on its way out, so a full channel means a failure
+            // is already in flight and this one is redundant. Blocking here
+            // would keep a doomed task alive for no benefit.
+            let _ = self.fatal_tx.try_send(err);
+            return;
+        }
+
         let _ = self
             .action_tx
-            .send(Action::Io(IoResult::ConfigSaved { outcome }))
+            .send(Action::Io(IoResult::ConfigSaved { outcome: Ok(()) }))
             .await;
 
         // First run: TDLib asked for its parameters before the wizard had
         // produced any credentials. Now it has (see module docs).
-        if saved_ok
-            && matches!(patch, ConfigPatch::Credentials { .. })
+        if matches!(patch, ConfigPatch::Credentials { .. })
             && self.params_pending.swap(false, Ordering::SeqCst)
         {
             self.send_tdlib_parameters().await;
@@ -770,8 +807,24 @@ mod tests {
         runtime: Arc<dyn TdRuntime>,
         config: Config,
     ) -> (Dispatcher, mpsc::Receiver<Action>, watch::Receiver<bool>) {
+        let (dispatcher, action_rx, quit_rx, _fatal_rx) = dispatcher_parts(runtime, config);
+        (dispatcher, action_rx, quit_rx)
+    }
+
+    /// [`dispatcher_with`] plus the fatal-error receiver, for the tests that
+    /// are about a config write failing.
+    #[allow(clippy::type_complexity)]
+    fn dispatcher_parts(
+        runtime: Arc<dyn TdRuntime>,
+        config: Config,
+    ) -> (
+        Dispatcher,
+        mpsc::Receiver<Action>,
+        watch::Receiver<bool>,
+        mpsc::Receiver<human_errors::Error>,
+    ) {
         let (action_tx, action_rx) = mpsc::channel(8);
-        let (dispatcher, quit_rx) = Dispatcher::new(
+        let (dispatcher, quit_rx, fatal_rx) = Dispatcher::new(
             action_tx,
             runtime,
             Arc::new(Mutex::new(config)),
@@ -780,7 +833,7 @@ mod tests {
                 database_encryption_key: vec![0u8; 32],
             },
         );
-        (dispatcher, action_rx, quit_rx)
+        (dispatcher, action_rx, quit_rx, fatal_rx)
     }
 
     fn config_with_credentials() -> Config {
@@ -789,6 +842,83 @@ mod tests {
             api_hash: Some("hash".to_string()),
             ..Config::default()
         }
+    }
+
+    /// A config write that fails must end the run, not be swallowed. Three
+    /// things have to hold together, and they are asserted together because
+    /// any one of them alone would still leave the user stranded:
+    /// the error reaches the loop, no `ConfigSaved` claims success, and the
+    /// deferred `SetTdlibParameters` does *not* fire — that last one is the
+    /// difference between "aborts with a message" and "sits on a login
+    /// screen for ever" (see `config::unwritable`).
+    // The env guard is deliberately held across the `save_config` await:
+    // the whole point is that `XDG_CONFIG_HOME` still points at the
+    // unwritable path while the write runs. It is a `std::sync::Mutex` in a
+    // single-threaded test runtime, so there is nothing for an async-aware
+    // mutex to buy here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_failed_config_write_aborts_the_run() {
+        let _lock = crate::logging::tests::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // A regular file where the config directory has to go, so the write
+        // beneath it cannot succeed.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        // SAFETY: serialized by the shared env lock held above.
+        unsafe {
+            crate::logging::tests::set_config_dir(&blocker);
+        }
+
+        let fake = fake_runtime("");
+        let (dispatcher, mut action_rx, _quit_rx, mut fatal_rx) = dispatcher_parts(
+            Arc::clone(&fake) as Arc<dyn TdRuntime>,
+            config_with_credentials(),
+        );
+
+        // TDLib has already asked for its parameters and is waiting on the
+        // credentials this write was supposed to persist — the exact
+        // situation in which a swallowed failure strands the login screen.
+        dispatcher
+            .inner
+            .params_pending
+            .store(true, Ordering::SeqCst);
+
+        dispatcher
+            .inner
+            .save_config(ConfigPatch::Credentials {
+                api_id: 42,
+                api_hash: "hash".to_string(),
+            })
+            .await;
+
+        // SAFETY: serialized by the lock held above.
+        unsafe {
+            crate::logging::tests::unset_config_dir();
+        }
+
+        let err = fatal_rx
+            .try_recv()
+            .expect("the failure must reach the loop, or nothing ends the run");
+        assert!(
+            err.message().contains("couldn't save your configuration"),
+            "the loop gets the actionable message, not a bare io error: {}",
+            err.message()
+        );
+
+        assert!(
+            action_rx.try_recv().is_err(),
+            "no ConfigSaved may claim the write happened"
+        );
+        assert!(
+            fake.received().is_empty(),
+            "a failed credentials write must not send TDLib its parameters"
+        );
+        assert!(
+            dispatcher.inner.params_pending.load(Ordering::SeqCst),
+            "and the pending flag stays set rather than being consumed by a \
+             request that never went out"
+        );
     }
 
     #[tokio::test]

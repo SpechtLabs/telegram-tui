@@ -111,6 +111,17 @@ impl CrashReporter {
     /// minus a concrete type name there is no way to recover from an erased
     /// report.
     pub fn record_fatal_error(&self, report: &color_eyre::Report) {
+        // A `human_errors::Error` — the fatal config write of
+        // `config::unwritable` is the only one so far — goes through the
+        // battery's own path, which keeps that crate's cause chain and its
+        // captured backtraces instead of flattening them into a `Display`
+        // string. This is what the `human_errors` feature on
+        // `tracing-batteries` is for.
+        if let Some(human) = report.downcast_ref::<human_errors::Error>() {
+            self.session.record_human_error(human);
+            return;
+        }
+
         let error: &(dyn std::error::Error + 'static) = &**report;
 
         let mut causes = Vec::new();

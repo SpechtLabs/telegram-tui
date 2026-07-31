@@ -135,7 +135,7 @@ use tgt_core::model::key::KeyBindings;
 use tgt_core::model::message::{
     FileSnapshot, MessageCaps, MessageContent, MessageView, SendState, Sender,
 };
-use tgt_core::state::auth::AuthField;
+use tgt_core::state::auth::{AuthField, LoginMethod};
 use tgt_core::state::chat_list::visible_rows;
 use tgt_core::state::focus::Focus;
 use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
@@ -400,12 +400,19 @@ impl Harness {
             received(fake).contains(&"SetTdlibParameters")
         })
         .await;
-        self.advance_until("the login method choice", |core, _| {
-            core.app().state().auth.phase == AuthPhase::WaitPhoneNumber
+        self.advance_until("the QR request the app makes on its own", |_, fake| {
+            received(fake).contains(&"RequestQrCodeAuthentication")
         })
         .await;
 
-        self.press(KeyCode::Char('p')).await;
+        // Down highlights "sign in with phone number instead", Enter reveals
+        // the field. This has to happen before the QR link comes back:
+        // TDLib refuses `setAuthenticationPhoneNumber` once it has issued
+        // one (see `state::auth`'s module docs). `phone_login` is still the
+        // action this session exports — the allowlist proof cares about the
+        // event, not about which of the two routes reached it.
+        self.press(KeyCode::Down).await;
+        self.press(KeyCode::Enter).await;
         self.advance_until("the phone field to take focus", |core, _| {
             core.app().state().auth.active_field == AuthField::Phone
         })
@@ -671,10 +678,18 @@ impl Harness {
             Screen::Consent,
             "the consent screen must still be up"
         );
+        // The witness used to be `method == None`, which stopped meaning
+        // anything when login went QR-first (T77): `handle_td` now sets
+        // `Some(Qr)` the moment `WaitPhoneNumber` arrives, with no key
+        // pressed at all. What still distinguishes "a key leaked" from "the
+        // app moved on its own" is whether any of the keys pressed above
+        // advanced the *choice* — `Down` would highlight the phone line
+        // (`PhoneSelected`) and `Enter` would confirm it (`Phone`), so
+        // either value here means the consent screen let a key through.
         assert_eq!(
             self.state().auth.method,
-            None,
-            "`p` reached the auth wizard through the consent screen"
+            Some(LoginMethod::Qr),
+            "a key reached the auth wizard through the consent screen"
         );
         assert!(
             !self.state().consent.acknowledged,
@@ -1372,6 +1387,13 @@ fn session_script() -> Vec<ScriptStep> {
             respond: RespondWith::Ok(TdResponse::Ok),
         },
         ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitPhoneNumber)),
+        // Login is QR-first since T77: reaching `WaitPhoneNumber` makes the
+        // app ask for a QR link before the user has touched anything, and
+        // the phone number is the escape hatch underneath it.
+        ScriptStep::Await {
+            expect: expect("RequestQrCodeAuthentication"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
         ScriptStep::Await {
             expect: expect("SetAuthenticationPhoneNumber"),
             respond: RespondWith::Ok(TdResponse::Ok),

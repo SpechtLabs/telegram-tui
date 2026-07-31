@@ -2194,6 +2194,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "human-errors"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef44dcc0e508d433319e72dcd65819757dde3f756b17f91e875a43d0b65bb7cb"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3527,7 +3533,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4670,7 +4676,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5464,6 +5470,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "etcetera",
+ "human-errors",
  "insta",
  "keyring",
  "opentelemetry",
@@ -5904,6 +5911,7 @@ name = "tracing-batteries"
 version = "0.1.0"
 source = "git+https://github.com/sierrasoftworks/tracing-batteries-rs.git?rev=f059e936623c2eb0ca67f6ae3301487c9443ffd0#f059e936623c2eb0ca67f6ae3301487c9443ffd0"
 dependencies = [
+ "human-errors",
  "opentelemetry-appender-tracing",
  "reqwest 0.12.28",
  "sentry",
@@ -6494,7 +6502,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -38,6 +38,8 @@ mod config;
 mod crash;
 #[path = "../src/dispatch.rs"]
 mod dispatch;
+#[path = "../src/logging.rs"]
+mod logging;
 #[path = "../src/media_kind.rs"]
 mod media_kind;
 #[path = "../src/notify.rs"]
