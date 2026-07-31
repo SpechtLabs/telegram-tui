@@ -117,6 +117,9 @@ impl Core {
     }
 
     /// The state a frame would be rendered from.
+    // Dead in the bin target itself: consumed by the integration tests, which
+    // `#[path]`-include this module (see tests/auth_flow.rs).
+    #[allow(dead_code)]
     pub fn app(&self) -> &App {
         &self.app
     }
