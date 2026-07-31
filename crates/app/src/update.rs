@@ -114,32 +114,44 @@ pub fn target_triple() -> String {
 }
 
 /// Resolves the install from the running executable.
-///
-/// `current_exe` resolves symlinks on both supported platforms, so a
-/// `~/.local/bin/tgt` symlink lands on the real tree — which is what makes
-/// the checks below meaningful rather than a test of where the user's PATH
-/// entry happens to point.
 pub fn resolve() -> eyre::Result<Install> {
-    let exe = std::env::current_exe()?;
+    Ok(classify(&std::env::current_exe()?))
+}
+
+/// The half of [`resolve`] that touches no process state, so the symlink and
+/// shared-prefix cases can be exercised against real directories.
+///
+/// The path is canonicalised first, and that is load-bearing rather than
+/// tidiness. `current_exe` does not resolve symlinks everywhere: Linux reads
+/// `/proc/self/exe` and gets the real file, but macOS returns the path the
+/// process was invoked *through*. Both supported install methods put a
+/// symlink on PATH — `install.sh` links `~/.local/bin/tgt` into the private
+/// tree, Homebrew links its prefix into the Cellar — so on macOS the
+/// derivation below saw `~/.local` or `/opt/homebrew` and called every real
+/// install [`Install::Foreign`]. `tgt update` then refused to run for
+/// anyone who did not type the full path to the binary, and the Homebrew
+/// branch could never be reached at all.
+fn classify(exe: &Path) -> Install {
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
     // …/<root>/bin/tgt → <root>
     let Some(root) = exe.parent().and_then(Path::parent) else {
-        return Ok(Install::Foreign { root: exe });
+        return Install::Foreign { root: exe };
     };
 
     // Homebrew installs the tree under libexec inside a Cellar and symlinks
     // the binary; the Cellar component is the reliable signal.
     if root.components().any(|c| c.as_os_str() == "Cellar") {
-        return Ok(Install::Homebrew);
+        return Install::Homebrew;
     }
 
     if is_private_tree(root) {
-        Ok(Install::Private {
+        Install::Private {
             root: root.to_path_buf(),
-        })
+        }
     } else {
-        Ok(Install::Foreign {
+        Install::Foreign {
             root: root.to_path_buf(),
-        })
+        }
     }
 }
 
@@ -588,6 +600,48 @@ mod tests {
             sha_for(sums, "tgt-1.0.0-aarch64-unknown-linux-gnu.tar.gz"),
             None
         );
+    }
+
+    /// The shipped layout: the binary lives in a private tree and PATH holds
+    /// a symlink to it. Classifying the symlink's own directory instead of
+    /// the tree it points into is what made `tgt update` refuse to run for
+    /// every install `install.sh` had ever made.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_on_path_resolves_to_the_tree_it_points_into() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tree(tmp.path(), true);
+        let bin_dir = tmp.path().join(".local/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let link = bin_dir.join("tgt");
+        std::os::unix::fs::symlink(root.join("bin/tgt"), &link).unwrap();
+
+        assert_eq!(
+            classify(&link),
+            Install::Private {
+                root: std::fs::canonicalize(&root).unwrap()
+            },
+            "invoking through the PATH symlink must reach the real tree"
+        );
+    }
+
+    /// Homebrew symlinks its prefix into the Cellar, so the Cellar component
+    /// only appears once the link is followed. Before it was, a brew user
+    /// updating in place was told their install was unrecognisable instead of
+    /// being pointed at `brew upgrade`.
+    #[test]
+    #[cfg(unix)]
+    fn a_homebrew_symlink_is_recognised_through_the_cellar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cellar = tmp.path().join("Cellar/tgt/0.1.5/libexec/bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        std::fs::write(cellar.join("tgt"), b"#!/bin/sh\n").unwrap();
+        let prefix_bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&prefix_bin).unwrap();
+        let link = prefix_bin.join("tgt");
+        std::os::unix::fs::symlink(cellar.join("tgt"), &link).unwrap();
+
+        assert_eq!(classify(&link), Install::Homebrew);
     }
 
     #[test]
