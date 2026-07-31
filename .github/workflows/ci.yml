@@ -36,11 +36,23 @@ jobs:
     # architectures. Windows is built and tested here and nowhere else: its
     # loader has no rpath equivalent, so the relocatable bin/ + lib/ layout the
     # release depends on has no Windows spelling, and nobody has run the client
-    # there. Building it anyway catches a port regression at the point it is
-    # introduced. A failure on any of the three is a real failure — an ignored
-    # job would be worse than no job.
+    # there.
+    #
+    # Windows is advisory: it runs, it reports, and it does not gate. The job
+    # is multiples slower than the other two for identical work — Defender
+    # scans every file cargo writes and NTFS charges more per file — and being
+    # slowest made it the one a superseding push always cancelled, so it
+    # blocked releases without ever finishing. Since it ships no artifact and
+    # is documented experimental, failing the run on it bought nothing that
+    # reading the run summary does not.
+    #
+    # The cost is real and worth stating: nothing forces a red Windows job to
+    # be fixed, so it can rot unnoticed. Check it before believing the platform
+    # still builds, and if it is red for long, either fix it or drop the job —
+    # a permanently red advisory job is worse than no job.
     name: Checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
