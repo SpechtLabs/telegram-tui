@@ -1,0 +1,10 @@
+---
+source: crates/ui/src/view/composer.rs
+expression: "render_to_string(40, 6, &state)"
+---
+╭──────────────────────────────────────╮
+│› first line                          │
+│  second line                         │
+│                                      │
+│                                      │
+╰──────────────────────────────────────╯
