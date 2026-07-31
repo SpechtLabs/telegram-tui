@@ -1,0 +1,5 @@
+---
+source: crates/ui/src/view/hint_bar.rs
+expression: out
+---
+↑↓ move   ⏎ open   / filter   ctrl+p palette   ? help
