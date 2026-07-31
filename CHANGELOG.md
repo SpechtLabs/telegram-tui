@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.5](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.4...v0.1.5) (2026-07-31)
+
+
+### Features
+
+* curl | sh installer, and one install layout everywhere ([cd39d6b](https://github.com/SpechtLabs/telegram-tui/commit/cd39d6b33c09f66987e5288019e5c0ecd54d6e45))
+* move the upload progress bar, and offer to cancel ([1d1250a](https://github.com/SpechtLabs/telegram-tui/commit/1d1250ae43ff5a2f48aa41ea59a2718dd5b38180))
+* show real Telegram folder names in the sidebar tab strip ([80f4ca0](https://github.com/SpechtLabs/telegram-tui/commit/80f4ca0fe04306c92ad953afabfdc394c52f7bdd))
+* sub-row hit targets for spoiler reveal and reply-quote jump ([33e3cb4](https://github.com/SpechtLabs/telegram-tui/commit/33e3cb42cecffed488cca3351f5073ef455ad376))
+
+
+### Bug Fixes
+
+* **core:** close the chat when the conversation stops being visible ([6a8761c](https://github.com/SpechtLabs/telegram-tui/commit/6a8761c1d67e25a1522f6707cfc4d442b92e46e7))
+* **install:** never replace a directory that is not demonstrably a tgt tree ([6087f60](https://github.com/SpechtLabs/telegram-tui/commit/6087f60b1a0f6f2513e37f5bebc4aa162539256b))
+* **release:** install the tarball Homebrew actually staged ([64a69c6](https://github.com/SpechtLabs/telegram-tui/commit/64a69c634960285a38b2934c78f90bc353fe905e))
+
 ## [0.1.4](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.3...v0.1.4) (2026-07-31)
 
 
