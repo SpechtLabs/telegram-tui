@@ -91,9 +91,17 @@
 //!    clipped at the top of the pane simply keeps fewer of them, and the
 //!    image draws smaller into what is left).
 //! 2. [`draw`] renders the row buffer as usual, then draws each image over
-//!    its own run of reserved rows. Those rows are recorded in the hit map
-//!    like every other row of the block, so a click on a photo still
+//!    its own run of reserved rows, through [`placement_rect`] — one place,
+//!    clipped to the pane, so a picture can never reach the sidebar however
+//!    the file's aspect ratio worked out. Those rows are recorded in the hit
+//!    map like every other row of the block, so a click on a photo still
 //!    resolves to its message.
+//!
+//! Both passes size the picture through `ImageArea`, from the same measured
+//! cell size, so the rows step 1 reserves are the cells step 2 fills. Where
+//! they legitimately differ is clipping: a block cut off at the top of the
+//! pane keeps fewer of its reserved rows, and step 2 fits the picture into
+//! what is left rather than drawing past it.
 //!
 //! Every gate is a reason to skip step 1 and keep the §4 line: no protocol
 //! (`rs.graphics` is `None`, which is also how `[app].inline_images = false`
@@ -263,17 +271,13 @@ fn extend_placement(placements: &mut Vec<Placement>, tag: Rc<ImageTag>, y: u16) 
 /// attachment, and `ImageArea` remembers not to plan that path again.
 fn draw_inline_images(pane: Rect, placements: &[Placement], rs: &mut RenderState, f: &mut Frame) {
     let graphics = rs.graphics;
+    let cell = rs.cell_size();
     for placement in placements {
         let tag = &placement.tag;
-        let rect = Rect {
-            x: pane.x + tag.inset,
-            y: pane.y + placement.top,
-            width: tag.cols,
-            height: placement.bottom - placement.top + 1,
-        };
+        let rect = placement_rect(pane, tag.inset, tag.cols, placement.top, placement.bottom);
         let drawn = rs
             .images
-            .area(tag.message_id, graphics)
+            .area(tag.message_id, graphics, cell)
             .render(rect, &tag.path, f);
         if !drawn {
             f.render_widget(
@@ -287,6 +291,38 @@ fn draw_inline_images(pane: Rect, placements: &[Placement], rs: &mut RenderState
             );
         }
     }
+}
+
+/// Where one placement's picture goes, in absolute frame coordinates, always
+/// inside `pane`.
+///
+/// The intersection is not defensive tidiness. A graphics protocol places
+/// pixels, not cells: a rect that runs one column past the pane draws over
+/// the sidebar, and the terminal keeps drawing it there until something
+/// rewrites those cells — which the conversation pane, by definition, never
+/// will. Clipping here is what makes "an image never draws a cell outside
+/// the pane" a property of the geometry rather than of every input that
+/// feeds it.
+/// An overhang so complete that nothing is left comes back as a rect at the
+/// pane's own origin rather than `Rect::intersection`'s zero-sized one out at
+/// the overhanging coordinate: both draw nothing, but only one of them is
+/// still describable as "inside the pane".
+fn placement_rect(pane: Rect, inset: u16, cols: u16, top: u16, bottom: u16) -> Rect {
+    let rect = Rect {
+        x: pane.x.saturating_add(inset),
+        y: pane.y.saturating_add(top),
+        width: cols,
+        height: bottom.saturating_sub(top).saturating_add(1),
+    }
+    .intersection(pane);
+    if rect.is_empty() {
+        return Rect {
+            width: 0,
+            height: 0,
+            ..pane
+        };
+    }
+    rect
 }
 
 /// Reserves and draws the one-line search query bar at the top of `inner`
@@ -856,9 +892,10 @@ fn plan_inline_image(
     } else {
         text_cols
     };
+    let cell = rs.cell_size();
     let footprint =
         rs.images
-            .area(msg.id, Some(capability))
+            .area(msg.id, Some(capability), cell)
             .plan(path, text_cols, image_rows_budget)?;
 
     // An own block is right-aligned, so its image ends where its text ends:
@@ -1828,6 +1865,135 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Card and picture are alternatives, never both, and the choice is per
+    /// message: three photos, one of them fetched, must produce exactly two
+    /// `⏎ download` lines and one run of reserved rows. Two card lines above
+    /// a picture is what two un-fetched photos look like — the bug it would
+    /// be is a *single* message rendering as both, which this pins shut.
+    #[test]
+    fn each_photo_renders_as_a_card_or_as_a_picture_and_never_as_both() {
+        let path = scratch_png(200, 100);
+        let mut fetched = photo_msg(1, 200, 100);
+        fetched.content = MessageContent::Photo {
+            file_id: PHOTO_FILE,
+            width: 200,
+            height: 100,
+            caption: FormattedText {
+                text: String::new(),
+                entities: Vec::new(),
+            },
+        };
+        // Two more photos on files nobody has fetched, so they keep their
+        // §4 line while the first becomes a picture.
+        let pending_file = FileId(10);
+        let mut pending_msgs = Vec::new();
+        for id in [2, 3] {
+            let mut msg = photo_msg(id, 640, 480);
+            msg.content = MessageContent::Photo {
+                file_id: pending_file,
+                width: 640,
+                height: 480,
+                caption: FormattedText {
+                    text: String::new(),
+                    entities: Vec::new(),
+                },
+            };
+            pending_msgs.push(msg);
+        }
+
+        let mut state = fixture_state(Some(conversation(
+            std::iter::once(fetched).chain(pending_msgs).collect(),
+            Scroll::Bottom,
+        )));
+        state.media.files.insert(
+            PHOTO_FILE,
+            FileSnapshot {
+                id: PHOTO_FILE,
+                expected_size: 4_096,
+                downloaded_size: 4_096,
+                is_downloading: false,
+                is_completed: true,
+                local_path: Some(path.clone()),
+            },
+        );
+        state.media.files.insert(
+            pending_file,
+            FileSnapshot {
+                id: pending_file,
+                expected_size: 4_096,
+                downloaded_size: 0,
+                is_downloading: false,
+                is_completed: false,
+                local_path: None,
+            },
+        );
+
+        let mut rs = RenderState::new(Some(Capability::Kitty));
+        let (rendered, _) = draw_frame(60, 30, &state, &mut rs);
+
+        assert_eq!(
+            rendered.matches("⏎ download").count(),
+            2,
+            "one card per un-fetched photo, and none for the fetched one:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("640×480").count(),
+            2,
+            "both un-fetched photos keep their §4 identity line:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("200×100"),
+            "the fetched photo is the picture, so its card is gone entirely:\n{rendered}"
+        );
+
+        // And structurally: the reserved rows all belong to the one message
+        // that became a picture, and that message contributed no card row.
+        let convo = state.conversations.get(&CHAT).unwrap();
+        let mut rs = RenderState::new(Some(Capability::Kitty));
+        let rows = build_window(convo, &state.media, 0, 60, 30, &theme(), &mut rs, None);
+        assert!(
+            rows.iter()
+                .filter(|r| r.image.is_some())
+                .all(|r| r.message_id == Some(MessageId(1))),
+            "only the fetched photo reserves image rows"
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r.message_id == Some(MessageId(1)))
+                .all(|r| !r.line.to_string().contains("⏎")),
+            "the message drawn as a picture contributes no affordance row"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A picture is pixels, not cells: a rect that runs past the pane draws
+    /// over the sidebar and the terminal keeps drawing it there, because
+    /// nothing in the conversation pane will ever rewrite those cells. So
+    /// the rect has to be clipped, in both axes, before it is handed over.
+    #[test]
+    fn a_placement_never_reaches_outside_its_pane() {
+        let pane = Rect::new(30, 4, 40, 12);
+        for (inset, cols, top, bottom) in [
+            (0u16, 40u16, 0u16, 11u16), // exactly the pane
+            (0, 200, 0, 11),            // absurdly wide
+            (35, 20, 0, 11),            // inset far enough right to overhang
+            (0, 40, 0, 200),            // taller than the pane
+            (39, 1, 11, 11),            // the last cell
+            (60, 10, 0, 3),             // inset past the right edge entirely
+        ] {
+            let rect = placement_rect(pane, inset, cols, top, bottom);
+            assert!(
+                rect.right() <= pane.right() && rect.bottom() <= pane.bottom(),
+                "({inset}, {cols}, {top}, {bottom}) produced {rect:?}, outside {pane:?}"
+            );
+            assert!(
+                rect.x >= pane.x && rect.y >= pane.y,
+                "({inset}, {cols}, {top}, {bottom}) produced {rect:?}, before {pane:?}"
+            );
+        }
     }
 
     /// A photo that has not been downloaded has no local file to decode, so

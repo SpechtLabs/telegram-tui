@@ -166,6 +166,7 @@ fn run_tui(cli: Cli) -> eyre::Result<()> {
                 theme,
                 resolve_theme,
                 graphics,
+                measure_cell: graphics::cell_size,
             },
         )
         .await

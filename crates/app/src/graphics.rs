@@ -15,6 +15,9 @@
 
 use std::env;
 
+use crossterm::terminal::WindowSize;
+use tgt_ui::render::image::CellSize;
+
 /// Terminal graphics protocol detected at startup.
 ///
 /// Telemetry records this once per session under `term.graphics_protocol`
@@ -94,6 +97,49 @@ pub fn probe_from(vars: impl Fn(&str) -> Option<String>) -> GraphicsProtocol {
     }
 
     GraphicsProtocol::None
+}
+
+/// The terminal's cell size in pixels, or `None` if it does not report one.
+///
+/// Kitty and iTerm2 both place an image by pixel extent and work out the
+/// cells it covers by dividing by this; encoding against a guess is what
+/// makes a photo render larger than the rows reserved for it and spill out of
+/// its pane (see `tgt_ui::render::image::CellSize`). `TIOCGWINSZ` answers it
+/// without a terminal *query*: no escape sequence goes out, nothing has to be
+/// read back, and there is nothing to time out — which is why this can be
+/// called on a resize, mid-session, and not only once behind a probe.
+///
+/// The pixel fields are documented as optional and are frequently zero
+/// (Windows never fills them, and neither do many Unix terminals); every such
+/// answer is `None` here, and the caller keeps `CellSize::FALLBACK`.
+pub fn cell_size() -> Option<CellSize> {
+    cell_size_from(crossterm::terminal::window_size().ok()?)
+}
+
+/// The pure half of [`cell_size`]. Rejects anything that cannot be a cell
+/// rather than dividing by it: a zero in any of the four fields, and any
+/// result outside `MIN_CELL_PX..=MAX_CELL_PX` — a terminal reporting a cell
+/// under a pixel or over a hundred is reporting something that is not a cell,
+/// and the fallback is a better answer than its arithmetic.
+fn cell_size_from(size: WindowSize) -> Option<CellSize> {
+    /// Below this, the report is noise rather than a font.
+    const MIN_CELL_PX: u16 = 2;
+    /// Above this, likewise — no terminal cell is this large, and a value
+    /// here means the pixel and cell fields have been confused for each
+    /// other somewhere.
+    const MAX_CELL_PX: u16 = 100;
+
+    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let width = size.width / size.columns;
+    let height = size.height / size.rows;
+    if !(MIN_CELL_PX..=MAX_CELL_PX).contains(&width)
+        || !(MIN_CELL_PX..=MAX_CELL_PX).contains(&height)
+    {
+        return None;
+    }
+    Some(CellSize::new(width, height))
 }
 
 /// Telemetry string for `term.graphics_protocol`, matching
@@ -253,6 +299,54 @@ mod tests {
     #[test]
     fn no_recognized_vars_is_none() {
         assert_eq!(probe_with(&[]), GraphicsProtocol::None);
+    }
+
+    fn window(columns: u16, rows: u16, width: u16, height: u16) -> WindowSize {
+        WindowSize {
+            rows,
+            columns,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_reported_window_divides_into_a_cell_size() {
+        // 1512x982 over 189x60 cells: an 8x16 cell, a real macOS terminal.
+        assert_eq!(
+            cell_size_from(window(189, 60, 1512, 960)),
+            Some(CellSize::new(8, 16))
+        );
+        // Retina, where the pixel fields carry device pixels.
+        assert_eq!(
+            cell_size_from(window(100, 40, 1400, 1200)),
+            Some(CellSize::new(14, 30))
+        );
+    }
+
+    /// Every terminal that reports nothing, and every one that reports
+    /// something impossible, has to land on the same answer: `None`, so the
+    /// caller keeps the last good measurement (or the fallback) instead of
+    /// encoding images against nonsense.
+    #[test]
+    fn unreported_and_implausible_window_sizes_are_declined() {
+        // The common case by far: Windows never fills these in, nor do many
+        // Unix terminals.
+        assert_eq!(cell_size_from(window(189, 60, 0, 0)), None);
+        assert_eq!(cell_size_from(window(189, 60, 1512, 0)), None);
+        // A window with no cells at all: nothing to divide by.
+        assert_eq!(cell_size_from(window(0, 0, 1512, 960)), None);
+        // Sub-pixel and absurd cells, i.e. the pixel and cell fields
+        // confused for one another in either direction.
+        assert_eq!(cell_size_from(window(189, 60, 189, 60)), None);
+        assert_eq!(cell_size_from(window(2, 2, 1512, 960)), None);
+    }
+
+    #[test]
+    fn cell_size_wraps_the_real_terminal_without_panicking() {
+        // Smoke test only, like `probe` above: under `cargo test` there may
+        // be no terminal at all, so the result is unspecified.
+        let _ = cell_size();
     }
 
     #[test]

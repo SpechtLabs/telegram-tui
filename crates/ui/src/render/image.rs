@@ -46,14 +46,65 @@ pub struct Footprint {
     pub rows: u16,
 }
 
-/// Cell aspect ratio used to size images when no queried terminal font size
-/// is available. `tgt-ui` must not query the terminal itself (see module
-/// docs), so this is a fixed, conservative stand-in — the same fallback
-/// value `ratatui-image`'s own `Picker` falls back to when its terminal
-/// query comes up empty. A future task may thread the real queried
-/// `FontSize` through from `tgt-app` if the approximation proves visibly
-/// wrong; nothing here changes shape to accommodate that later.
-const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
+/// The terminal's cell size in pixels, measured by `tgt-app`
+/// (`graphics::cell_size`) and handed in like [`Capability`] is — `tgt-ui`
+/// must not measure the terminal itself (see module docs).
+///
+/// This is not a cosmetic detail. Kitty and iTerm2 both place an image by
+/// *pixel* extent, and both derive the cells it covers by dividing that
+/// extent by the terminal's real cell size. Encode a picture at
+/// `cols * width` x `rows * height` pixels with the wrong `width`/`height`
+/// and the terminal spreads it over more (or fewer) cells than the layout
+/// reserved: with a too-large assumption the picture spills past the rows and
+/// columns we marked, out of the conversation pane, and stays there — nothing
+/// ever rewrites cells our own model believes are unchanged blanks. That is
+/// the oversized-and-smearing photo this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl CellSize {
+    /// Zero in either axis is not a cell size, and would divide by zero
+    /// downstream; it falls back to [`CellSize::FALLBACK`]'s corresponding
+    /// axis rather than being rejected, so a terminal that reports only one
+    /// of the two still contributes the one it knows.
+    pub fn new(width: u16, height: u16) -> Self {
+        CellSize {
+            width: if width == 0 {
+                Self::FALLBACK.width
+            } else {
+                width
+            },
+            height: if height == 0 {
+                Self::FALLBACK.height
+            } else {
+                height
+            },
+        }
+    }
+
+    /// What to use when the terminal reports no pixel dimensions at all. The
+    /// same 10x20 `ratatui-image`'s own `Picker` falls back to — a plausible
+    /// 1:2 cell, and nothing more than that. Every protocol this module
+    /// speaks sizes by pixels, so a session that lands here can still place
+    /// images somewhat wrong; it is a floor, not a target.
+    pub const FALLBACK: CellSize = CellSize {
+        width: 10,
+        height: 20,
+    };
+
+    fn font_size(self) -> FontSize {
+        FontSize::new(self.width, self.height)
+    }
+}
+
+impl Default for CellSize {
+    fn default() -> Self {
+        Self::FALLBACK
+    }
+}
 
 /// Monotonic per-process id source for Kitty protocol image placements.
 /// Kitty identifies each transmitted image by a client-chosen id; any
@@ -86,6 +137,7 @@ struct CachedImage {
 /// `ImageArea` can never affect another message's already-encoded protocol.
 pub struct ImageArea {
     capability: Option<Capability>,
+    cell: CellSize,
     cached: Option<CachedImage>,
     /// Pixel dimensions read from `path`'s header by [`ImageArea::plan`],
     /// which the caller runs once per frame while it is laying rows out.
@@ -106,9 +158,10 @@ impl ImageArea {
     /// `false` immediately, telling the caller to fall back to the T37
     /// placeholder card — the "placeholder fallback always available"
     /// half of spec §8.3.
-    pub fn new(capability: Option<Capability>) -> Self {
+    pub fn new(capability: Option<Capability>, cell: CellSize) -> Self {
         Self {
             capability,
+            cell,
             cached: None,
             dimensions: None,
             failed: None,
@@ -127,26 +180,21 @@ impl ImageArea {
     /// draw into, and it must not pay for a full decode per frame to find
     /// out.
     ///
-    /// The answer is an estimate — it applies the same aspect-fit at
-    /// [`FALLBACK_FONT_SIZE`] that `render` does, but `render` re-derives the
-    /// exact footprint from the decoded image and always draws *inside* the
-    /// area it is given. So a disagreement of a cell costs a blank row or
-    /// column, never an overflow.
+    /// Both passes reach their answer through [`bound`] and [`footprint`],
+    /// from the same cell size, so "the rows planning reserved" and "the
+    /// cells rendering fills" are the same arithmetic on the same inputs
+    /// rather than two derivations that happen to agree.
     pub fn plan(&mut self, path: &Path, max_cols: u16, max_rows: u16) -> Option<Footprint> {
         self.capability?;
         if self.failed.as_deref() == Some(path) {
             return None;
         }
-        let max_rows = max_rows.min(MAX_IMAGE_ROWS);
-        if max_cols == 0 || max_rows == 0 {
+        let bounds = bound(Size::new(max_cols, max_rows));
+        if bounds.width == 0 || bounds.height == 0 {
             return None;
         }
         let (width_px, height_px) = self.dimensions_of(path)?;
-        Some(footprint(
-            width_px,
-            height_px,
-            Size::new(max_cols, max_rows),
-        ))
+        Some(footprint(width_px, height_px, bounds, self.cell))
     }
 
     fn dimensions_of(&mut self, path: &Path) -> Option<(u32, u32)> {
@@ -178,6 +226,13 @@ impl ImageArea {
     /// finished downloading, and re-reading a header is the cheap half of
     /// what this call already throws away.
     ///
+    /// This is only half of what "the image must go away" needs, and the
+    /// smaller half: dropping the encoded protocol stops *us* from drawing
+    /// it, and does nothing about the pixels the terminal was already told
+    /// to draw. Those are reclaimed when the cells they cover are written
+    /// again, which is `RenderState::take_repaint_request`'s job — see that
+    /// module's "Erasing, as opposed to forgetting".
+    ///
     /// MANUAL GATE CHECK (documented per plan.md T38 — ghosting cannot be
     /// asserted from a `TestBackend` buffer, since it's a property of the
     /// real terminal's graphics protocol state, not of what ratatui thinks
@@ -199,16 +254,29 @@ impl ImageArea {
     /// - `area` has no room,
     /// - `path` can't be read, or
     /// - the bytes don't decode as an image.
+    ///
+    /// Never draws a cell outside `area`. That is a stronger promise than it
+    /// looks: a `Cell` write past the buffer is dropped, but a protocol
+    /// placement is pixels the terminal owns, and one that overhangs its
+    /// area lands somewhere nothing in this pane will ever rewrite.
     pub fn render(&mut self, area: Rect, path: &Path, f: &mut Frame) -> bool {
         let Some(capability) = self.capability else {
             return false;
         };
-        if area.width == 0 || area.height == 0 {
+        // The caller has already clipped `area` to its pane; clipping again
+        // to the frame is what makes "never a cell outside" hold even if a
+        // future caller forgets, since the protocol's pixels do not stop at
+        // the buffer's edge the way a `Cell` write does.
+        let area = area.intersection(f.area());
+        let capped = bound(Size::new(area.width, area.height));
+        if capped.width == 0 || capped.height == 0 {
             return false;
         }
         let bounded = Rect {
-            height: area.height.min(MAX_IMAGE_ROWS),
-            ..area
+            x: area.x,
+            y: area.y,
+            width: capped.width,
+            height: capped.height,
         };
 
         if let Some(cached) = &self.cached
@@ -228,6 +296,14 @@ impl ImageArea {
             return false;
         };
 
+        // `fit` cannot exceed `bounded` — but if it ever did, `Image` would
+        // silently draw nothing while this returned `true`, leaving blank
+        // reserved rows and no card. Falling back is the honest answer, and
+        // unlike the failures above it says nothing about the file, so it is
+        // not remembered.
+        if size.width > bounded.width || size.height > bounded.height {
+            return false;
+        }
         let rect = Rect {
             x: bounded.x,
             y: bounded.y,
@@ -260,7 +336,7 @@ impl ImageArea {
         let dyn_img = image::load_from_memory(&bytes).ok()?;
 
         let target = Size::new(bounded.width, bounded.height);
-        let (image, size) = fit(dyn_img, target);
+        let (image, size) = fit(dyn_img, target, self.cell);
         if size.width == 0 || size.height == 0 {
             return None;
         }
@@ -276,6 +352,15 @@ impl ImageArea {
     }
 }
 
+/// The single place a caller's "you may have this much room" becomes the box
+/// an image is actually fitted into: [`MAX_IMAGE_ROWS`] applied, nothing
+/// else. Both [`ImageArea::plan`] and [`ImageArea::render`] go through it, so
+/// the rows one reserves and the rows the other fills cannot drift apart by
+/// one pass capping and the other not.
+fn bound(available: Size) -> Size {
+    Size::new(available.width, available.height.min(MAX_IMAGE_ROWS))
+}
+
 /// The cell footprint an image of `width_px` x `height_px` gets inside
 /// `target`, without a decoded image in hand. Mirrors [`fit`] — natural size
 /// when it already fits, otherwise `Resize::Fit`'s proportional shrink — in
@@ -283,45 +368,47 @@ impl ImageArea {
 /// [`ImageArea::plan`] reserves and the rows [`ImageArea::render`] fills are
 /// the same rows. (`Resize::size_for` would answer this directly but wants a
 /// `DynamicImage`, i.e. the full decode this exists to avoid.)
-fn footprint(width_px: u32, height_px: u32, target: Size) -> Footprint {
-    let natural = round_to_cells(width_px, height_px);
+fn footprint(width_px: u32, height_px: u32, target: Size, cell: CellSize) -> Footprint {
+    let natural = round_to_cells(width_px, height_px, cell);
     if natural.cols <= target.width && natural.rows <= target.height {
         return natural;
     }
     let available_px = (
-        u32::from(target.width) * u32::from(FALLBACK_FONT_SIZE.width),
-        u32::from(target.height) * u32::from(FALLBACK_FONT_SIZE.height),
+        u32::from(target.width) * u32::from(cell.width),
+        u32::from(target.height) * u32::from(cell.height),
     );
     let ratio = f64::from(available_px.0.min(width_px)) / f64::from(width_px);
     let ratio = ratio.min(f64::from(available_px.1.min(height_px)) / f64::from(height_px));
     round_to_cells(
         ((f64::from(width_px) * ratio).round() as u32).max(1),
         ((f64::from(height_px) * ratio).round() as u32).max(1),
+        cell,
     )
 }
 
-fn round_to_cells(width_px: u32, height_px: u32) -> Footprint {
+fn round_to_cells(width_px: u32, height_px: u32, cell: CellSize) -> Footprint {
     Footprint {
-        cols: (width_px as f32 / f32::from(FALLBACK_FONT_SIZE.width)).ceil() as u16,
-        rows: (height_px as f32 / f32::from(FALLBACK_FONT_SIZE.height)).ceil() as u16,
+        cols: (width_px as f32 / f32::from(cell.width)).ceil() as u16,
+        rows: (height_px as f32 / f32::from(cell.height)).ceil() as u16,
     }
 }
 
-/// Fits `image` into `target` (a cell-grid bound) at [`FALLBACK_FONT_SIZE`],
-/// preserving aspect ratio, resizing pixel data only when the image's
-/// natural cell size would exceed `target`. Mirrors what
+/// Fits `image` into `target` (a cell-grid bound) at the terminal's real
+/// cell size, preserving aspect ratio, resizing pixel data only when the
+/// image's natural cell size would exceed `target`. Mirrors what
 /// `ratatui_image::picker::Picker::new_protocol` does internally, minus the
 /// parts of its API this crate isn't allowed to call (its resize-decision
 /// helper is private to `ratatui-image`, and its `Picker` constructors all
 /// read the environment, which this crate must not do — see module docs).
-fn fit(image: DynamicImage, target: Size) -> (DynamicImage, Size) {
-    let natural = Resize::natural_size(&image, FALLBACK_FONT_SIZE);
+fn fit(image: DynamicImage, target: Size, cell: CellSize) -> (DynamicImage, Size) {
+    let font_size = cell.font_size();
+    let natural = Resize::natural_size(&image, font_size);
     if natural.width <= target.width && natural.height <= target.height {
         return (image, natural);
     }
     let resize = Resize::Fit(None);
-    let size = resize.size_for(&image, FALLBACK_FONT_SIZE, target);
-    let resized = resize.resize(&image, FALLBACK_FONT_SIZE, size, None);
+    let size = resize.size_for(&image, font_size, target);
+    let resized = resize.resize(&image, font_size, size, None);
     (resized, size)
 }
 
@@ -373,7 +460,7 @@ mod tests {
         let path = scratch_path("no-protocol.png");
         write_png(&path, 40, 40);
 
-        let image_area = ImageArea::new(None);
+        let image_area = ImageArea::new(None, CellSize::FALLBACK);
         let drawn = render_once(image_area, Rect::new(0, 0, 20, 20), &path);
 
         assert!(!drawn, "no capability must never render an image cell");
@@ -388,7 +475,7 @@ mod tests {
         let path = scratch_path("tall.png");
         write_png(&path, 100, 2000);
 
-        let mut image_area = ImageArea::new(Some(Capability::Kitty));
+        let mut image_area = ImageArea::new(Some(Capability::Kitty), CellSize::FALLBACK);
         let area_rect = Rect::new(0, 0, 40, 40);
         let mut terminal =
             Terminal::new(TestBackend::new(area_rect.width, area_rect.height)).expect("backend");
@@ -413,7 +500,7 @@ mod tests {
         let path = scratch_path("garbage.png");
         std::fs::write(&path, b"not actually an image").expect("write garbage bytes");
 
-        let image_area = ImageArea::new(Some(Capability::Kitty));
+        let image_area = ImageArea::new(Some(Capability::Kitty), CellSize::FALLBACK);
         let drawn = render_once(image_area, Rect::new(0, 0, 20, 20), &path);
 
         assert!(!drawn, "undecodable bytes must never render an image cell");
@@ -424,7 +511,7 @@ mod tests {
     fn unreadable_path_falls_back_to_placeholder() {
         let path = scratch_path("does-not-exist.png");
 
-        let image_area = ImageArea::new(Some(Capability::Sixel));
+        let image_area = ImageArea::new(Some(Capability::Sixel), CellSize::FALLBACK);
         let drawn = render_once(image_area, Rect::new(0, 0, 20, 20), &path);
 
         assert!(!drawn, "a missing file must never render an image cell");
@@ -435,53 +522,181 @@ mod tests {
         let path = scratch_path("zero-area.png");
         write_png(&path, 10, 10);
 
-        let image_area = ImageArea::new(Some(Capability::Iterm2));
+        let image_area = ImageArea::new(Some(Capability::Iterm2), CellSize::FALLBACK);
         let drawn = render_once(image_area, Rect::new(0, 0, 0, 0), &path);
 
         assert!(!drawn);
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Wide, tall, square, and one that fits without any resizing at all.
+    const SHAPES: [(u32, u32); 4] = [(400, 100), (100, 2000), (300, 300), (30, 40)];
+
     /// The contract the conversation view depends on: the rows `plan`
     /// reserves are the rows `render` fills. A mismatch is not a crash, but
     /// it is a visible gap (reserved too many) or a clipped image (too few),
     /// and the two derive their answer from different inputs — a file header
     /// vs. a decoded image — so nothing but a test keeps them agreeing.
+    ///
+    /// Run at several cell sizes, because the cell size is now measured from
+    /// the terminal rather than assumed: every one of them has to hold, not
+    /// just the 10x20 both passes used to hard-code.
     #[test]
     fn plan_reserves_the_rows_render_actually_fills() {
-        // Wide, tall, square, and one that fits without any resizing at all.
-        for (i, (w, h)) in [(400u32, 100u32), (100, 2000), (300, 300), (30, 40)]
-            .into_iter()
-            .enumerate()
-        {
-            let path = scratch_path(&format!("plan-{i}.png"));
-            write_png(&path, w, h);
+        for cell in [
+            CellSize::FALLBACK,
+            CellSize::new(7, 15),
+            CellSize::new(9, 18),
+            CellSize::new(20, 40),
+        ] {
+            for (i, (w, h)) in SHAPES.into_iter().enumerate() {
+                let path = scratch_path(&format!("plan-{}-{}-{i}.png", cell.width, cell.height));
+                write_png(&path, w, h);
 
-            let mut image_area = ImageArea::new(Some(Capability::Kitty));
-            let planned = image_area
-                .plan(&path, 30, 40)
-                .expect("a readable PNG with a capability plans a footprint");
-            assert!(
-                planned.rows <= MAX_IMAGE_ROWS && planned.cols <= 30,
-                "{w}x{h}: plan {planned:?} escaped its bounds"
-            );
+                let mut image_area = ImageArea::new(Some(Capability::Kitty), cell);
+                let planned = image_area
+                    .plan(&path, 30, 40)
+                    .expect("a readable PNG with a capability plans a footprint");
+                assert!(
+                    planned.rows <= MAX_IMAGE_ROWS && planned.cols <= 30,
+                    "{w}x{h} at {cell:?}: plan {planned:?} escaped its bounds"
+                );
 
-            let area_rect = Rect::new(0, 0, 30, planned.rows);
-            let mut terminal = Terminal::new(TestBackend::new(40, 40)).expect("backend");
-            let mut drawn = false;
-            terminal
-                .draw(|f| drawn = image_area.render(area_rect, &path, f))
-                .expect("draw");
-            assert!(drawn, "{w}x{h}: should have rendered");
+                let area_rect = Rect::new(0, 0, 30, planned.rows);
+                let mut terminal = Terminal::new(TestBackend::new(40, 40)).expect("backend");
+                let mut drawn = false;
+                terminal
+                    .draw(|f| drawn = image_area.render(area_rect, &path, f))
+                    .expect("draw");
+                assert!(drawn, "{w}x{h} at {cell:?}: should have rendered");
 
-            let rect = image_area.cached.as_ref().expect("cached").rect;
-            assert_eq!(
-                (rect.width, rect.height),
-                (planned.cols, planned.rows),
-                "{w}x{h}: plan {planned:?} disagrees with the rendered footprint"
-            );
-            let _ = std::fs::remove_file(&path);
+                let rect = image_area.cached.as_ref().expect("cached").rect;
+                assert_eq!(
+                    (rect.width, rect.height),
+                    (planned.cols, planned.rows),
+                    "{w}x{h} at {cell:?}: plan disagrees with the rendered footprint"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
         }
+    }
+
+    /// The property the leaked-fragment bug violated: whatever the file's
+    /// aspect ratio and whatever the caller asks for, the cells drawn stay
+    /// inside the area handed in. A protocol placement that runs one column
+    /// past its area is pixels in a region nothing in the conversation pane
+    /// will ever rewrite.
+    #[test]
+    fn a_rendered_image_never_exceeds_the_area_it_was_given() {
+        // Deliberately awkward areas, including ones far taller than
+        // MAX_IMAGE_ROWS and ones a single cell wide.
+        for area_rect in [
+            Rect::new(0, 0, 30, 40),
+            Rect::new(3, 2, 12, 4),
+            Rect::new(0, 0, 1, 30),
+            Rect::new(10, 10, 25, 1),
+        ] {
+            for (i, (w, h)) in SHAPES.into_iter().enumerate() {
+                let path = scratch_path(&format!(
+                    "bounds-{}-{}-{i}.png",
+                    area_rect.x, area_rect.width
+                ));
+                write_png(&path, w, h);
+
+                let mut image_area = ImageArea::new(Some(Capability::Kitty), CellSize::new(7, 15));
+                let mut terminal = Terminal::new(TestBackend::new(60, 60)).expect("backend");
+                terminal
+                    .draw(|f| {
+                        image_area.render(area_rect, &path, f);
+                    })
+                    .expect("draw");
+
+                if let Some(cached) = image_area.cached.as_ref() {
+                    let drawn = cached.rect;
+                    assert!(
+                        drawn.right() <= area_rect.right()
+                            && drawn.bottom() <= area_rect.bottom()
+                            && drawn.x >= area_rect.x
+                            && drawn.y >= area_rect.y,
+                        "{w}x{h}: drew {drawn:?} outside {area_rect:?}"
+                    );
+                    assert!(
+                        drawn.height <= MAX_IMAGE_ROWS,
+                        "{w}x{h}: drew {} rows, over the {MAX_IMAGE_ROWS}-row cap",
+                        drawn.height
+                    );
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// A rect that reaches past the frame is clipped rather than trusted:
+    /// `Frame`'s buffer stops writes at its edge, but a graphics protocol's
+    /// pixels do not, so the area has to be narrowed before it is encoded.
+    #[test]
+    fn an_area_reaching_past_the_frame_is_clipped_to_it() {
+        let path = scratch_path("past-the-frame.png");
+        write_png(&path, 300, 300);
+
+        let mut image_area = ImageArea::new(Some(Capability::Kitty), CellSize::FALLBACK);
+        let mut terminal = Terminal::new(TestBackend::new(20, 20)).expect("backend");
+        terminal
+            .draw(|f| {
+                image_area.render(Rect::new(15, 15, 40, 40), &path, f);
+            })
+            .expect("draw");
+
+        let drawn = image_area.cached.as_ref().expect("cached").rect;
+        assert!(
+            drawn.right() <= 20 && drawn.bottom() <= 20,
+            "drew {drawn:?} outside the 20x20 frame"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same picture in the same box is the same size whatever the
+    /// terminal reports — but a terminal with smaller cells fits *more* of
+    /// them under one image, which is exactly the arithmetic that decides
+    /// how far the picture spreads on screen. A hard-coded cell size gets
+    /// this wrong in whichever direction the real terminal differs.
+    #[test]
+    fn the_measured_cell_size_decides_the_footprint() {
+        let path = scratch_path("cell-size.png");
+        // 210x150 px: 21x7.5 cells at 10x20, 30x10 cells at 7x15.
+        write_png(&path, 210, 150);
+
+        let footprint_at = |cell: CellSize| {
+            ImageArea::new(Some(Capability::Kitty), cell)
+                .plan(&path, 40, 40)
+                .expect("plans")
+        };
+
+        assert_eq!(
+            footprint_at(CellSize::FALLBACK),
+            Footprint { cols: 21, rows: 8 }
+        );
+        assert_eq!(
+            footprint_at(CellSize::new(7, 15)),
+            Footprint { cols: 30, rows: 10 }
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A cell size can arrive from an ioctl that filled in one axis and not
+    /// the other; a zero there would divide by zero in `round_to_cells`.
+    #[test]
+    fn a_zero_axis_falls_back_rather_than_dividing_by_it() {
+        assert_eq!(CellSize::new(0, 0), CellSize::FALLBACK);
+        assert_eq!(
+            CellSize::new(0, 15),
+            CellSize::new(CellSize::FALLBACK.width, 15)
+        );
+        assert_eq!(
+            CellSize::new(7, 0),
+            CellSize::new(7, CellSize::FALLBACK.height)
+        );
+        assert_eq!(CellSize::default(), CellSize::FALLBACK);
     }
 
     #[test]
@@ -490,10 +705,12 @@ mod tests {
         write_png(&path, 40, 40);
 
         assert!(
-            ImageArea::new(None).plan(&path, 20, 20).is_none(),
+            ImageArea::new(None, CellSize::FALLBACK)
+                .plan(&path, 20, 20)
+                .is_none(),
             "no capability plans nothing"
         );
-        let mut with_capability = ImageArea::new(Some(Capability::Kitty));
+        let mut with_capability = ImageArea::new(Some(Capability::Kitty), CellSize::FALLBACK);
         assert!(with_capability.plan(&path, 0, 20).is_none(), "no columns");
         assert!(with_capability.plan(&path, 20, 0).is_none(), "no rows");
         assert!(
@@ -516,7 +733,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read the valid PNG");
         std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate it");
 
-        let mut image_area = ImageArea::new(Some(Capability::Kitty));
+        let mut image_area = ImageArea::new(Some(Capability::Kitty), CellSize::FALLBACK);
         assert!(
             image_area.plan(&path, 20, 20).is_some(),
             "the header alone still parses, so planning cannot tell yet"
@@ -545,7 +762,7 @@ mod tests {
         let path = scratch_path("cache-then-invalidate.png");
         write_png(&path, 20, 20);
 
-        let mut image_area = ImageArea::new(Some(Capability::Kitty));
+        let mut image_area = ImageArea::new(Some(Capability::Kitty), CellSize::FALLBACK);
         let area_rect = Rect::new(0, 0, 20, 20);
         let mut terminal =
             Terminal::new(TestBackend::new(area_rect.width, area_rect.height)).expect("backend");

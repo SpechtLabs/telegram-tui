@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::DefaultTerminal;
+use ratatui::backend::Backend;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, MissedTickBehavior};
 
@@ -28,7 +29,7 @@ use tgt_core::model::time::Millis;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, TdUpdate};
 use tgt_ui::render::hit::HitMap;
-use tgt_ui::render::image::Capability;
+use tgt_ui::render::image::{Capability, CellSize};
 use tgt_ui::render::state::RenderState;
 use tgt_ui::theme::Theme;
 
@@ -94,6 +95,16 @@ pub struct Core {
     /// is up, so a click that arrives before or under either resolves to
     /// nothing rather than to a stale frame's geometry.
     last_hits: HitMap,
+    /// Whether the terminal's cell size needs (re)measuring before the next
+    /// frame. Starts true, so the first frame is drawn against a measured
+    /// size rather than `CellSize::FALLBACK`.
+    ///
+    /// Measuring is an ioctl on the real terminal, which is `run`'s business
+    /// and not this struct's: the integration tests `#[path]`-include this
+    /// module without `main.rs` or `graphics.rs` and drive `Core` directly
+    /// against `FakeTd`, with no terminal to ask (the same reason
+    /// [`ThemeResolver`] is a `fn` pointer rather than a `crate::` call).
+    cell_size_stale: bool,
 }
 
 impl Core {
@@ -126,6 +137,7 @@ impl Core {
             effects: Vec::new(),
             render: RenderState::new(graphics),
             last_hits: HitMap::new(),
+            cell_size_stale: true,
         }
     }
 
@@ -192,6 +204,11 @@ impl Core {
                 // of this.
                 if let Event::Resize(_, _) = event {
                     self.render.clear();
+                    // A resize is also what arrives when the user changes
+                    // the font size, so the cell size inline images are
+                    // encoded against has to be measured again. Measuring is
+                    // `run`'s job, not this one's — see the field.
+                    self.cell_size_stale = true;
                 }
                 if let Some(action) = tgt_ui::input::map_event(event) {
                     self.apply(resolve_pasted_path(action));
@@ -319,6 +336,11 @@ struct LiveTheme {
 /// module still has to typecheck standalone either way.
 type ThemeResolver = fn(&str) -> Theme;
 
+/// Measures the terminal's cell size in pixels. Always
+/// `graphics::cell_size` in the real binary; a `fn` pointer for the same
+/// reason [`ThemeResolver`] is one.
+type CellMeasure = fn() -> Option<CellSize>;
+
 /// How a frame is put on screen, as opposed to what is in it: everything
 /// [`run`] needs for drawing and nothing it needs for running the app.
 /// `main.rs` resolves all three from config and the startup probe.
@@ -330,6 +352,8 @@ pub struct Presentation {
     /// The terminal graphics protocol, or `None` for the design-language §4
     /// fallback (`main.rs::graphics_capability`).
     pub graphics: Option<Capability>,
+    /// How the terminal's cell size is measured. See [`CellMeasure`].
+    pub measure_cell: CellMeasure,
 }
 
 /// Runs `app` to completion. The caller owns terminal setup/teardown (raw
@@ -354,6 +378,7 @@ pub async fn run(
         theme,
         resolve_theme,
         graphics,
+        measure_cell,
     } = presentation;
     let (term_events, event_reader_running) = spawn_terminal_event_reader();
     let mut core = Core::new(app, runtime, config, td_boot, term_events, graphics);
@@ -369,6 +394,7 @@ pub async fn run(
         &mut core,
         &mut live_theme,
         resolve_theme,
+        measure_cell,
         terminal,
         &mut last_draw,
     )?;
@@ -378,6 +404,7 @@ pub async fn run(
             &mut core,
             &mut live_theme,
             resolve_theme,
+            measure_cell,
             terminal,
             &mut last_draw,
         )?;
@@ -391,6 +418,7 @@ fn draw_if_due(
     core: &mut Core,
     live_theme: &mut LiveTheme,
     resolve_theme: ThemeResolver,
+    measure_cell: CellMeasure,
     terminal: &mut DefaultTerminal,
     last_draw: &mut Option<Instant>,
 ) -> io::Result<()> {
@@ -409,9 +437,22 @@ fn draw_if_due(
             app,
             render,
             last_hits,
+            cell_size_stale,
             ..
         } = core;
         let state = app.state();
+
+        // Before anything is laid out: inline images are encoded at a pixel
+        // size derived from this, and the terminal decides how many cells
+        // that covers by dividing by the same number. A stale one draws a
+        // photo over more cells than the layout reserved for it. A terminal
+        // that reports nothing leaves the last good measurement in place
+        // rather than replacing it with a guess.
+        if std::mem::take(cell_size_stale)
+            && let Some(cell) = measure_cell()
+        {
+            render.set_cell_size(cell);
+        }
 
         // A theme switch (currently only `state::palette`'s `ToggleTheme`)
         // bumps `theme_generation`; notice it here and re-resolve rather
@@ -433,8 +474,51 @@ fn draw_if_due(
         // now on screen, and a click can only ever mean something against
         // the frame the user was looking at.
         terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, render))?;
+
+        // A frame that changed which inline images are placed leaves the
+        // terminal holding pixels for the ones that went away: they live in
+        // the terminal's own layer, and ratatui's diff will not rewrite the
+        // cells it thinks are unchanged blanks underneath them (see
+        // `tgt_ui::render::state`'s "Erasing, as opposed to forgetting").
+        //
+        // Drawing twice rather than deferring to the next frame, because
+        // there may not be a next frame: the loop draws on change, so a
+        // scroll that settles would leave the fragments on screen until the
+        // user happened to do something else. The redraw cannot ask for a
+        // third — the second pass finds every slot already placed, sweeps
+        // nothing, and moves no viewport.
+        if render.take_repaint_request() {
+            repaint(terminal)?;
+            terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, render))?;
+        }
         *last_draw = Some(Instant::now());
     }
+    Ok(())
+}
+
+/// Blanks the screen and makes the next `draw` a full repaint rather than a
+/// diff, so that every cell is written again — including the ones a graphics
+/// protocol placed pixels over, which is the whole point (see
+/// `tgt_ui::render::state`'s "Erasing, as opposed to forgetting").
+///
+/// Deliberately *not* `Terminal::clear()`, which does exactly this but reads
+/// the cursor position first — and reading it means writing `ESC[6n` and
+/// waiting on stdin for the reply, on a process that already has
+/// [`spawn_terminal_event_reader`]'s thread parked in crossterm's reader. The
+/// two contend for crossterm's internal reader lock, with a two-second
+/// timeout on the loser, and this runs on every frame where a placement
+/// changed. The cursor position is worth nothing here anyway: the draw that
+/// follows sets it.
+///
+/// The pair is what does it. Blanking the screen alone would leave ratatui
+/// believing the old frame is still displayed and diffing away every cell of
+/// the redraw; resetting the buffers alone would leave the terminal's
+/// graphics layer untouched, which is the bug. `swap_buffers` resets the
+/// inactive buffer and flips, so calling it once out of band leaves both
+/// buffers blank — matching the screen that was just cleared.
+fn repaint(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    terminal.backend_mut().clear()?;
+    terminal.swap_buffers();
     Ok(())
 }
 
