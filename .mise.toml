@@ -5,7 +5,14 @@
 # green pipeline.
 
 [tools]
-rust = "1.97.1"                # mirrors rust-toolchain.toml
+# `components` has to be repeated here even though rust-toolchain.toml already
+# declares it: mise installs the toolchain through rustup with the minimal
+# profile and exports RUSTUP_TOOLCHAIN, and that variable takes precedence over
+# rust-toolchain.toml, so the file's component list never gets applied. Without
+# this, `cargo fmt`/`cargo clippy` fail on a clean machine (and in CI) with
+# "'cargo-fmt' is not installed for the toolchain". Keep the version in step
+# with rust-toolchain.toml.
+rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
 pinact = "4.1.0"
 
