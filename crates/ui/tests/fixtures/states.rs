@@ -563,7 +563,7 @@ pub fn with_chat_search(
 
 pub fn toast(chat_id: ChatId, title: &str, body: &str, expires_at_ms: u64) -> Toast {
     Toast {
-        chat_id,
+        chat_id: Some(chat_id),
         title: title.to_string(),
         body: body.to_string(),
         expires_at: Millis(expires_at_ms),

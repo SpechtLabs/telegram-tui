@@ -68,7 +68,7 @@ is a candidate for editing.
 | `state/modal.rs` | Modal lifecycle: confirm-delete, send-file; confirmation → effects |
 | `state/palette.rs` | `ctrl+p` palette: nucleo fuzzy match over chats and commands |
 | `state/search.rs` | In-chat search: query, hit list, `n`/`N` stepping |
-| `state/toasts.rs` | Toast queue (max 3, 4 s TTL), mute/focused-chat suppression |
+| `state/toasts.rs` | Toast queue (max 3, 4 s TTL), mute/focused-chat suppression, chat-less notifications |
 | `state/media.rs` | `FileSnapshot` table, download/upload progress, viewport-priority derivation |
 | `state/presence.rs` | Typing indicators (with expiry) and user online status |
 | `td/runtime.rs` | `TdRuntime` trait |
@@ -1187,9 +1187,15 @@ pub const TOAST_TTL_MS: u64 = 4_000;
 /// In-app only: title/body may contain chat titles and message text because
 /// they never leave the terminal cell grid. Effect::Alert (the escape-sequence
 /// path) carries no payload at all.
+///
+/// `chat_id` is `None` for a notification with no chat to point at — a
+/// failed logout, a failed "open externally" — raised through
+/// `on_chatless_failure` rather than `on_new_message`/`on_action_failed`.
+/// `view/toast.rs` never reads this field either way; it's reserved for a
+/// future click-to-jump.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
-    pub chat_id: ChatId,
+    pub chat_id: Option<ChatId>,
     pub title: String,
     pub body: String,
     pub expires_at: Millis,

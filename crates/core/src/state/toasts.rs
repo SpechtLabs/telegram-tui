@@ -24,6 +24,13 @@
 //! otherwise tells the user anything happened at all. None of the three
 //! suppression rules above apply to it: a failure the user's own keypress
 //! caused is not the unsolicited-message case those rules were written for.
+//!
+//! `on_chatless_failure` is the third source, for a failure with no chat at
+//! all to attach to: `App::dispatch` calls it from `LogOutDone`'s `Err` arm
+//! and `IoResult::ExternalOpened`'s `Err` arm. It shares `on_action_failed`'s
+//! unconditional delivery — same reasoning, a failure caused by the user's
+//! own action is never suppressed — but its `Toast.chat_id` is `None`
+//! instead of derived from a chat that may not exist for this failure.
 
 use std::collections::VecDeque;
 
@@ -39,9 +46,15 @@ pub const TOAST_TTL_MS: u64 = 4_000;
 /// In-app only: title/body may contain chat titles and message text because
 /// they never leave the terminal cell grid. Effect::Alert (the escape-sequence
 /// path) carries no payload at all.
+///
+/// `chat_id` is `None` for a notification with no chat to point at — a
+/// failed logout, a failed "open externally" — raised through
+/// `on_chatless_failure` rather than `on_new_message`/`on_action_failed`.
+/// `view/toast.rs` never reads this field either way; it's reserved for a
+/// future click-to-jump.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
-    pub chat_id: ChatId,
+    pub chat_id: Option<ChatId>,
     pub title: String,
     pub body: String,
     pub expires_at: Millis,
@@ -71,7 +84,7 @@ pub fn on_new_message(app: &mut AppState, msg: &MessageView) -> Vec<Effect> {
     let title = chat
         .map(|c| c.title.clone())
         .unwrap_or_else(|| "New message".to_string());
-    push_toast(app, msg.chat_id, title, preview_text(&msg.content))
+    push_toast(app, Some(msg.chat_id), title, preview_text(&msg.content))
 }
 
 /// Unconditional counterpart to `on_new_message`: raised for a failed
@@ -95,14 +108,29 @@ pub fn on_action_failed(app: &mut AppState, chat_id: ChatId, body: String) -> Ve
         .get(&chat_id)
         .map(|c| c.title.clone())
         .unwrap_or_else(|| "Chat".to_string());
-    push_toast(app, chat_id, title, body)
+    push_toast(app, Some(chat_id), title, body)
 }
 
-/// Shared enqueue-and-cap step behind both toast sources: push, then drop
-/// the oldest past `TOAST_MAX`. Always raises the alert — a toast that
+/// Third, unconditional source, alongside `on_new_message` and
+/// `on_action_failed`: for a failure with no chat to attach to at all — a
+/// failed logout, a failed "open externally" — rather than one this app
+/// merely doesn't know the chat for. `title` and `body` are both
+/// caller-supplied, same division of labor as `on_action_failed`: this
+/// module owns the queue, not the vocabulary.
+pub fn on_chatless_failure(app: &mut AppState, title: String, body: String) -> Vec<Effect> {
+    push_toast(app, None, title, body)
+}
+
+/// Shared enqueue-and-cap step behind all three toast sources: push, then
+/// drop the oldest past `TOAST_MAX`. Always raises the alert — a toast that
 /// enqueues but never rings the bell would be silently missed exactly like
 /// the bug this task fixes.
-fn push_toast(app: &mut AppState, chat_id: ChatId, title: String, body: String) -> Vec<Effect> {
+fn push_toast(
+    app: &mut AppState,
+    chat_id: Option<ChatId>,
+    title: String,
+    body: String,
+) -> Vec<Effect> {
     let toast = Toast {
         chat_id,
         title,
@@ -345,6 +373,47 @@ mod tests {
 
         assert_eq!(effects.len(), 1);
         assert_eq!(app.toasts.toasts[0].title, "Chat");
+    }
+
+    /// `on_chatless_failure` raises the same alert and leaves `chat_id`
+    /// unset — the one thing distinguishing it from the other two sources.
+    #[test]
+    fn chatless_failure_toasts_with_no_chat_id() {
+        let mut app = fixture_state();
+
+        let effects = on_chatless_failure(
+            &mut app,
+            "Log out".to_string(),
+            "Couldn't log out".to_string(),
+        );
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::Alert));
+        assert_eq!(app.toasts.toasts.len(), 1);
+        assert_eq!(app.toasts.toasts[0].chat_id, None);
+        assert_eq!(app.toasts.toasts[0].title, "Log out");
+        assert_eq!(app.toasts.toasts[0].body, "Couldn't log out");
+    }
+
+    /// Unconditional like `on_action_failed`: a chatless failure still
+    /// toasts even while a chat is open and focused — there is no chat for
+    /// the mute/focus suppression rules to even key off of.
+    #[test]
+    fn chatless_failure_ignores_open_chat() {
+        let mut app = fixture_state();
+        app.chat_list
+            .chats
+            .insert(CHAT_A, chat(CHAT_A, "Alice", false));
+        app.open_chat = Some(CHAT_A);
+
+        let effects = on_chatless_failure(
+            &mut app,
+            "Open file".to_string(),
+            "Couldn't open the file".to_string(),
+        );
+
+        assert_eq!(effects.len(), 1);
+        assert_eq!(app.toasts.toasts.len(), 1);
     }
 
     /// Shares the same cap-at-three, drop-oldest queue as incoming-message

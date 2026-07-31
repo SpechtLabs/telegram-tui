@@ -622,7 +622,7 @@ mod tests {
         state.height = 40;
         state.toasts = ToastState {
             toasts: VecDeque::from(vec![Toast {
-                chat_id: ChatId(2),
+                chat_id: Some(ChatId(2)),
                 title: "Grace Hopper".to_string(),
                 body: "the compiler is done".to_string(),
                 expires_at: Millis(5_000),

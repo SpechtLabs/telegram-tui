@@ -166,7 +166,7 @@ mod tests {
 
     fn toast(chat_id: i64, title: &str, body: &str) -> Toast {
         Toast {
-            chat_id: ChatId(chat_id),
+            chat_id: Some(ChatId(chat_id)),
             title: title.to_string(),
             body: body.to_string(),
             expires_at: Millis(5_000),
@@ -218,5 +218,21 @@ mod tests {
         )]);
         let rendered = render_to_string(120, 40, &state);
         assert!(rendered.contains('…'));
+    }
+
+    /// A chat-less toast (`chat_id: None` — a failed logout, a failed
+    /// "open externally") renders exactly like a chat-scoped one:
+    /// `draw_one` never reads the field either way.
+    #[test]
+    fn chatless_toast_renders_like_any_other() {
+        let state = fixture_state(vec![Toast {
+            chat_id: None,
+            title: "Log out".to_string(),
+            body: "Couldn't log out".to_string(),
+            expires_at: Millis(5_000),
+        }]);
+        let rendered = render_to_string(120, 40, &state);
+        assert!(rendered.contains("Log out"));
+        assert!(rendered.contains("Couldn't log out"));
     }
 }

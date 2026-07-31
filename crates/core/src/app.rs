@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::action::{Action, TdResult};
+use crate::action::{Action, IoResult, TdResult};
 use crate::effect::{Effect, TelemetryMode};
 use crate::model::hit::{ClickButton, HitTarget, ScrollArea};
 use crate::model::ids::{ChatId, MessageId};
@@ -535,14 +535,68 @@ impl App {
                     effects
                 }
             },
-            // `Action::Io(_)` and `TdResult::LogOutDone` stay dropped here,
-            // deliberately, past this task's scope: `ConfigSaved` and
-            // `LogOutDone` failures want either `Toast.chat_id` widened to
-            // `Option<ChatId>` (a shared type — docs/architecture.md first)
-            // or a second, chat-less notification path, and logout has no
-            // allowlisted telemetry action yet at all, unlike the four
-            // above which already had one firing optimistically. Those are
-            // product decisions, not wiring.
+            // `Ok` needs nothing: `/logout` already tears down the client,
+            // resets state, and lands back on the phone screen (see
+            // `AccountReset` above and `tgt-app`'s restart handling) — a
+            // visibly dramatic transition that is its own confirmation.
+            // `Err` is the case that previously vanished into the wildcard
+            // below: the user is still signed in, mid-`/logout`, with
+            // nothing telling them it failed. Unlike the four message
+            // actions above, `LogOut` has no allowlisted telemetry action
+            // (`schema::actions` has none for it) and deliberately gets
+            // none here either — that is a product decision about what
+            // this app reports, not something to add as a side effect of
+            // an unrelated UI fix.
+            Action::TdResult(TdResult::LogOutDone { outcome }) => match outcome {
+                Ok(()) => Vec::new(),
+                Err(_) => {
+                    self.dirty = true;
+                    toasts::on_chatless_failure(
+                        &mut self.state,
+                        "Log out".to_string(),
+                        "Couldn't log out".to_string(),
+                    )
+                }
+            },
+            // Opening a file externally (spec: `/open`, or a media hit
+            // target) has no chat-scoped completion to hang a toast off of
+            // the way the four message actions do — `path` is all it
+            // carries, and no chat is necessarily even open. `Ok` is a
+            // no-op: the OS opener took over, there is nothing left for
+            // this app to show.
+            //
+            // No telemetry event fires here either, same reasoning as
+            // `LogOutDone` above: this would be a first-ever event needing
+            // a new `actions::` constant, which is a call for the user to
+            // make, not this fix. If that ever gets wired,
+            // `IoErrorKind::NotFound` (the only failure mode this effect
+            // actually produces — a missing opener binary) folds into
+            // `error_kinds::IO_OTHER` rather than earning its own
+            // constant; it isn't distinct enough from "other" to be worth
+            // a reviewed schema diff on its own.
+            Action::Io(IoResult::ExternalOpened { path, outcome }) => match outcome {
+                Ok(()) => Vec::new(),
+                Err(_) => {
+                    self.dirty = true;
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    toasts::on_chatless_failure(
+                        &mut self.state,
+                        "Open file".to_string(),
+                        format!("Couldn't open {name}"),
+                    )
+                }
+            },
+            // `ClipboardCopied` and `ConfigSaved` stay dropped here.
+            // `ConfigSaved`'s `Err` is structurally unreachable in practice
+            // — `tgt-app`'s config-write handler aborts the process via
+            // `fatal_tx` before an `Action::Io` is ever sent for a failed
+            // write (see `dispatch.rs`'s config-save task) — and a
+            // clipboard copy failing silently is a smaller loss than the
+            // other two: the text the user tried to copy is still on
+            // screen to select by hand.
             _ => Vec::new(),
         }
     }
@@ -2126,6 +2180,7 @@ mod tests {
 mod routing {
     use super::tests::{boot_fixture, chat, logged_in, message};
     use super::*;
+    use crate::action::IoErrorKind;
     use crate::td::error::TdError;
     use crate::telemetry::Outcome;
 
@@ -2337,7 +2392,7 @@ mod routing {
         assert_eq!(event.error_kind, Some(TdError::NetTimeout.telemetry_kind()));
 
         assert_eq!(app.state().toasts.toasts.len(), 1);
-        assert_eq!(app.state().toasts.toasts[0].chat_id, CHAT);
+        assert_eq!(app.state().toasts.toasts[0].chat_id, Some(CHAT));
         assert!(app.take_dirty(), "the new toast is render-worthy");
     }
 
@@ -2418,7 +2473,84 @@ mod routing {
                     && event.error_kind == Some(TdError::Offline.telemetry_kind())
         )));
         assert_eq!(app.state().toasts.toasts.len(), 1);
-        assert_eq!(app.state().toasts.toasts[0].chat_id, DEST);
+        assert_eq!(app.state().toasts.toasts[0].chat_id, Some(DEST));
+    }
+
+    /// A successful logout raises nothing here: the visible confirmation is
+    /// the screen transition `AccountReset` drives, not a toast.
+    #[test]
+    fn log_out_done_ok_is_a_no_op() {
+        let mut app = chat_open();
+        app.take_dirty();
+
+        let effects = app.update(Action::TdResult(TdResult::LogOutDone { outcome: Ok(()) }));
+
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.state().toasts.toasts.is_empty());
+        assert!(!app.take_dirty());
+    }
+
+    /// This task's fix: a failed `LogOutDone` — previously dropped by the
+    /// catch-all, leaving the user signed in with no signal at all — now
+    /// raises a chat-less toast. No telemetry: `LogOut` has no allowlisted
+    /// action, and adding one is out of scope here (see the `dispatch` arm's
+    /// doc comment).
+    #[test]
+    fn log_out_done_err_toasts_with_no_chat_id() {
+        let mut app = chat_open();
+        app.take_dirty();
+
+        let effects = app.update(Action::TdResult(TdResult::LogOutDone {
+            outcome: Err(TdError::Offline),
+        }));
+
+        assert!(effects.iter().any(|e| matches!(e, Effect::Alert)));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Telemetry(_))),
+            "logout gets no telemetry: {effects:?}"
+        );
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+        assert_eq!(app.state().toasts.toasts[0].chat_id, None);
+        assert!(app.take_dirty());
+    }
+
+    /// A file opened successfully needs no acknowledgment; the OS opener
+    /// taking over is confirmation enough.
+    #[test]
+    fn external_opened_ok_is_a_no_op() {
+        let mut app = chat_open();
+        app.take_dirty();
+
+        let effects = app.update(Action::Io(IoResult::ExternalOpened {
+            path: std::path::PathBuf::from("/tmp/photo.jpg"),
+            outcome: Ok(()),
+        }));
+
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.state().toasts.toasts.is_empty());
+        assert!(!app.take_dirty());
+    }
+
+    /// A failed "open externally" — e.g. no opener configured for this
+    /// platform — is the same class of silent failure the four message
+    /// actions were fixed for. Toasts chat-less, names the file, no
+    /// telemetry (see the `dispatch` arm's doc comment).
+    #[test]
+    fn external_opened_err_toasts_naming_the_file() {
+        let mut app = chat_open();
+        app.take_dirty();
+
+        let effects = app.update(Action::Io(IoResult::ExternalOpened {
+            path: std::path::PathBuf::from("/tmp/photo.jpg"),
+            outcome: Err(IoErrorKind::NotFound),
+        }));
+
+        assert!(effects.iter().any(|e| matches!(e, Effect::Alert)));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Telemetry(_))));
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+        assert_eq!(app.state().toasts.toasts[0].chat_id, None);
+        assert_eq!(app.state().toasts.toasts[0].body, "Couldn't open photo.jpg");
+        assert!(app.take_dirty());
     }
 
     #[test]
