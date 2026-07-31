@@ -13,6 +13,12 @@ rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
 pinact = "4.1.0"
 
+# Documentation website (docs/): VuePress builds under bun, and the same
+# markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
+# and `mise run docs-build` locally are exactly what CI does.
+bun = "1.3.14"
+markdownlint-cli2 = "0.23.2"
+
 [env]
 # Where `mise run install` puts the binary and TDLib's dylib. The packaged
 # layout is bin/ + ../lib, which is what the binary's @executable_path/../lib
@@ -102,6 +108,18 @@ set -euo pipefail
 rm -f "$TGT_PREFIX/bin/tgt" "$TGT_PREFIX"/lib/libtdjson*.dylib
 echo "removed tgt from $TGT_PREFIX"
 '''
+
+[tasks.docs-lint]
+description = "Lint the documentation markdown (the docs workflow's first job)"
+run = "markdownlint-cli2 'docs/**/*.md'"
+
+[tasks.docs-dev]
+description = "Serve the documentation website locally with hot reload"
+run = "cd docs && bun install && bun run dev"
+
+[tasks.docs-build]
+description = "Build the documentation website (the docs workflow's second job)"
+run = "cd docs && bun install --frozen-lockfile && bun run build"
 
 [tasks.update-gha]
 description = "Update GithubActions to latest version and pin their commit sha"
