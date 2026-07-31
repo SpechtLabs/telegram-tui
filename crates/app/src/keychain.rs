@@ -1,8 +1,9 @@
-//! TDLib database encryption key, stored in the macOS Keychain via the
-//! `keyring` crate; generated on first run and never written to disk in
-//! plaintext (spec §9.3). Also the TDLib database directory itself.
+//! TDLib database encryption key, stored in the platform credential store via
+//! the `keyring` crate — the Keychain on macOS, the Credential Manager on
+//! Windows, and a D-Bus Secret Service provider on other unixes; generated on
+//! first run and never written to disk in plaintext (spec §9.3). Also the
+//! TDLib database directory itself.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, Context};
@@ -13,13 +14,20 @@ const DB_KEY_USER: &str = "db-encryption-key";
 const APP_DIR: &str = "telegram-tui";
 const TD_SUBDIR: &str = "td";
 
-/// Gets the 32-byte TDLib database encryption key from the macOS Keychain,
-/// generating and storing a fresh random one on first run. The key is
-/// stored hex-encoded (Keychain entries are UTF-8 strings); it is never
-/// held anywhere else, and never written to a plaintext file.
+/// Gets the 32-byte TDLib database encryption key from the platform
+/// credential store, generating and storing a fresh random one on first run.
+/// The key is stored hex-encoded (credential-store entries are UTF-8
+/// strings); it is never held anywhere else, and never written to a plaintext
+/// file.
+///
+/// On macOS and Windows the backing store is always there. On other unixes it
+/// is a D-Bus Secret Service provider — gnome-keyring, KWallet, KeePassXC —
+/// which a headless or bare ssh session may simply not have running, and
+/// there is no fallback: without a store there is nowhere to keep the key
+/// that isn't a plaintext file on disk, so this fails and startup stops.
 pub fn db_key() -> eyre::Result<[u8; 32]> {
     let entry = keyring::Entry::new(SERVICE, DB_KEY_USER).map_err(|err| {
-        eyre::eyre!("failed to open Keychain entry {SERVICE}/{DB_KEY_USER}: {err}")
+        eyre::eyre!("failed to open credential store entry {SERVICE}/{DB_KEY_USER}: {err}")
     })?;
 
     match entry.get_password() {
@@ -27,27 +35,41 @@ pub fn db_key() -> eyre::Result<[u8; 32]> {
         Err(keyring::Error::NoEntry) => {
             let mut key = [0u8; 32];
             rand::fill(&mut key);
-            entry
-                .set_password(&hex_encode(&key))
-                .map_err(|err| eyre::eyre!("failed to store db key in Keychain: {err}"))?;
+            entry.set_password(&hex_encode(&key)).map_err(|err| {
+                eyre::eyre!("failed to store db key in the credential store: {err}")
+            })?;
             Ok(key)
         }
         Err(err) => Err(eyre::eyre!(
-            "failed to read db key from Keychain entry {SERVICE}/{DB_KEY_USER}: {err}"
+            "failed to read db key from credential store entry {SERVICE}/{DB_KEY_USER}: {err}"
         )),
     }
 }
 
-/// `~/.local/share/telegram-tui/td/` (spec §9.3), created mode `0700` if it
-/// doesn't already exist. An existing directory's mode is left untouched.
+/// `~/.local/share/telegram-tui/td/` (spec §9.3), or
+/// `%APPDATA%\telegram-tui\td\` on Windows. Created mode `0700` on unix if it
+/// doesn't already exist; an existing directory's mode is left untouched.
+///
+/// That `0700` is a real privacy property rather than tidiness: this
+/// directory holds the TDLib database, which is every message this client has
+/// cached. Windows has no mode bits, so the directory is created with
+/// whatever ACL it inherits from `%APPDATA%` — restrictive in practice on a
+/// normal single-user profile, but inherited rather than asserted. Matching
+/// the unix guarantee would take an explicit DACL, and that is unfinished
+/// work, not parity.
 pub fn td_database_dir() -> eyre::Result<PathBuf> {
     let strategy = etcetera::choose_base_strategy()
         .map_err(|err| eyre::eyre!("could not determine the data directory: {err}"))?;
     let dir = strategy.data_dir().join(APP_DIR).join(TD_SUBDIR);
 
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(&dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
 
@@ -87,12 +109,15 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Only the unix-gated directory test below mutates the environment, so
+    // the lock it needs is gated with it; leaving it visible everywhere would
+    // be dead code under `-D warnings` on Windows.
+    #[cfg(unix)]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
@@ -116,6 +141,13 @@ mod tests {
         assert!(decode_key("deadbeef").is_err());
     }
 
+    /// Unix only, for two reasons that both stop it dead on Windows: there
+    /// are no mode bits to assert, and `XDG_DATA_HOME` — the hook this test
+    /// uses to redirect the directory into a tempdir — is not consulted by
+    /// `etcetera`'s Windows strategy, which answers `%APPDATA%` regardless.
+    /// Whether Windows creates the directory at all is left to the
+    /// integration tests.
+    #[cfg(unix)]
     #[test]
     fn td_database_dir_created_with_mode_0700() {
         let _lock = lock_env();
@@ -139,13 +171,14 @@ mod tests {
         }
     }
 
-    /// Touches the real macOS Keychain, which may prompt for permission the
-    /// first time it runs interactively. Run manually with:
+    /// Touches the real platform credential store, which may prompt for
+    /// permission the first time it runs interactively and needs a Secret
+    /// Service provider to be running on non-Apple unixes. Run manually with:
     /// `cargo test -p tgt-app keychain -- --ignored`.
     #[test]
     #[ignore]
     fn db_key_is_stable_across_calls() {
-        let first = db_key().expect("db_key should succeed against the real Keychain");
+        let first = db_key().expect("db_key should succeed against the real credential store");
         let second = db_key().expect("db_key should succeed on a second call");
         assert_eq!(
             first, second,

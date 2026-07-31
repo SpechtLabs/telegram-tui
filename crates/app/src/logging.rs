@@ -77,13 +77,20 @@ pub fn install_export_layer(handle: &ExportHandle, layer: ExportLayer) -> eyre::
         .map_err(|err| eyre::eyre!("failed to install the telemetry export layer: {err}"))
 }
 
-/// `$XDG_STATE_HOME/telegram-tui/`, defaulting to `~/.local/state/telegram-tui/`.
+/// `$XDG_STATE_HOME/telegram-tui/`, defaulting to `~/.local/state/telegram-tui/`,
+/// and `%LOCALAPPDATA%\telegram-tui\` on Windows.
+///
+/// A state directory is an XDG idea, so `etcetera`'s Windows strategy answers
+/// `None` for it. Its cache directory is `%LOCALAPPDATA%`, which is where
+/// Windows expects exactly this kind of file: regenerable, machine-local, and
+/// specifically not something to sync onto every other machine the user signs
+/// in to — which `%APPDATA%`, the roaming half and the one holding the config
+/// and the database, would do. On unix `state_dir` always answers, so the
+/// fallback is unreachable there and `~/.cache` is never used.
 fn state_dir() -> eyre::Result<PathBuf> {
     let strategy = etcetera::choose_base_strategy()
         .map_err(|err| eyre::eyre!("could not determine the state directory: {err}"))?;
-    let base = strategy
-        .state_dir()
-        .ok_or_else(|| eyre::eyre!("this platform strategy has no state directory"))?;
+    let base = strategy.state_dir().unwrap_or_else(|| strategy.cache_dir());
     Ok(base.join(APP_DIR))
 }
 

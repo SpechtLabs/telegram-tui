@@ -36,13 +36,13 @@
 //!
 //! # Opening a file externally
 //!
-//! `OpenExternal` shells out to `open` on macOS, overridable through
-//! `TGT_OPENER` — which is what the integration tests point at a harmless
-//! command, and what a user on a non-macOS terminal would set to
-//! `xdg-open`. The child is spawned and awaited for its exit status only:
-//! nothing it writes is read, because a viewer inheriting this process's
-//! stdio would paint over the TUI. `Stdio::null()` on all three streams is
-//! the enforcement.
+//! `OpenExternal` shells out to whatever the platform uses to hand a file to
+//! its default application — see [`DEFAULT_OPENER`] for the three spellings —
+//! overridable through `TGT_OPENER`, which is what the integration tests
+//! point at a harmless command. The child is spawned and awaited for its
+//! exit status only: nothing it writes is read, because a viewer inheriting
+//! this process's stdio would paint over the TUI. `Stdio::null()` on all
+//! three streams is the enforcement.
 //!
 //! # `SetTdlibParameters` — the impure boundary
 //!
@@ -77,8 +77,9 @@ use crate::config::Config;
 use crate::media_kind;
 
 /// TDLib parameters that come from neither the config file nor `update()`:
-/// the 32-byte database key held in the macOS Keychain and the 0700 database
-/// directory. The api credentials are read from the shared [`Config`] at the
+/// the 32-byte database key held in the platform credential store and the
+/// database directory, which is mode 0700 where the platform has modes. The
+/// api credentials are read from the shared [`Config`] at the
 /// moment the request is built, so a wizard that has just written them is
 /// picked up without rebuilding anything.
 #[derive(Debug, Clone)]
@@ -91,11 +92,40 @@ pub struct TdBootParams {
 /// client is expected to survive restarts without re-downloading the world.
 /// `system_version` is left to TDLib, which probes the OS itself.
 const SYSTEM_LANGUAGE_CODE: &str = "en";
-const DEVICE_MODEL: &str = "Mac";
 
-/// Command `Effect::OpenExternal` runs, and the environment variable that
-/// overrides it. See the module docs.
-const DEFAULT_OPENER: &str = "open";
+// What Telegram shows this session as in the user's active sessions list, so
+// it names the machine the client runs on rather than the client. Cosmetic,
+// but it is the line a user reads when deciding whether a session is theirs,
+// and every platform reporting "Mac" makes that harder rather than easier.
+#[cfg(target_os = "macos")]
+const DEVICE_MODEL: &str = "Mac";
+#[cfg(target_os = "windows")]
+const DEVICE_MODEL: &str = "PC";
+#[cfg(target_os = "linux")]
+const DEVICE_MODEL: &str = "Linux";
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+const DEVICE_MODEL: &str = "Desktop";
+
+/// The platform's "hand this to whatever handles it" command, as a program
+/// plus the arguments that have to precede the path. See the module docs.
+///
+/// macOS has `open` and the freedesktop platforms have `xdg-open`, both of
+/// which take the path as their only argument. Windows has no such
+/// executable: `start` is a `cmd` builtin, so it has to be invoked through
+/// `cmd /c`. The empty `""` is not padding — `start` reads its first quoted
+/// argument as the title of the console window to open, so without a title to
+/// eat it, a quoted path is consumed as one and nothing is opened.
+#[cfg(target_os = "macos")]
+const DEFAULT_OPENER: (&str, &[&str]) = ("open", &[]);
+#[cfg(target_os = "windows")]
+const DEFAULT_OPENER: (&str, &[&str]) = ("cmd", &["/c", "start", ""]);
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const DEFAULT_OPENER: (&str, &[&str]) = ("xdg-open", &[]);
+
+/// Overrides the program above with a bare command taking the path as its
+/// only argument — which is what the integration tests point at a harmless
+/// command, and the escape hatch for a desktop whose handler is neither of
+/// the defaults.
 const OPENER_ENV: &str = "TGT_OPENER";
 
 /// Executes `Effect`s produced by `App::update`. Everything an effect needs
@@ -298,8 +328,9 @@ impl Inner {
     }
 
     /// `arboard` talks to the platform clipboard synchronously (a round trip
-    /// through NSPasteboard on macOS), so it goes on the blocking pool like
-    /// every other blocking call in this crate.
+    /// through NSPasteboard on macOS, and a protocol exchange with the
+    /// compositor or X server elsewhere), so it goes on the blocking pool
+    /// like every other blocking call in this crate.
     ///
     /// The `Clipboard` handle is built and dropped inside the task rather
     /// than cached on `Inner`: it is neither `Sync` nor cheap to hold across
@@ -332,8 +363,14 @@ impl Inner {
     /// Hands a downloaded file to the platform viewer. See the module docs
     /// for the opener command and why the child's stdio is discarded.
     async fn open_external(&self, path: PathBuf) {
-        let opener = std::env::var(OPENER_ENV).unwrap_or_else(|_| DEFAULT_OPENER.to_string());
+        // An override replaces the whole invocation, leading arguments
+        // included: it names a program that takes the path and nothing else.
+        let (opener, leading_args) = match std::env::var(OPENER_ENV) {
+            Ok(custom) => (custom, &[][..]),
+            Err(_) => (DEFAULT_OPENER.0.to_string(), DEFAULT_OPENER.1),
+        };
         let status = tokio::process::Command::new(&opener)
+            .args(leading_args)
             .arg(&path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

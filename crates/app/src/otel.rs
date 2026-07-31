@@ -347,9 +347,9 @@ fn resource(session: &SessionContext) -> Resource {
 
 /// The macOS product version — `"15.3.1"` — which is what OTel semantic
 /// conventions mean by `os.version`, and what `keys::OS_VERSION` has been
-/// reserving a slot for since T03. Spec §2 makes macOS the only supported
-/// platform, so `sw_vers` is the authoritative source; `std::env::consts::OS`
-/// would only ever answer `"macos"`, which is an OS *name*, not a version.
+/// reserving a slot for since T03. `sw_vers` is the authoritative source;
+/// `std::env::consts::OS` would only ever answer `"macos"`, which is an OS
+/// *name*, not a version.
 ///
 /// It is a subprocess, so it is called from [`resource`] and nowhere else:
 /// a session with telemetry off never spawns it, and a session with
@@ -360,6 +360,7 @@ fn resource(session: &SessionContext) -> Resource {
 /// of an allowlist is that every exported value has a known shape as well as
 /// a known key, so a machine whose `sw_vers` answers something unexpected
 /// contributes no attribute at all rather than an unbounded string.
+#[cfg(target_os = "macos")]
 fn os_version() -> Option<String> {
     let output = std::process::Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
@@ -373,6 +374,21 @@ fn os_version() -> Option<String> {
         && version.len() <= 16
         && version.chars().all(|c| c.is_ascii_digit() || c == '.');
     plausible.then_some(version)
+}
+
+/// No `os.version` off macOS, and the attribute is simply omitted.
+///
+/// Every other platform needs a different source with a different output
+/// shape — `/etc/os-release`'s `VERSION_ID` varies by distribution and is
+/// absent entirely on rolling releases, and Windows has no equivalent short
+/// of a registry or WMI read. Reporting the OS *name* here instead would be a
+/// different attribute wearing this one's key, and an allowlisted key whose
+/// value has no fixed shape is exactly what the allowlist exists to prevent.
+/// Omitting it is the honest answer until each platform gets a probe that has
+/// been checked on that platform.
+#[cfg(not(target_os = "macos"))]
+fn os_version() -> Option<String> {
+    None
 }
 
 /// OTLP/HTTP wants the signal path on the endpoint; a configured endpoint
@@ -507,17 +523,27 @@ fn config_dir() -> eyre::Result<PathBuf> {
     Ok(strategy.config_dir().join(APP_DIR))
 }
 
-/// Creates (or truncates) `path` with mode `0600` and writes `bytes`. The
-/// mode is set at `open` time rather than afterwards so the content is never
-/// world-readable, not even briefly.
+/// Creates (or truncates) `path` and writes `bytes`, with mode `0600` on
+/// unix. The mode is set at `open` time rather than afterwards so the content
+/// is never world-readable, not even briefly.
+///
+/// The mode is load-bearing, not hygiene: the two files written through here
+/// are the install id and the hashing salt, and the irreversibility this
+/// module promises rests on the salt staying secret. Windows has no mode
+/// bits, so the file is created with whatever ACL it inherits from
+/// `%APPDATA%` — restrictive in practice on a normal single-user profile, but
+/// inherited rather than asserted. Matching the unix guarantee would take an
+/// explicit DACL, and that is unfinished work, not parity.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> eyre::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut file = options
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(bytes)
@@ -805,6 +831,13 @@ mod tests {
         assert!(protocol_from(Some("carrier-pigeon")).is_err());
     }
 
+    /// Unix only, for two reasons that both stop it dead on Windows: there
+    /// are no mode bits to assert, and `XDG_CONFIG_HOME` — the hook this test
+    /// uses to keep the identity files inside a tempdir — is not consulted by
+    /// `etcetera`'s Windows strategy, which answers `%APPDATA%` regardless.
+    /// Running it there would write to the real config directory and still
+    /// prove nothing about privacy.
+    #[cfg(unix)]
     #[test]
     fn identity_is_stable_across_calls_and_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -870,16 +903,21 @@ mod tests {
             );
         }
 
-        // Spec §2 makes macOS the only supported platform, so `sw_vers` is
-        // always there and the attribute is never the absent branch.
-        let os = resource
-            .get(&opentelemetry::Key::from_static_str(keys::OS_VERSION))
-            .expect("os.version is attached");
-        assert!(
-            os.as_str()
-                .split('.')
-                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
-            "os.version should be a dotted number, got {os:?}"
-        );
+        // `sw_vers` is always there on macOS, so the attribute is never the
+        // absent branch; off macOS `os_version` has no source and the absent
+        // branch is the only one. Either way the loop above has already
+        // checked that whatever *is* attached is allowlisted.
+        #[cfg(target_os = "macos")]
+        {
+            let os = resource
+                .get(&opentelemetry::Key::from_static_str(keys::OS_VERSION))
+                .expect("os.version is attached");
+            assert!(
+                os.as_str()
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
+                "os.version should be a dotted number, got {os:?}"
+            );
+        }
     }
 }

@@ -1,5 +1,12 @@
 # rust-toolchain.toml — authoritative for the compiler
+#
+# No `targets` key on purpose. It adds targets to install *on top of* the host's
+# own, so pinning one here only ever means "also install a cross-compilation
+# target" — which is not something this project does: TDLib is a prebuilt native
+# shared library per platform, and cross-linking it is not a supported path. Each
+# host builds for itself, and rustup gives every host its own target already.
+# Naming one target here would additionally make every non-macOS machine download
+# a macOS std it can never link against.
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
-targets = ["aarch64-apple-darwin"]

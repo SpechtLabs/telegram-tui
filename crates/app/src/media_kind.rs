@@ -40,6 +40,13 @@ pub fn kind_for(path: &Path) -> OutgoingFileKind {
 /// exist, or any other `fs` error swallowed by `Path::exists` — collapses to
 /// `None`; callers only need "usable to hand to TDLib" or not, not the
 /// reason it isn't.
+///
+/// The `~/` shorthand stays unix-shaped on purpose. It is a shell convention,
+/// not a filesystem one, and Windows shells do not have it — a Windows user
+/// types or drags an absolute path, which needs no expansion. `HOME` is
+/// unset there, so the lookup collapses to `None` and the string is treated
+/// as a literal path, which is the right answer for a Windows path that
+/// happens to start with `~`.
 pub fn existing_path(s: &str) -> Option<PathBuf> {
     let expanded = match s.strip_prefix("~/") {
         Some(rest) => PathBuf::from(env::var_os("HOME")?).join(rest),
@@ -99,6 +106,9 @@ mod tests {
         assert_eq!(existing_path(missing.to_str().unwrap()), None);
     }
 
+    /// Unix only: `~/` expansion is deliberately not a Windows behaviour, and
+    /// `HOME` is not set there to expand against. See `existing_path`.
+    #[cfg(unix)]
     #[test]
     fn existing_path_expands_leading_tilde() {
         let home = env::var_os("HOME").expect("HOME set in test environment");

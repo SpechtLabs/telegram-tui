@@ -585,11 +585,14 @@ async fn init_tdlib_logging(client_id: i32, log_path: Option<PathBuf>) {
     }
 }
 
-/// `$XDG_STATE_HOME/telegram-tui/tdlib.log`, alongside the app's own log.
+/// `$XDG_STATE_HOME/telegram-tui/tdlib.log`, alongside the app's own log —
+/// which means falling back to the cache directory where there is no state
+/// directory, exactly as `logging::state_dir` does and for the same reason.
+/// The two have to agree: "alongside" is the whole point.
 fn default_td_log_path() -> Option<PathBuf> {
     use etcetera::BaseStrategy;
     let strategy = etcetera::choose_base_strategy().ok()?;
-    let base = strategy.state_dir()?;
+    let base = strategy.state_dir().unwrap_or_else(|| strategy.cache_dir());
     Some(base.join(APP_DIR).join(TD_LOG_FILE))
 }
 

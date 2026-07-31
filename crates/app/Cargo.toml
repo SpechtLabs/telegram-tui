@@ -18,6 +18,13 @@ ratatui = "=0.30.2"
 clap = { version = "=4.6.4", features = ["derive"] }
 color-eyre = "=0.6.5"
 etcetera = "=0.11.0"
+# Default features are deliberate and sufficient on all three platforms: the
+# default `v1` feature turns on the Keychain store, the Windows Credential
+# Manager store and the zbus Secret Service store together, and keyring gates
+# each one's dependency to the platform it belongs to, so naming them per
+# target here would only restate what keyring already does. On non-Apple unix
+# the Secret Service store needs a provider running (gnome-keyring, KWallet,
+# KeePassXC) — see `keychain::db_key`, which has no fallback for its absence.
 keyring = "=4.1.5"
 arboard = "=3.6.1"
 rand = "=0.10.2"
@@ -39,6 +46,16 @@ opentelemetry-appender-tracing = "=0.32.0"
 # Not used directly: it pins the TLS backend for the OTLP exporter's blocking
 # HTTP client, which otherwise cannot talk to an https collector.
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Wayland clipboard, which is not one of arboard's default features. Without it
+# arboard only speaks X11, so a pure Wayland session with no XWayland has no
+# clipboard at all and every yank fails. It is additive rather than a swap:
+# arboard tries the Wayland protocol when `WAYLAND_DISPLAY` is set and falls
+# back to X11 otherwise, or if the Wayland handshake fails. Stated per target
+# because the feature pulls `wl-clipboard-rs`, which arboard makes available on
+# non-Apple unix only.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 insta = { workspace = true }
