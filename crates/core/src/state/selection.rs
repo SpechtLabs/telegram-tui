@@ -242,7 +242,7 @@ fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Eff
     let Some(idx) = conversation::index_of(&convo.messages, message_id) else {
         return Vec::new();
     };
-    let chips = chips_for_message(&convo.messages[idx], &app.media);
+    let chips = chips_for_message(&convo.messages[idx], &app.media, &convo.revealed_spoilers);
     let send_failed = matches!(convo.messages[idx].send_state, SendState::Failed(_));
     let now = app.now;
 
@@ -330,7 +330,7 @@ fn recompute_chips(app: &mut AppState, chat_id: ChatId, message_id: MessageId) {
     let Some(idx) = conversation::index_of(&convo.messages, message_id) else {
         return;
     };
-    let chips = chips_for_message(&convo.messages[idx], &app.media);
+    let chips = chips_for_message(&convo.messages[idx], &app.media, &convo.revealed_spoilers);
 
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
         return;
@@ -344,19 +344,36 @@ fn recompute_chips(app: &mut AppState, chat_id: ChatId, message_id: MessageId) {
 }
 
 /// The bridge between the message model and [`chips_for`]: TDLib's caps plus
-/// the three local facts only the client knows.
-fn chips_for_message(msg: &MessageView, media: &MediaState) -> Vec<Chip> {
+/// the local facts only the client knows.
+///
+/// `Chip::Reveal` is appended here rather than folded into [`chips_for`]
+/// itself (architecture §7.5.1, T77): it is not a TDLib capability, and
+/// keeping it out of that function's signature keeps its five-argument,
+/// exhaustively-tested contract untouched. Suppressed on a failed send —
+/// same as every other chip that function's `send_failed` short-circuit
+/// already drops — since a message that never reached the server has
+/// nothing server-confirmed to reveal.
+fn chips_for_message(
+    msg: &MessageView,
+    media: &MediaState,
+    revealed_spoilers: &std::collections::BTreeSet<MessageId>,
+) -> Vec<Chip> {
     let file = file_of(&msg.content);
     let downloaded = file
         .and_then(|id| media.files.get(&id))
         .is_some_and(|f| f.is_completed);
-    chips_for(
+    let send_failed = matches!(msg.send_state, SendState::Failed(_));
+    let mut chips = chips_for(
         &msg.caps,
         msg.is_outgoing,
         file.is_some(),
         downloaded,
-        matches!(msg.send_state, SendState::Failed(_)),
-    )
+        send_failed,
+    );
+    if !send_failed && conversation::has_unrevealed_spoiler(msg, revealed_spoilers) {
+        chips.push(Chip::Reveal);
+    }
+    chips
 }
 
 // --- chip invocation ----------------------------------------------------
@@ -441,6 +458,15 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
             None => Vec::new(),
         },
         Chip::Resend => resend(app, chat_id, &msg),
+        // Local and synchronous, unlike every other chip here: nothing
+        // comes back from TDLib to trigger a fresh `recompute_chips`, so
+        // this calls it directly — otherwise `Reveal` would sit in the row
+        // for a message that no longer has anything left to reveal.
+        Chip::Reveal => {
+            let effects = conversation::reveal_spoilers(app, chat_id, message_id);
+            recompute_chips(app, chat_id, message_id);
+            effects
+        }
     }
 }
 
@@ -616,6 +642,19 @@ mod tests {
             caps: MessageCaps::default(),
             is_edited: false,
         }
+    }
+
+    fn msg_with_spoiler(id: i64) -> MessageView {
+        let mut m = msg(id);
+        m.content = MessageContent::Text(FormattedText {
+            text: "before secret after".to_string(),
+            entities: vec![crate::model::entity::TextEntity {
+                offset_utf16: 7,
+                length_utf16: 6,
+                kind: crate::model::entity::EntityKind::Spoiler,
+            }],
+        });
+        m
     }
 
     fn full_caps() -> MessageCaps {
@@ -1336,5 +1375,57 @@ mod tests {
         // The failed corpse is gone, and so is the selection pointing at it.
         assert!(app.conversations[&CHAT].messages.is_empty());
         assert!(app.conversations[&CHAT].selection.is_none());
+    }
+
+    #[test]
+    fn reveal_is_offered_for_an_unrevealed_spoiler_and_not_after() {
+        let mut app = with_messages(vec![msg_with_spoiler(1)]);
+        enter(&mut app);
+        assert!(
+            selection(&app).chips.contains(&Chip::Reveal),
+            "expected Reveal in {:?}",
+            selection(&app).chips
+        );
+
+        let effects = handle_key(&mut app, Key::Char('v')).expect("Reveal answers to 'v'");
+        assert!(effects.is_empty());
+        assert!(
+            app.conversations[&CHAT]
+                .revealed_spoilers
+                .contains(&MessageId(1))
+        );
+        // The row is re-derived immediately (module docs on `Chip::Reveal`'s
+        // `invoke` arm): nothing left to reveal, so it drops out on its own
+        // rather than sitting there until some unrelated recompute.
+        assert!(!selection(&app).chips.contains(&Chip::Reveal));
+    }
+
+    #[test]
+    fn reveal_is_not_offered_without_a_spoiler_or_once_already_revealed() {
+        let mut app = with_messages(vec![msg(1)]);
+        enter(&mut app);
+        assert!(!selection(&app).chips.contains(&Chip::Reveal));
+
+        let mut app = with_messages(vec![msg_with_spoiler(1)]);
+        app.conversations
+            .get_mut(&CHAT)
+            .unwrap()
+            .revealed_spoilers
+            .insert(MessageId(1));
+        enter(&mut app);
+        assert!(!selection(&app).chips.contains(&Chip::Reveal));
+    }
+
+    /// Mirrors `chips_for`'s own failed-send short-circuit (module docs on
+    /// `chips_for_message`): a message that never reached the server has
+    /// nothing server-confirmed to reveal, spoiler entity or not.
+    #[test]
+    fn reveal_is_suppressed_on_a_failed_send_even_with_a_spoiler() {
+        let mut m = msg_with_spoiler(1);
+        m.is_outgoing = true;
+        m.send_state = SendState::Failed(TdError::NetTimeout);
+        let mut app = with_messages(vec![m]);
+        enter(&mut app);
+        assert_eq!(selection(&app).chips, vec![Chip::Resend, Chip::Delete]);
     }
 }

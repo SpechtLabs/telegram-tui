@@ -22,6 +22,14 @@ pub enum Chip {
     Download, // 'l'  (file content, not yet downloaded)
     Open,     // 'o'  (file content, downloaded)
     Resend,   // 's'  (only SendState::Failed)
+    /// The `⏎`-on-selected-message reveal the design spec calls for
+    /// (architecture §7.5.1, T77): unlike every other chip, it is not
+    /// derived by `chips_for` from `MessageCaps` — a local rendering fact
+    /// (an unrevealed `Spoiler` entity) gates it instead, appended by
+    /// `selection.rs` after `chips_for` runs. Its presence here, not a
+    /// hidden key binding, is what keeps the row "the truth about what is
+    /// possible" for this action too.
+    Reveal, // 'v'  (message has an unrevealed spoiler)
 }
 
 impl Chip {
@@ -36,6 +44,7 @@ impl Chip {
             Chip::Download => 'l',
             Chip::Open => 'o',
             Chip::Resend => 's',
+            Chip::Reveal => 'v',
         }
     }
 
@@ -50,6 +59,7 @@ impl Chip {
             Chip::Download => "Download",
             Chip::Open => "Open",
             Chip::Resend => "Resend",
+            Chip::Reveal => "Reveal",
         }
     }
 }
@@ -107,6 +117,7 @@ mod tests {
         Chip::Download,
         Chip::Open,
         Chip::Resend,
+        Chip::Reveal,
     ];
 
     fn caps(

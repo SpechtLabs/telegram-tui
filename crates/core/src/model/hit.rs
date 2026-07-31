@@ -15,6 +15,17 @@ pub enum HitTarget {
     FolderTab(ChatListId),
     Message(MessageId),
     Composer,
+    /// A masked spoiler run's cells (architecture §7.5.1): sub-row, and
+    /// only pushed for the columns the block glyphs actually occupy.
+    Spoiler(MessageId),
+    /// A reply-quote line's cells (architecture §7.5.1). `quoted` is the
+    /// jump target; `containing` is the message the line's block belongs
+    /// to, so right-click still enters selection on the right message even
+    /// though the quoted message may not be loaded at all.
+    ReplyQuote {
+        containing: MessageId,
+        quoted: MessageId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

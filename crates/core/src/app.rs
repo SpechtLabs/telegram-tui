@@ -957,6 +957,30 @@ impl App {
             (HitTarget::Message(message_id), ClickButton::Right) => {
                 self.click_message_right(message_id)
             }
+            // Sub-row targets (architecture §7.5.1, T77). Right-click on
+            // either mirrors plain `Message`'s: it enters selection on the
+            // message the *row* belongs to, never on `ReplyQuote`'s quoted
+            // message, which is why that variant carries both ids.
+            (HitTarget::Spoiler(message_id), ClickButton::Left) => {
+                let Some(chat_id) = self.state.open_chat else {
+                    return Vec::new();
+                };
+                self.dirty = true;
+                conversation::reveal_spoilers(&mut self.state, chat_id, message_id)
+            }
+            (HitTarget::Spoiler(message_id), ClickButton::Right) => {
+                self.click_message_right(message_id)
+            }
+            (HitTarget::ReplyQuote { quoted, .. }, ClickButton::Left) => {
+                let Some(chat_id) = self.state.open_chat else {
+                    return Vec::new();
+                };
+                self.dirty = true;
+                conversation::jump_to_message(&mut self.state, chat_id, quoted)
+            }
+            (HitTarget::ReplyQuote { containing, .. }, ClickButton::Right) => {
+                self.click_message_right(containing)
+            }
             // Left-click on a message, and right-click on anything else,
             // are no-ops in v1 (architecture §7.5): claimed (nothing falls
             // through to a pane below, there is none left to fall to), but
@@ -2858,6 +2882,102 @@ mod routing {
         assert_eq!(describe(&effects), ["Td(GetMessageProperties)"]);
         assert_eq!(selected_message(&app), Some(NEWEST));
         assert_eq!(app.state().focus.depth(), 2, "no second level stacked");
+    }
+
+    /// Left-click on a spoiler reveals exactly that message, without
+    /// touching selection or focus (architecture §7.5.1, T77) — unlike
+    /// right-click on the same target, which is `Message`'s right-click in
+    /// every other respect.
+    #[test]
+    fn left_click_spoiler_reveals_that_message_only() {
+        let mut app = chat_open();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::Spoiler(MessageId(10)),
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert!(
+            app.state().conversations[&CHAT]
+                .revealed_spoilers
+                .contains(&MessageId(10))
+        );
+        assert!(
+            !app.state().conversations[&CHAT]
+                .revealed_spoilers
+                .contains(&NEWEST),
+            "only the clicked message reveals"
+        );
+        assert_eq!(
+            *app.state().focus.current(),
+            Focus::Composer,
+            "revealing a spoiler must not enter selection mode"
+        );
+    }
+
+    #[test]
+    fn right_click_spoiler_enters_selection_like_an_ordinary_message() {
+        let mut app = chat_open();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::Spoiler(MessageId(10)),
+            button: ClickButton::Right,
+        });
+        assert_eq!(
+            describe(&effects),
+            ["Td(GetMessageProperties)", "Td(GetChatHistory)"]
+        );
+        assert_eq!(selected_message(&app), Some(MessageId(10)));
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+        assert!(
+            app.state().conversations[&CHAT]
+                .revealed_spoilers
+                .is_empty(),
+            "right-click reveals nothing"
+        );
+    }
+
+    /// Left-click jumps to the *quoted* message; right-click still enters
+    /// selection on the *containing* one, which is why the target carries
+    /// both ids (architecture §7.5.1, T77).
+    #[test]
+    fn reply_quote_click_routes_left_to_jump_and_right_to_the_containing_message() {
+        let mut app = chat_open();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::ReplyQuote {
+                containing: NEWEST,
+                quoted: MessageId(10),
+            },
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(10),
+                line_offset: 0,
+            }
+        );
+        assert_eq!(
+            *app.state().focus.current(),
+            Focus::Composer,
+            "jumping must not enter selection mode"
+        );
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::ReplyQuote {
+                containing: NEWEST,
+                quoted: MessageId(10),
+            },
+            button: ClickButton::Right,
+        });
+        assert_eq!(describe(&effects), ["Td(GetMessageProperties)"]);
+        assert_eq!(
+            selected_message(&app),
+            Some(NEWEST),
+            "right-click selects the containing message, not the quoted one"
+        );
     }
 
     #[test]

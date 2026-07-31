@@ -2262,6 +2262,16 @@ pub enum HitTarget {
     FolderTab(ChatListId),
     Message(MessageId),
     Composer,
+    /// A masked spoiler run's cells, sub-row (T77): narrower than the
+    /// `Message` rect for the same row, and pushed after it so it wins
+    /// there (`target_at`'s existing last-pushed rule — unchanged).
+    Spoiler(MessageId),
+    /// A reply-quote line's cells, sub-row (T77). `quoted` is the message
+    /// the excerpt names (the jump target); `containing` is the message
+    /// whose block the line is part of, carried separately so a right-click
+    /// here still enters selection on the right message — the *quoted*
+    /// message may not even be loaded (`§7.5.1`).
+    ReplyQuote { containing: MessageId, quoted: MessageId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2296,16 +2306,110 @@ pub fn view(state: &AppState, theme: &Theme, f: &mut Frame, cache: &mut LayoutCa
   `FolderTab` switches lists; `ArchiveRow` toggles archive; `Composer`
   focuses the composer; right-click `Message` enters selection mode on that
   message (`selection::enter_at`, new alongside `enter`); left-click
-  `Message` is a no-op in v1. While a modal, the palette, or help is
-  focused, all clicks and scrolls are ignored (overlays are keyboard-only
-  for now). `Scroll` maps to the pane's existing Up/Down semantics
-  (chat-list selection movement; conversation anchor movement — which keeps
-  the paging trigger working from the wheel).
+  `Message` is a no-op in v1. `Spoiler`/`ReplyQuote` left/right-click
+  routing is §7.5.1. While a modal, the palette, or help is focused, all
+  clicks and scrolls are ignored (overlays are keyboard-only for now).
+  `Scroll` maps to the pane's existing Up/Down semantics (chat-list
+  selection movement; conversation anchor movement — which keeps the paging
+  trigger working from the wheel).
 - App: `[app] mouse = true` config key (default on; unknown-key-tolerant
   parsers make this backward-safe). Mouse capture is enabled with the
   alternate screen and released in BOTH the normal teardown and the panic
   hook's restore. Native terminal text selection requires shift while
   capture is on — the config toggle is the escape hatch.
+
+### 7.5.1 Sub-row hit targets: spoiler reveal, reply-quote jump (T77 amendment — audit findings #66/#67, 2026-07-31)
+
+Both features were specified but never reachable: `revealed_spoilers` and
+`ReplyPreview.message_id` already existed and the render side already
+consumed them (masking, the `↳` line), but nothing could ever set the
+former or act on the latter, because every hit target before this amendment
+was whole-row.
+
+**Finding sub-row targets without touching `message_layout.rs`.** The
+obvious approach — have layout return column-range metadata alongside its
+`Vec<Line>` — was rejected: it is out of this task's file scope, and it
+would touch the layout cache (§8.2) for a fact the *view* can already
+recover for free. A masked spoiler run is rendered as `'█'` glyphs and
+nothing else ever produces that character in this pipeline (progress bars
+use `▓`/`░`, a different glyph); the reply-quote line is rendered as exactly
+one span whose content starts `↳ ` and nothing else does. So `view::build_window`
+scans the already-laid-out `Line`s it gets back from the cache for spans
+matching either signature, computing column ranges from `unicode-width` on
+what it finds — the same content-signature technique this file's own
+`message_layout.rs` tests already use to locate a masked span. No new
+metadata leaves `message_layout.rs`; the cache and its key are untouched.
+
+**Coexistence with row-level targets.** `HitMap::target_at`'s existing
+last-pushed-wins rule is the whole mechanism — no new resolution logic.
+`view::conversation::draw` pushes the row-wide `Message(id)` for every row
+first, then `Spoiler`/`ReplyQuote` for the narrower ranges within it. A
+click landing outside those ranges (ordinary body text, the header) still
+resolves to `Message`; a click on the spoiler or the quote line resolves to
+the more specific target, at that column range only.
+
+**Click routing**, all in `app.rs`:
+
+| Target | Left | Right |
+|---|---|---|
+| `Spoiler(id)` | `conversation::reveal_spoilers(app, chat_id, id)` | same as `Message(id)`: `selection::enter_at(id)` |
+| `ReplyQuote { containing, quoted }` | `conversation::jump_to_message(app, chat_id, quoted)` | same as `Message(containing)`: `selection::enter_at(containing)` |
+
+Right-click is deliberately unchanged in effect: `ReplyQuote` carries
+`containing` precisely so a right-click on the quote line still opens
+selection on the message that line belongs to, not the message it quotes
+(which may not even be loaded — see jump, below). Left-click on `Spoiler`
+was previously the row's `Message` no-op; it is the only left-click
+behavior this amendment changes, and only where a spoiler is actually
+rendered.
+
+**Keyboard path.** The spec's "revealed with `⏎` on the selected message"
+predates `chips.rs`'s fixed set (T26) and conflicts with it as written:
+selection mode's `⏎` already invokes the *focused chip*, and there is no
+slot for an un-offered action — `selection.rs`'s own `Key::Char(c)` arm
+already documents why a hidden, non-chip binding is wrong for this module:
+*"the row is the truth about what is possible, and swallowing the key would
+also swallow global bindings."* An invisible key would repeat that mistake
+in the other direction — reachable, but not shown. So spoiler reveal is a
+real chip, `Chip::Reveal` (shortcut `v`), computed in `selection.rs` after
+`chips_for`'s existing five-argument capability derivation rather than
+folded into it: `chips_for`'s signature and its exhaustive test table stay
+untouched, and `Reveal` is appended only when the selected message carries
+an entity of kind `Spoiler` not yet in `revealed_spoilers`. `⏎`/`v` invoke
+it through the same `invoke()` dispatch every other chip already uses. This
+is the one place mouse and keyboard genuinely diverge: the mouse path is a
+`Click` on `Spoiler`, the keyboard path is a chip invocation — they
+converge on the same `conversation::reveal_spoilers` call, not a shared
+input primitive.
+
+**Reveal granularity: per-message, not per-run.** `revealed_spoilers:
+BTreeSet<MessageId>` and the layout cache key's `spoilers_revealed: bool`
+already committed to this before this amendment — a message with two
+spoiler runs reveals both together, because there is only one bit to record
+either had been revealed at all. Changing that would mean widening the
+cache key from a bool to a per-entity set, a §8.2 change out of scope here;
+this amendment reads that existing commitment rather than relitigating it.
+
+**Jump when the quoted message is not loaded.** `conversation::jump_to_message`
+sets `Scroll::At { message_id: quoted, line_offset: 0 }` and nothing else —
+deliberately mirroring `state::search`'s `n`/`N` stepping (`step()`), which
+already jumps to a TDLib-supplied message id with no guarantee it is in the
+loaded window and does not page for it directly. Per that module's own doc
+comment, "conversation.rs's own near-top/near-bottom paging logic... is
+what notices and issues the follow-up `GetChatHistory` the next time the
+anchor is re-derived" — an anchor older than the whole window is exactly
+what `is_older_than_window`/`trigger_paging_if_near_top` (§4.6) already
+exist to page toward. A quoted message is always older than or equal to the
+message quoting it, so (unlike an arbitrary search hit) it can never be
+newer than the window the click came from. Building a second, direct
+"load toward an arbitrary id" path was rejected: the paging state machine
+is already the subtle part of this codebase (§5.2's empty-page trap), and
+introducing a second way to drive it risks the two interacting rather than
+composing. This choice inherits whatever gap already exists in the
+search-jump precedent it mirrors — if stepping to an unloaded hit does not
+actually trigger a page today, jumping to an unloaded quote will not
+either; that is a pre-existing `state::search` question, not a new one this
+amendment introduces.
 
 ## 8. Decisions the spec delegated
 

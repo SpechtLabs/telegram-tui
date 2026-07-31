@@ -133,6 +133,7 @@
 //! `chat_list::draw_filter_input`).
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -149,6 +150,7 @@ use tgt_core::state::conversation::{ConversationState, Scroll};
 use tgt_core::state::focus::Focus;
 use tgt_core::state::media::MediaState;
 use tgt_core::state::search::ChatSearchState;
+use unicode_width::UnicodeWidthStr;
 
 use crate::render::cache::{LayoutCache, LayoutKey};
 use crate::render::hit::HitMap;
@@ -220,6 +222,38 @@ pub fn draw(
                 },
                 HitTarget::Message(message_id),
             );
+            // Sub-row targets (architecture §7.5.1, T77), pushed after the
+            // row-wide one above so `HitMap::target_at`'s existing
+            // last-pushed-wins rule resolves a click on the narrower range
+            // to these instead — no new resolution logic, same mechanism.
+            for range in &row.spoiler_cols {
+                hits.push(
+                    Rect {
+                        x: messages_area.x + range.start,
+                        y: messages_area.y + i as u16,
+                        width: range.end - range.start,
+                        height: 1,
+                    },
+                    HitTarget::Spoiler(message_id),
+                );
+            }
+            if let Some(quoted) = row.reply_quote {
+                // Full row width, unlike `Spoiler`: a reply-quote row is
+                // never shared with ordinary body text the way a spoiler
+                // run can be, so there is no narrower range to compute.
+                hits.push(
+                    Rect {
+                        x: messages_area.x,
+                        y: messages_area.y + i as u16,
+                        width: messages_area.width,
+                        height: 1,
+                    },
+                    HitTarget::ReplyQuote {
+                        containing: message_id,
+                        quoted,
+                    },
+                );
+            }
         }
         if let Some(tag) = row.image {
             extend_placement(&mut placements, tag, i as u16);
@@ -434,6 +468,13 @@ struct WindowRow {
     /// every row of one message's run, so the run can be recognized after
     /// the walk has moved, clipped and padded its rows.
     image: Option<Rc<ImageTag>>,
+    /// Column ranges within `line` rendering a masked spoiler block —
+    /// sub-row hit targets (architecture §7.5.1, T77), narrower than the
+    /// row-wide `Message` target `draw` also pushes for this row.
+    spoiler_cols: Vec<Range<u16>>,
+    /// Set only on the row rendering a reply-quote excerpt: the id of the
+    /// message it names (architecture §7.5.1, T77's jump target).
+    reply_quote: Option<MessageId>,
 }
 
 impl WindowRow {
@@ -444,8 +485,41 @@ impl WindowRow {
             message_id: None,
             line: Line::default(),
             image: None,
+            spoiler_cols: Vec::new(),
+            reply_quote: None,
         }
     }
+}
+
+/// Sub-row hit metadata for one already-laid-out `Line` (architecture
+/// §7.5.1, T77). Computed by scanning the line's spans for two stable,
+/// intentional content signatures — a masked spoiler run is rendered as
+/// `'█'`-only glyphs and nothing else in this pipeline ever produces that
+/// character (progress bars use `▓`/`░`); a reply-quote line is rendered as
+/// exactly one span starting `↳` and nothing else does — rather than
+/// duplicating `message_layout.rs`'s wrap/entity logic here, or changing
+/// its return type and rippling into the layout cache for facts the view
+/// can already recover for free.
+#[derive(Default, Clone)]
+struct RowHits {
+    spoiler_cols: Vec<Range<u16>>,
+    reply_quote: Option<MessageId>,
+}
+
+fn scan_row_hits(line: &Line<'static>, reply_to: Option<MessageId>) -> RowHits {
+    let mut hits = RowHits::default();
+    let mut col: u16 = 0;
+    for span in &line.spans {
+        let w = span.content.width() as u16;
+        if !span.content.is_empty() && span.content.chars().all(|c| c == '█') {
+            hits.spoiler_cols.push(col..col + w);
+        } else if hits.reply_quote.is_none() && reply_to.is_some() && span.content.starts_with('↳')
+        {
+            hits.reply_quote = reply_to;
+        }
+        col += w;
+    }
+    hits
 }
 
 /// What one message's reserved image rows need at draw time. Shared behind
@@ -514,6 +588,16 @@ fn build_window(
             msg_lines.truncate(keep);
         }
 
+        // Scanned from the cached lines only, before the per-frame ones
+        // below are appended — a spoiler block or a reply-quote line only
+        // ever comes from `rendered_lines`, never from the attachment,
+        // reaction or receipt lines (module docs on `RowHits`).
+        let reply_target = msg.reply_to.as_ref().map(|r| r.message_id);
+        let row_hits: Vec<RowHits> = msg_lines
+            .iter()
+            .map(|line| scan_row_hits(line, reply_target))
+            .collect();
+
         // The attachment line, reactions, and the receipt are drawn here,
         // per frame, on top of what the cache handed back — never folded
         // into the cached lines themselves. All three change (a download
@@ -547,12 +631,19 @@ fn build_window(
             block.push(WindowRow::blank());
         }
         block.extend(msg_lines.into_iter().enumerate().map(|(i, line)| {
+            // `row_hits` only has entries for the cached lines scanned
+            // above; the attachment/reaction/receipt rows appended after
+            // that scan fall through to the `unwrap_or_default()` (neither
+            // ever renders a spoiler block or a reply-quote line).
+            let hits = row_hits.get(i).cloned().unwrap_or_default();
             WindowRow {
                 message_id: Some(msg.id),
                 image: reserved
                     .as_ref()
                     .filter(|r| r.covers(i))
                     .map(|r| Rc::clone(&r.tag)),
+                spoiler_cols: hits.spoiler_cols,
+                reply_quote: hits.reply_quote,
                 line: apply_search_highlight(
                     apply_selection_highlight(line, selected, width, theme),
                     hit_kind,
@@ -1059,7 +1150,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use tgt_core::app::{AppState, Screen};
     use tgt_core::effect::TelemetryMode;
-    use tgt_core::model::entity::FormattedText;
+    use tgt_core::model::entity::{EntityKind, FormattedText, TextEntity};
     use tgt_core::model::ids::{ChatId, FileId, MessageId, UserId};
     use tgt_core::model::key::KeyBindings;
     use tgt_core::model::message::{
@@ -2518,5 +2609,97 @@ mod tests {
         let state = fixture_state(Some(conversation(Vec::new(), Scroll::Bottom)));
         let mut rs = RenderState::new(None);
         assert!(visible_range(&state, Rect::new(0, 0, 80, 24), &mut rs).is_none());
+    }
+
+    // --- sub-row hit targets (architecture §7.5.1, T77) --------------------
+
+    fn spoiler_msg(id: i64) -> MessageView {
+        MessageView {
+            id: MessageId(id),
+            chat_id: CHAT,
+            sender: Sender::User(UserId(1)),
+            sender_name: "Alice".to_string(),
+            is_outgoing: false,
+            date: BASE_DATE,
+            content: MessageContent::Text(FormattedText {
+                text: "before secret after".to_string(),
+                entities: vec![TextEntity {
+                    offset_utf16: 7,
+                    length_utf16: 6,
+                    kind: EntityKind::Spoiler,
+                }],
+            }),
+            reply_to: None,
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            caps: MessageCaps::default(),
+            is_edited: false,
+        }
+    }
+
+    /// A masked spoiler block gets a narrower hit target than the row it
+    /// sits in, layered over the row-wide `Message` target rather than
+    /// replacing it (`HitMap::target_at`'s existing last-pushed-wins rule).
+    /// Locates the block by its actual rendered `'█'` glyphs rather than a
+    /// hardcoded column, so the test fails if the column math is ever wrong
+    /// in either direction.
+    #[test]
+    fn spoiler_click_target_is_narrower_than_the_message_row() {
+        let state = fixture_state(Some(conversation(vec![spoiler_msg(1)], Scroll::Bottom)));
+        let mut rs = RenderState::new(None);
+        let (rendered, hits) = draw_frame(60, 20, &state, &mut rs);
+
+        let row = rendered
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains('█'))
+            .map(|(i, _)| i as u16)
+            .unwrap_or_else(|| panic!("expected a masked spoiler block on screen:\n{rendered}"));
+        let line_text = rendered.lines().nth(row as usize).unwrap();
+        let byte_idx = line_text.find('█').unwrap();
+        // Byte offset -> display column: the row can carry the rail glyph
+        // (multi-byte, one column) before the block, so a byte count would
+        // overshoot.
+        let block_col = line_text[..byte_idx].width() as u16;
+
+        assert_eq!(
+            hits.target_at(block_col, row),
+            Some(HitTarget::Spoiler(MessageId(1))),
+            "row {row} col {block_col} (a masked block cell):\n{rendered}"
+        );
+        // Column 0 is the rail, never inside the block: the row-wide
+        // `Message` target must still win there.
+        assert_eq!(
+            hits.target_at(0, row),
+            Some(HitTarget::Message(MessageId(1))),
+            "row {row} col 0 (outside the block):\n{rendered}"
+        );
+    }
+
+    /// Left/right routing on `Spoiler`/`ReplyQuote` is `app.rs`'s job
+    /// (tested there); this only proves the *view* hands back the right
+    /// target at the right cells in the first place, using the message
+    /// `mixed_history` already carries a reply on (msg 4 quotes msg 3).
+    #[test]
+    fn reply_quote_click_target_names_the_quoted_message() {
+        let state = fixture_state(Some(conversation(mixed_history(), Scroll::Bottom)));
+        let mut rs = RenderState::new(None);
+        let (rendered, hits) = draw_frame(60, 30, &state, &mut rs);
+
+        let row = rendered
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains('↳'))
+            .map(|(i, _)| i as u16)
+            .unwrap_or_else(|| panic!("expected the reply-quote line on screen:\n{rendered}"));
+
+        assert_eq!(
+            hits.target_at(5, row),
+            Some(HitTarget::ReplyQuote {
+                containing: MessageId(4),
+                quoted: MessageId(3),
+            }),
+            "row {row}:\n{rendered}"
+        );
     }
 }

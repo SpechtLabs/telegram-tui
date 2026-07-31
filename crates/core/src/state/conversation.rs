@@ -92,9 +92,10 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::app::AppState;
 use crate::effect::Effect;
+use crate::model::entity::EntityKind;
 use crate::model::ids::{ChatId, MessageId};
 use crate::model::key::Key;
-use crate::model::message::MessageView;
+use crate::model::message::{MessageContent, MessageView};
 use crate::model::time::Millis;
 use crate::state::focus::Focus;
 use crate::state::history::{self, PagingDirective, PagingState};
@@ -248,6 +249,63 @@ pub fn close_previous_chat(app: &AppState, new_chat_id: ChatId) -> Vec<Effect> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Whether `msg` carries a `Spoiler` entity not yet revealed for it — the
+/// gate both the `Spoiler` click target and `Chip::Reveal` (architecture
+/// §7.5.1, T77) use to decide whether reveal is even offered. Checks
+/// whichever `FormattedText` the content variant carries (a caption counts
+/// the same as body text; the render side masks both the same way).
+pub fn has_unrevealed_spoiler(msg: &MessageView, revealed: &BTreeSet<MessageId>) -> bool {
+    if revealed.contains(&msg.id) {
+        return false;
+    }
+    let text = match &msg.content {
+        MessageContent::Text(text)
+        | MessageContent::Photo { caption: text, .. }
+        | MessageContent::Video { caption: text, .. }
+        | MessageContent::Document { caption: text, .. } => text,
+        MessageContent::Audio { .. } | MessageContent::Sticker { .. } => return false,
+        MessageContent::Unsupported { .. } => return false,
+    };
+    text.entities
+        .iter()
+        .any(|e| matches!(e.kind, EntityKind::Spoiler))
+}
+
+/// Reveals every spoiler run in `message_id` at once (architecture §7.5.1:
+/// reveal is per-message, matching the single `spoilers_revealed` bit
+/// already in the layout cache key — there is no per-run granularity to
+/// preserve). A no-op if the chat or message is not tracked, which cannot
+/// happen from either of this function's real call sites (a click or chip
+/// invocation on a message currently on screen) but keeps this safe to call
+/// speculatively.
+pub fn reveal_spoilers(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Effect> {
+    if let Some(convo) = app.conversations.get_mut(&chat_id) {
+        convo.revealed_spoilers.insert(message_id);
+    }
+    Vec::new()
+}
+
+/// Jumps the open chat's scroll anchor to `message_id` — the reply-quote
+/// click target (architecture §7.5.1). Deliberately mirrors
+/// `state::search`'s `step()`: sets `Scroll::At` and nothing else, whether
+/// or not `message_id` is currently loaded. A quoted message is always
+/// older than or equal to the message quoting it, so if it is not loaded it
+/// is necessarily *older* than the window — exactly the case
+/// `trigger_paging_if_near_top` already exists to notice and page toward
+/// the next time the anchor is re-derived, the same path search hits
+/// already rely on. No direct "load toward an arbitrary id" request is
+/// issued here; see the architecture doc for why a second path into paging
+/// was rejected.
+pub fn jump_to_message(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Effect> {
+    if let Some(convo) = app.conversations.get_mut(&chat_id) {
+        convo.scroll = Scroll::At {
+            message_id,
+            line_offset: 0,
+        };
+    }
+    Vec::new()
 }
 
 /// Tells TDLib which messages the user has actually seen in `chat_id`, so it
@@ -1158,6 +1216,87 @@ mod tests {
             effects[0],
             Effect::Td(TdRequest::CloseChat { chat_id: CHAT })
         ));
+    }
+
+    fn msg_with_spoiler(id: i64) -> MessageView {
+        let mut m = msg(id);
+        m.content = MessageContent::Text(FormattedText {
+            text: "before secret after".to_string(),
+            entities: vec![crate::model::entity::TextEntity {
+                offset_utf16: 7,
+                length_utf16: 6,
+                kind: crate::model::entity::EntityKind::Spoiler,
+            }],
+        });
+        m
+    }
+
+    #[test]
+    fn has_unrevealed_spoiler_true_only_before_reveal() {
+        let revealed = std::collections::BTreeSet::new();
+        assert!(has_unrevealed_spoiler(&msg_with_spoiler(1), &revealed));
+        // A message with no Spoiler entity at all: never true, however the
+        // reveal set looks.
+        assert!(!has_unrevealed_spoiler(&msg(2), &revealed));
+
+        let mut revealed_1 = std::collections::BTreeSet::new();
+        revealed_1.insert(MessageId(1));
+        assert!(!has_unrevealed_spoiler(&msg_with_spoiler(1), &revealed_1));
+    }
+
+    #[test]
+    fn reveal_spoilers_inserts_into_the_open_chats_set() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        assert!(
+            !app.conversations[&CHAT]
+                .revealed_spoilers
+                .contains(&MessageId(1))
+        );
+
+        let effects = reveal_spoilers(&mut app, CHAT, MessageId(1));
+        assert!(effects.is_empty());
+        assert!(
+            app.conversations[&CHAT]
+                .revealed_spoilers
+                .contains(&MessageId(1))
+        );
+    }
+
+    #[test]
+    fn jump_to_message_anchors_scroll_regardless_of_whether_its_loaded() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        app.conversations
+            .get_mut(&CHAT)
+            .unwrap()
+            .messages
+            .push_back(msg(5));
+
+        // Loaded case.
+        let effects = jump_to_message(&mut app, CHAT, MessageId(5));
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(5),
+                line_offset: 0,
+            }
+        );
+
+        // Not loaded, and older than everything in the window (the only
+        // relationship a quoted message can have to its window per the
+        // architecture doc): still just sets the anchor, mirroring
+        // `state::search`'s `step()` rather than paging directly.
+        let effects = jump_to_message(&mut app, CHAT, MessageId(1));
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(1),
+                line_offset: 0,
+            }
+        );
     }
 
     // --- prepend / anchor stability -----------------------------------
