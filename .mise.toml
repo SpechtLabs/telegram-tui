@@ -5,13 +5,10 @@
 # green pipeline.
 
 [tools]
-# `components` has to be repeated here even though rust-toolchain.toml already
-# declares it: mise installs the toolchain through rustup with the minimal
-# profile and exports RUSTUP_TOOLCHAIN, and that variable takes precedence over
-# rust-toolchain.toml, so the file's component list never gets applied. Without
-# this, `cargo fmt`/`cargo clippy` fail on a clean machine (and in CI) with
-# "'cargo-fmt' is not installed for the toolchain". Keep the version in step
-# with rust-toolchain.toml.
+# Rust has to be pinned here as well as in rust-toolchain.toml: a global mise
+# config may set `rust = "stable"`, and whichever mise config wins exports
+# RUSTUP_TOOLCHAIN, which overrides rust-toolchain.toml. Without this entry the
+# project would silently build on stable.
 rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
 pinact = "4.1.0"
@@ -22,16 +19,35 @@ pinact = "4.1.0"
 # rpath resolves against (architecture.md §9.2).
 TGT_PREFIX = "{{ env.HOME }}/.local"
 
+# mise's rust backend keeps only a symlink in its own installs dir; the real
+# toolchain lives in ~/.rustup, which mise-action does not cache. On a cache
+# hit mise therefore reports "all tools are installed", skips the install that
+# would add the components above, and the first cargo call makes rustup fetch a
+# bare toolchain instead. `cargo fmt` then fails with "'cargo-fmt' is not
+# installed for the toolchain" on exactly the CI runs that hit the cache. This
+# task closes that gap: it is idempotent, costs nothing when the components are
+# already present, and installs the toolchain if it is missing entirely.
+[tasks.toolchain]
+description = "Ensure the pinned toolchain has rustfmt and clippy (idempotent)"
+run = '''
+set -euo pipefail
+channel="${RUSTUP_TOOLCHAIN:-$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)}"
+rustup toolchain install "$channel" --component rustfmt --component clippy --no-self-update
+'''
+
 [tasks.fmt]
 description = "Format the workspace"
+depends = ["toolchain"]
 run = "cargo fmt --all"
 
 [tasks.fmt-check]
 description = "Check formatting without writing (gate 1)"
+depends = ["toolchain"]
 run = "cargo fmt --all -- --check"
 
 [tasks.lint]
 description = "Clippy across every target, warnings are errors (gate 2)"
+depends = ["toolchain"]
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.test]
