@@ -39,6 +39,7 @@ use tgt_core::model::ids::{ChatId, MessageId, UserId};
 use tgt_core::model::key::KeyBindings;
 use tgt_core::model::message::{MessageCaps, MessageContent, MessageView, SendState, Sender};
 use tgt_core::state::chat_list::visible_rows;
+use tgt_core::state::history::PagingState;
 use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
 use tgt_core::td::request::{TdRequest, TdResponse};
 use tgt_core::td::runtime::TdRuntime;
@@ -114,6 +115,17 @@ impl Harness {
             self.window_len(),
             self.requests(),
         );
+    }
+
+    /// Steps the loop a fixed number of times with nothing to wait for, so a
+    /// request that was spawned but not yet polled gets its chance to reach
+    /// `FakeTd`. Only for assertions of the form "and then nothing else
+    /// happened", which have no state change to wait on by definition; every
+    /// step is bounded by the 250 ms tick.
+    async fn settle(&mut self, steps: usize) {
+        for _ in 0..steps {
+            self.core.step().await;
+        }
     }
 
     fn state(&self) -> &AppState {
@@ -349,6 +361,110 @@ async fn empty_local_cache_falls_back_to_remote() {
     assert_eq!(app.window_len(), 50);
 }
 
+/// T67, the bug this fixes, end to end: opening a chat for the first time in
+/// this client showed only its last message until the user scrolled.
+///
+/// A chat that has never been opened here has exactly one message in TDLib's
+/// local database — the chat-list preview `updateChatLastMessage` delivered —
+/// so the local-first opening request comes back with one message. That is a
+/// *short but non-empty* page: real progress as far as the paging machine is
+/// concerned (and it must stay that way — one message is never proof of
+/// end-of-history), so the machine parks at `Idle` and asks for nothing more.
+/// The client now notices the window is nowhere near a viewport's worth and
+/// asks for the history before it.
+#[tokio::test]
+async fn cold_open_fills_the_viewport_without_a_scroll() {
+    let mut app = Harness::new(&to_jsonl(&cold_open_script()));
+    app.open_top_chat().await;
+
+    app.advance_until("the one-message local page to land", |core, _| {
+        core.app()
+            .state()
+            .conversations
+            .get(&ChatId(1))
+            .is_some_and(|c| !c.messages.is_empty())
+    })
+    .await;
+
+    // No key has been pressed and none will be: the fill is what the open
+    // itself owes the user.
+    app.advance_until("the viewport to fill", |core, _| {
+        core.app()
+            .state()
+            .conversations
+            .get(&ChatId(1))
+            .is_some_and(|c| c.messages.len() >= 50)
+    })
+    .await;
+    app.settle(4).await;
+
+    let history: Vec<TdRequest> = app
+        .requests()
+        .into_iter()
+        .filter(|r| matches!(r, TdRequest::GetChatHistory { .. }))
+        .collect();
+    assert_eq!(
+        history.len(),
+        3,
+        "the local open, T59's reconcile and one T67 fill — a full page \
+         answers both follow-ups, so neither asks again: {history:?}"
+    );
+    assert!(
+        matches!(
+            history[0],
+            TdRequest::GetChatHistory {
+                chat_id: ChatId(1),
+                from_message_id: MessageId(0),
+                only_local: true,
+                ..
+            }
+        ),
+        "the opening request is still local-first (T59): {:?}",
+        history[0]
+    );
+    // The two follow-ups ask opposite ends of the history and are spawned by
+    // the same completion, so which one reaches TDLib first is a race the
+    // assertions must not depend on — only that both were asked, exactly
+    // once each, and both remotely.
+    let follow_ups: Vec<(i64, bool)> = history[1..]
+        .iter()
+        .map(|r| match r {
+            TdRequest::GetChatHistory {
+                from_message_id,
+                only_local,
+                ..
+            } => (from_message_id.0, *only_local),
+            _ => unreachable!("filtered above"),
+        })
+        .collect();
+    assert!(
+        follow_ups.contains(&(0, false)),
+        "T59's reconcile asks the newest end remotely: {follow_ups:?}"
+    );
+    assert!(
+        follow_ups.contains(&(50, false)),
+        "T67's fill asks for the history before the one message the local \
+         database had: {follow_ups:?}"
+    );
+
+    let ids = app.window_ids();
+    assert_eq!(
+        ids.len(),
+        50,
+        "the pane is full without the user having scrolled: {ids:?}"
+    );
+    let mut deduped = ids.clone();
+    deduped.dedup();
+    assert_eq!(ids.len(), deduped.len(), "no duplicate ids: {ids:?}");
+    assert_eq!(
+        app.state().conversations[&ChatId(1)].paging,
+        PagingState::Idle,
+        "the fill is a caller-side policy: it must leave the paging machine \
+         exactly where the machine itself put it, so a later scroll still \
+         gets the §5.2 retry ladder"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -465,6 +581,42 @@ fn cold_cache_script() -> Vec<ScriptStep> {
             respond: RespondWith::Ok(TdResponse::Messages {
                 messages: Vec::new(),
             }),
+        },
+        ScriptStep::Await {
+            expect: expect("GetChatHistory"),
+            respond: page(1..=50),
+        },
+    ]);
+    steps
+}
+
+/// The cold-open scenario (T67): a chat this client has never opened, so
+/// TDLib's local database holds exactly the one message the chat list was
+/// built from, and the first round trip that goes out over the network comes
+/// back with no more than that — TDLib has not finished syncing the chat.
+/// Only the second one carries the real history.
+///
+/// The two follow-ups (T59's reconcile from the newest end, T67's fill from
+/// the oldest loaded message) are spawned by one completion and race each
+/// other to `FakeTd`, so the script must not care which arrives first — and
+/// it does not: whichever gets the stale answer contributes nothing (the
+/// reconcile because it is not a fill, the fill because a page that adds
+/// nothing new ends the chain), and whichever gets the real page fills the
+/// window. Either order ends at ids 1..=50 after three requests.
+fn cold_open_script() -> Vec<ScriptStep> {
+    let mut steps = ready_and_load_chats();
+    steps.extend([
+        chat(1, "Ada Lovelace", 100),
+        // All TDLib's local database has: the chat-list preview.
+        ScriptStep::Await {
+            expect: expect("GetChatHistory"),
+            respond: page(50..=50),
+        },
+        // Still nothing new — this is the round trip that used to leave the
+        // pane showing one message until the user scrolled.
+        ScriptStep::Await {
+            expect: expect("GetChatHistory"),
+            respond: page(50..=50),
         },
         ScriptStep::Await {
             expect: expect("GetChatHistory"),

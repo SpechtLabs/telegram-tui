@@ -492,10 +492,26 @@ async fn search_step_to_offscreen_hit_pages_history() {
     })
     .await;
 
+    // One page for the hit — and then one more, because the twenty messages
+    // now loaded are still short of a viewport's worth and T67 keeps asking
+    // until they are not (`conversation::VIEWPORT_FILL_TARGET_MESSAGES`).
+    // That second request is what this waits for: asserting the count without
+    // waiting would only be testing that its spawned task had not been polled
+    // yet. The script has nothing left to answer it with, so it comes back
+    // empty, adds nothing, and the fill stops there — which is what makes
+    // this an exact count rather than a lower bound.
+    app.advance_until("the fill that follows the hit's page", |_, fake| {
+        fake.received()
+            .iter()
+            .filter(|r| r.kind() == "GetChatHistory")
+            .count()
+            >= pages_before + 2
+    })
+    .await;
     assert_eq!(
         app.request_count("GetChatHistory"),
-        pages_before + 1,
-        "exactly one page was fetched for the hit: {:?}",
+        pages_before + 2,
+        "exactly one page was fetched for the hit, plus its viewport fill: {:?}",
         app.requests()
     );
     assert!(

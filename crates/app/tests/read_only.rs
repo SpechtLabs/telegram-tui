@@ -60,6 +60,7 @@ use tgt_core::model::ids::{ChatId, MessageId, UserId};
 use tgt_core::model::key::KeyBindings;
 use tgt_core::model::message::{MessageCaps, MessageContent, MessageView, SendState, Sender};
 use tgt_core::state::chat_list::visible_rows;
+use tgt_core::state::conversation::Scroll;
 use tgt_core::state::history::PagingState;
 use tgt_core::td::fake::{FakeTd, RequestMatcher, RespondWith, ScriptStep};
 use tgt_core::td::request::{TdRequest, TdResponse};
@@ -365,10 +366,16 @@ async fn open_chat_loads_history_and_renders() {
 /// is never proof of end-of-history — the client re-issues the request (up to
 /// `MAX_EMPTY_ATTEMPTS`) and the next round delivers the page.
 ///
-/// The chat is opened with a deliberately short first page: paging only
-/// triggers once the scroll anchor is within `PAGE_TRIGGER_MESSAGES` of the
-/// oldest loaded message, and five messages put the very first `↑` inside that
-/// window.
+/// The chat opens with a *full* page. It used to open with five messages,
+/// which put the very first `PageUp` inside `PAGE_TRIGGER_MESSAGES` of the
+/// oldest loaded one; T67 made that shape mean something else entirely — a
+/// window that short is one the client now fills on its own, and its fill
+/// request would be the one answered with the empty page below, so the
+/// scroll-triggered round this test is about would never see the trap. A full
+/// opening page is under no such policy (see
+/// `conversation::VIEWPORT_FILL_TARGET_MESSAGES`), so every request here is
+/// still one this test asked for; the walk down to the trigger window just
+/// takes four `PageUp`s instead of one.
 #[tokio::test]
 async fn empty_history_response_retries_then_succeeds() {
     let mut app = Harness::new(&to_jsonl(&empty_then_page_script()));
@@ -379,7 +386,7 @@ async fn empty_history_response_retries_then_succeeds() {
             .state()
             .conversations
             .get(&ChatId(1))
-            .is_some_and(|c| c.messages.len() == 5)
+            .is_some_and(|c| c.messages.len() == 50)
     })
     .await;
 
@@ -406,21 +413,26 @@ async fn empty_history_response_retries_then_succeeds() {
         PagingState::Idle,
         "an empty *remote* reconcile completion must not disturb paging state"
     );
-    assert_eq!(app.window_len(), 5, "the empty reconcile added nothing");
+    assert_eq!(app.window_len(), 50, "the empty reconcile added nothing");
 
-    // Scroll off the bottom: the anchor lands inside the paging window and
-    // asks for the page before the oldest loaded message. `PageUp` rather
-    // than `Up` since T28 wired the §6.2 routing table — with the composer
-    // focused, `Up` on an empty input enters selection mode, and the page
-    // keys are what reach the viewport from there.
-    app.press(KeyCode::PageUp).await;
+    // Scroll off the bottom until the anchor lands inside the paging window,
+    // which asks for the page before the oldest loaded message. `PageUp`
+    // rather than `Up` since T28 wired the §6.2 routing table — with the
+    // composer focused, `Up` on an empty input enters selection mode, and the
+    // page keys are what reach the viewport from there. Four of them: a press
+    // steps `PAGE_STEP_MESSAGES` (10) through a window of 50, and the trigger
+    // is the first press that lands within `PAGE_TRIGGER_MESSAGES` (20) of the
+    // oldest — indices 40, 30, 20, then 10.
+    for _ in 0..4 {
+        app.press(KeyCode::PageUp).await;
+    }
 
     app.advance_until("the retried page to land", |core, _| {
         core.app()
             .state()
             .conversations
             .get(&ChatId(1))
-            .is_some_and(|c| c.messages.len() > 5)
+            .is_some_and(|c| c.messages.len() > 50)
     })
     .await;
 
@@ -471,7 +483,7 @@ async fn empty_history_response_retries_then_succeeds() {
                 request,
                 TdRequest::GetChatHistory {
                     chat_id: ChatId(1),
-                    from_message_id: MessageId(101),
+                    from_message_id: MessageId(51),
                     only_local: false,
                     ..
                 }
@@ -483,15 +495,29 @@ async fn empty_history_response_retries_then_succeeds() {
     let convo = &app.state().conversations[&ChatId(1)];
     assert_eq!(
         convo.messages.len(),
-        55,
+        100,
         "the 50-message page was prepended"
     );
-    assert_eq!(convo.messages.front().unwrap().id, MessageId(51));
-    assert_eq!(convo.messages.back().unwrap().id, MessageId(105));
+    assert_eq!(convo.messages.front().unwrap().id, MessageId(1));
+    assert_eq!(convo.messages.back().unwrap().id, MessageId(100));
+
+    // One more press walks the anchor into the page that just arrived (the
+    // viewport is drawn upward from the anchor, so what proves the page
+    // rendered is a message just *above* it). It asks for nothing: at index
+    // 50 of 100 the anchor is nowhere near the top any more.
+    app.press(KeyCode::PageUp).await;
+    app.advance_until("the anchor to step into the new page", |core, _| {
+        core.app().state().conversations[&ChatId(1)].scroll
+            == Scroll::At {
+                message_id: MessageId(51),
+                line_offset: 0,
+            }
+    })
+    .await;
 
     let rendered = app.render(120, 40);
     assert!(
-        rendered.contains("history line 100"),
+        rendered.contains("history line 50"),
         "the paged-in history is missing from the frame:\n{rendered}"
     );
 }
@@ -644,10 +670,12 @@ fn empty_then_page_script() -> Vec<ScriptStep> {
     let mut steps = ready_and_load_chats();
     steps.extend([
         chat(1, "Ada Lovelace", 100),
-        // The opening page (T59: local-first, `only_local: true`).
+        // The opening page (T59: local-first, `only_local: true`). A full
+        // page, so T67's viewport fill has nothing to do — see the test's
+        // doc comment.
         ScriptStep::Await {
             expect: expect("GetChatHistory"),
-            respond: page(101..=105),
+            respond: page(51..=100),
         },
         // T59: the automatic remote reconcile the non-empty opening page
         // triggers. Answered with nothing on purpose — an empty *remote*
@@ -670,7 +698,7 @@ fn empty_then_page_script() -> Vec<ScriptStep> {
         // The retry the client is obliged to make.
         ScriptStep::Await {
             expect: expect("GetChatHistory"),
-            respond: page(51..=100),
+            respond: page(1..=50),
         },
     ]);
     steps

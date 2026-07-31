@@ -60,6 +60,20 @@ use crate::td::update::TdUpdate;
 /// Bounded loaded window: memory stays flat in long-lived sessions.
 pub const WINDOW_MAX_MESSAGES: usize = 500;
 
+/// How many messages a conversation window must hold before the client stops
+/// asking for older history on its own (T67 — see [`fill_viewport`]).
+///
+/// `history::PAGE_SIZE` worth of messages is the value because it is the only
+/// number here that is already calibrated: it is what one `GetChatHistory`
+/// asks for, so reaching it means one successful round trip's worth of
+/// history is loaded. It is also comfortably more than any terminal viewport
+/// can show — the conversation pane is at most a screen tall (tens of rows)
+/// and spec §7.1 spends at least two rows on a message — so a window this
+/// deep always fills the pane with something to scroll through. A larger
+/// target would page in history nobody asked to see; a smaller one could
+/// still leave the pane half empty on a tall terminal.
+pub const VIEWPORT_FILL_TARGET_MESSAGES: usize = history::PAGE_SIZE as usize;
+
 /// M3 approximation for `PageUp`/`PageDown`: the message-count equivalent of
 /// "a page" while the UI has no viewport/layout info to consult (that lives
 /// in `tgt-ui`, not here). `line_offset` therefore stays `0` for every
@@ -309,6 +323,14 @@ fn reanchor_after_deletion(messages: &VecDeque<MessageView>, deleted_id: Message
 ///   otherwise put back into `Loading` — so the reconcile's own completion
 ///   (always `only_local: false`) can never spawn another one: that is the
 ///   loop guard.
+///
+/// ## T67: filling the viewport
+///
+/// Whatever the page did, the window it landed in may still be too short to
+/// fill the pane; [`fill_viewport`] decides whether to ask for more. See its
+/// doc comment for why that is a caller-side policy rather than a paging
+/// state, how it terminates, and why it cannot ping-pong with the reconcile
+/// above.
 pub fn apply_history_page(
     app: &mut AppState,
     chat_id: ChatId,
@@ -326,7 +348,7 @@ pub fn apply_history_page(
             let directive =
                 history::on_history_loaded(&mut convo.paging, received, only_local, oldest_loaded);
 
-            prepend_messages(&mut convo.messages, msgs);
+            let added = prepend_messages(&mut convo.messages, msgs);
             evict_excess(&mut convo.messages, &convo.scroll);
             drop_selection_if_gone(convo);
 
@@ -368,6 +390,8 @@ pub fn apply_history_page(
                 }));
             }
 
+            effects.extend(fill_viewport(convo, chat_id, added));
+
             effects
         }
         Err(e) => {
@@ -390,10 +414,12 @@ pub fn apply_history_page(
 /// Merges `new_msgs` into the front of `existing`, deduped by id (against
 /// both the existing window and duplicates within `new_msgs` itself) and
 /// kept in ascending order regardless of the order TDLib/the mapping layer
-/// delivered them in.
-fn prepend_messages(existing: &mut VecDeque<MessageView>, new_msgs: &[MessageView]) {
+/// delivered them in. Returns how many messages were genuinely new, which is
+/// what [`fill_viewport`] measures progress by — `new_msgs.len()` would count
+/// a page of pure overlap as progress and is not the same number.
+fn prepend_messages(existing: &mut VecDeque<MessageView>, new_msgs: &[MessageView]) -> usize {
     if new_msgs.is_empty() {
-        return;
+        return 0;
     }
     let mut seen: BTreeSet<MessageId> = existing.iter().map(|m| m.id).collect();
     let mut to_prepend: Vec<MessageView> = Vec::new();
@@ -402,10 +428,116 @@ fn prepend_messages(existing: &mut VecDeque<MessageView>, new_msgs: &[MessageVie
             to_prepend.push(m.clone());
         }
     }
+    let added = to_prepend.len();
     to_prepend.sort_by_key(|m| m.id);
     for m in to_prepend.into_iter().rev() {
         existing.push_front(m);
     }
+    added
+}
+
+/// T67: keeps asking for older history while the window is too short to fill
+/// the pane. `added` is what the page that just landed contributed *after*
+/// dedupe (see [`prepend_messages`]).
+///
+/// ## The bug this exists for
+///
+/// `getChatHistory` answers from TDLib's local database before it goes to the
+/// server. For a chat this client has never opened, that database holds
+/// exactly one message — the chat-list preview delivered by
+/// `updateChatLastMessage`. The opening request (`only_local: true`, T59)
+/// therefore comes back with a single message, which is a *short but
+/// non-empty* page: the milder sibling of spec §5.2's empty-response trap.
+/// The paging machine is right to call that progress and return to `Idle`
+/// (`history::short_but_nonempty_response_is_not_exhausted` pins it — one
+/// message is never proof of end-of-history), and it is right that nothing in
+/// the machine asks again on its own. But the user is left looking at a pane
+/// holding one message until they scroll, which is the reported bug. Asking
+/// for the rest is a policy decision about what an *opened chat* should show,
+/// so it lives here, in the caller, and adds no state to the machine.
+///
+/// ## Why this does not drive the paging machine
+///
+/// The request goes out without moving `convo.paging` out of `Idle` — the
+/// same shape as T59's reconcile above, and deliberately not a
+/// `Loading` transition. Driving the machine would hand an empty answer to
+/// `history::on_history_loaded`, which correctly (spec §5.2) re-asks up to
+/// `MAX_EMPTY_ATTEMPTS` times and then latches `Exhausted`. Spending that
+/// ladder at *open* time, on a chat whose server sync merely hasn't caught up
+/// yet, would leave `Exhausted` latched for the rest of the session and kill
+/// scroll-up for that chat entirely — a worse bug than the one being fixed.
+/// A fill that simply stops instead costs at most one unanswered round trip,
+/// and the user's next scroll still goes through the machine and its retry
+/// ladder in the normal way.
+///
+/// Its completion lands while `paging` is `Idle`, which
+/// `history::on_history_loaded`'s stale-completion branch ignores outright
+/// (state untouched, no directive) — while `apply_history_page` still
+/// prepends the messages, since prepending is unconditional. That is exactly
+/// the behaviour wanted: the page is kept, the machine is undisturbed, and
+/// this function gets to decide whether to ask again.
+///
+/// ## Termination
+///
+/// Every fill round either ends the chain or grows the window by at least one
+/// message:
+///
+/// - `added == 0` stops it. A server that answers every request with the same
+///   message (or with pure overlap of what is already loaded) contributes
+///   nothing new, so it cannot spin: the second identical answer ends the
+///   chain. This is the rule that makes the fill safe against a
+///   badly-behaved or stuck peer.
+/// - `added > 0` means the window grew by `added`, and the window only ever
+///   grows here: `evict_excess` cannot fire below `WINDOW_MAX_MESSAGES`
+///   (500), and this function only runs at all below
+///   `VIEWPORT_FILL_TARGET_MESSAGES` (50). So the length is strictly
+///   increasing toward a fixed target it is tested against, and at most
+///   `VIEWPORT_FILL_TARGET_MESSAGES` rounds can happen before
+///   `messages.len() >= VIEWPORT_FILL_TARGET_MESSAGES` ends the chain.
+///
+/// A genuinely short chat therefore ends after one unanswerable round: TDLib
+/// returns nothing older, `added` is 0, and the chain stops without ever
+/// claiming the history is exhausted. No round counter is needed as a second
+/// belt — the target itself is the bound, and every round it permits has paid
+/// for itself with at least one message the user can now see.
+///
+/// ## Why this cannot ping-pong with T59's reconcile
+///
+/// The two requests ask opposite ends of the history and neither one's
+/// completion can re-trigger the other:
+///
+/// - The reconcile asks from `MessageId(0)` (TDLib's *newest message*
+///   sentinel) and is spawned only by a completion whose request was
+///   `only_local: true`. Every fill request is `only_local: false`, so a
+///   fill's completion never spawns a reconcile.
+/// - The fill asks from the *oldest* loaded message and is spawned only while
+///   the window is under target. The reconcile's completion can spawn a fill
+///   — that is intended, it is another page landing in a short window — but
+///   only if it brought something new, and then the fill asks in the older
+///   direction, which is not where the reconcile was looking.
+///
+/// A cold open does put both in flight at once (the local page is short *and*
+/// `only_local`). They are independent requests for different pages;
+/// `prepend_messages` dedupes whatever overlaps, and because neither touches
+/// `paging`, neither can consume or confuse the other's completion.
+fn fill_viewport(convo: &ConversationState, chat_id: ChatId, added: usize) -> Option<Effect> {
+    if added == 0 || convo.messages.len() >= VIEWPORT_FILL_TARGET_MESSAGES {
+        return None;
+    }
+    // `Loading`: a request is already out and its page will run this check
+    // again. `Cooldown`: TDLib asked us to back off, and a fill is the least
+    // urgent reason to ignore that. `Exhausted`: there is genuinely no more
+    // history to fetch, short window or not.
+    if !matches!(convo.paging, PagingState::Idle) {
+        return None;
+    }
+    let oldest = convo.messages.front()?.id;
+    Some(Effect::Td(TdRequest::GetChatHistory {
+        chat_id,
+        from_message_id: oldest,
+        limit: history::PAGE_SIZE,
+        only_local: false,
+    }))
 }
 
 /// Selection plumbing (T26): a selection that no longer names a message in
@@ -1403,6 +1535,276 @@ mod tests {
             }
         );
         assert!(app.conversations[&CHAT].messages.is_empty());
+    }
+
+    // --- T67: filling the viewport on a cold open ---------------------
+
+    /// Every `GetChatHistory` in `effects`, as
+    /// `(from_message_id, only_local)` pairs — the two parameters that say
+    /// which end of the history a request is asking about.
+    fn history_requests(effects: &[Effect]) -> Vec<(i64, bool)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Td(TdRequest::GetChatHistory {
+                    from_message_id,
+                    only_local,
+                    ..
+                }) => Some((from_message_id.0, *only_local)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reported bug: a chat this client has never opened has exactly one
+    /// message in TDLib's local database (the chat-list preview), so the
+    /// local-first opening page comes back with one message and the paging
+    /// machine — correctly — parks at `Idle`. The window must not be left
+    /// like that.
+    #[test]
+    fn cold_open_of_one_message_asks_for_more() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+
+        assert_eq!(
+            history_requests(&effects),
+            vec![(0, false), (100, false)],
+            "the T59 reconcile asks from the newest end, the T67 fill from \
+             the oldest loaded message: {effects:?}"
+        );
+        // The fill is a caller-side policy: it leaves the machine alone, so
+        // the page it eventually gets back is ignored by the machine rather
+        // than mistaken for a scroll-triggered page (and an empty answer
+        // never spends the §5.2 retry ladder).
+        assert_eq!(app.conversations[&CHAT].paging, PagingState::Idle);
+    }
+
+    /// The fill keeps going while the window is short, and stops the moment
+    /// it is deep enough — without any scroll input.
+    #[test]
+    fn fill_repeats_until_the_target_is_reached() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+
+        // The cold open: one message, and the fill asks for what precedes it.
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+        assert!(history_requests(&effects).contains(&(100, false)));
+
+        // TDLib is still syncing and dribbles the history out in short
+        // pages. Each one is progress, so each one is followed by another
+        // ask, from the new oldest message.
+        let mut oldest = 100;
+        let mut rounds = 0;
+        while app.conversations[&CHAT].messages.len() < VIEWPORT_FILL_TARGET_MESSAGES {
+            rounds += 1;
+            assert!(
+                rounds <= VIEWPORT_FILL_TARGET_MESSAGES,
+                "the fill must terminate"
+            );
+            let page: Vec<MessageView> = ((oldest - 10)..oldest).map(msg).collect();
+            oldest -= 10;
+            let effects = apply_history_page(&mut app, CHAT, false, &Ok(page));
+
+            let requested = history_requests(&effects);
+            if app.conversations[&CHAT].messages.len() < VIEWPORT_FILL_TARGET_MESSAGES {
+                assert_eq!(
+                    requested,
+                    vec![(oldest, false)],
+                    "a short window keeps asking, from its new oldest message"
+                );
+            } else {
+                assert!(
+                    requested.is_empty(),
+                    "a full enough window asks for nothing: {effects:?}"
+                );
+            }
+        }
+        assert_eq!(rounds, 5, "10 messages a round from a window of 1");
+        assert_eq!(app.conversations[&CHAT].messages.len(), 51);
+    }
+
+    /// The anti-spin rule, and the only one that has to hold against a
+    /// misbehaving server: a page that contributes nothing new — the same
+    /// message over and over, or pure overlap — ends the fill even though the
+    /// window is still short.
+    #[test]
+    fn fill_stops_when_a_page_adds_nothing_new() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+        apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+
+        // The server answers the fill with the message we already have.
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(100)]));
+
+        assert!(
+            history_requests(&effects).is_empty(),
+            "a page of pure overlap must not be answered with another ask: {effects:?}"
+        );
+        assert_eq!(app.conversations[&CHAT].messages.len(), 1);
+    }
+
+    /// A genuinely short chat: TDLib has nothing older to give. The fill ends
+    /// on its own, and — because it never drove the machine — without
+    /// latching `Exhausted` on a chat whose server sync may simply be behind.
+    #[test]
+    fn fill_stops_on_an_empty_answer_without_exhausting_the_machine() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+        apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(Vec::new()));
+
+        assert!(history_requests(&effects).is_empty(), "{effects:?}");
+        assert_eq!(app.conversations[&CHAT].paging, PagingState::Idle);
+    }
+
+    /// `Exhausted` is the machine's word for "there is genuinely no more
+    /// history", and it outranks a short window.
+    #[test]
+    fn no_fill_while_exhausted() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.push_back(msg(100));
+        convo.paging = PagingState::Exhausted;
+
+        // A page still lands (a reconcile's, say) and is prepended, but the
+        // window being short is no reason to ask a chat that has no more.
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(99)]));
+
+        assert!(history_requests(&effects).is_empty(), "{effects:?}");
+        assert_eq!(app.conversations[&CHAT].messages.len(), 2);
+    }
+
+    /// `Cooldown` means TDLib asked for a backoff. A page can still land
+    /// during one (a request that was already in flight), and it is still
+    /// prepended — but a fill is the least urgent reason to ignore a backoff.
+    #[test]
+    fn no_fill_while_in_cooldown() {
+        let mut app = fixture_state();
+        app.now = Millis(1_000);
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.push_back(msg(100));
+        convo.paging = PagingState::Cooldown {
+            until: Millis(9_000),
+        };
+
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(99)]));
+
+        assert!(history_requests(&effects).is_empty(), "{effects:?}");
+        assert_eq!(app.conversations[&CHAT].messages.len(), 2);
+        assert_eq!(
+            app.conversations[&CHAT].paging,
+            PagingState::Cooldown {
+                until: Millis(9_000)
+            },
+            "a fill must never move the paging state"
+        );
+    }
+
+    /// The state table [`fill_viewport`] enforces, asserted on the function
+    /// itself. `Loading` is checked here rather than through
+    /// [`apply_history_page`] because the machine can only be left `Loading`
+    /// by an *empty* page (a non-empty one returns it to `Idle`), and an
+    /// empty page adds nothing, so that guard is unreachable from the outside
+    /// — it is the belt to the `added == 0` braces, and the two must not be
+    /// allowed to drift apart.
+    #[test]
+    fn fill_asks_only_from_idle_and_only_after_progress() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.push_back(msg(100));
+
+        for paging in [
+            PagingState::Loading {
+                attempt: 1,
+                only_local: false,
+            },
+            PagingState::Loading {
+                attempt: 1,
+                only_local: true,
+            },
+            PagingState::Cooldown {
+                until: Millis(9_000),
+            },
+            PagingState::Exhausted,
+        ] {
+            let convo = app.conversations.get_mut(&CHAT).unwrap();
+            convo.paging = paging;
+            assert!(
+                fill_viewport(convo, CHAT, 1).is_none(),
+                "{paging:?} must not fill"
+            );
+        }
+
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.paging = PagingState::Idle;
+        assert!(
+            fill_viewport(convo, CHAT, 0).is_none(),
+            "a page that added nothing new must not fill, even from Idle"
+        );
+        assert!(fill_viewport(convo, CHAT, 1).is_some());
+    }
+
+    /// A full first page needs no help — the common case, and the one that
+    /// must stay free of extra traffic.
+    #[test]
+    fn full_first_page_triggers_no_fill() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+
+        let page: Vec<MessageView> = (1..=(VIEWPORT_FILL_TARGET_MESSAGES as i64))
+            .map(msg)
+            .collect();
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(page));
+
+        assert_eq!(
+            history_requests(&effects),
+            vec![(0, false)],
+            "only T59's reconcile, no fill: {effects:?}"
+        );
+    }
+
+    /// The two follow-ups a cold open puts in flight ask opposite ends of the
+    /// history, and neither one's completion re-triggers the other: the
+    /// reconcile is keyed off `only_local` (a fill is never local), and the
+    /// fill is keyed off a window that is still short *and* a page that
+    /// brought something new.
+    #[test]
+    fn fill_and_reconcile_do_not_trigger_each_other() {
+        let mut app = fixture_state();
+        fixture_opening(&mut app);
+        apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+
+        // The reconcile lands first with one genuinely newer message. It is
+        // remote, so it spawns no reconcile of its own; the window is still
+        // short and it did bring something new, so it does spawn a fill —
+        // asking older, which is not where the reconcile was looking. (Which
+        // id exactly is not this test's subject: the reconcile's own newer
+        // message is what `prepend_messages` just put at the front.)
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(100), msg(101)]));
+        let requested = history_requests(&effects);
+        assert_eq!(
+            requested.len(),
+            1,
+            "one fill, no second reconcile: {effects:?}"
+        );
+        assert!(
+            !requested[0].1,
+            "every fill is remote, which is also why a fill's own completion \
+             can never spawn a reconcile: {effects:?}"
+        );
+
+        // The original fill's page lands last and finishes the job; nothing
+        // further is asked.
+        let page: Vec<MessageView> = (50..100).map(msg).collect();
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page));
+        assert!(history_requests(&effects).is_empty(), "{effects:?}");
+        assert_eq!(app.conversations[&CHAT].messages.len(), 52);
     }
 
     // --- handle_key ----------------------------------------------------

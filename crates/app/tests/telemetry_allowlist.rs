@@ -496,6 +496,18 @@ impl Harness {
         self.press(KeyCode::Enter).await;
         self.advance_until("the send to reach TDLib", |_, fake| sends(fake) == 2)
             .await;
+        // A request `FakeTd` has *recorded* is not yet a message in the
+        // window: the optimistic `MessageSent` completion is still in the
+        // action channel at this point. The next step enters selection mode,
+        // which picks the newest loaded message — so waiting for the request
+        // alone would sometimes arm the edit below on the reply instead.
+        self.advance_until("the sent message to reach the window", |core, _| {
+            core.app().state().conversations[&ADA]
+                .messages
+                .iter()
+                .any(|m| m.id == SENT_ID)
+        })
+        .await;
     }
 
     /// `message.edit`. The Edit chip is only offered on an *outgoing*
