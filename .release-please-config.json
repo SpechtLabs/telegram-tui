@@ -7,6 +7,7 @@
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
+      "last-release-sha": "92d7c5b8bae0e5f7a96a79d9237f63434e56e373",
       "extra-files": [
         {
           "type": "generic",
