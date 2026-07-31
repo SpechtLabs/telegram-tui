@@ -16,17 +16,35 @@
 //! Unread counts are `accent` bold, mentions `warning`, right-aligned and
 //! unbracketed; muted chats drop to `text_muted` entirely.
 //!
-//! ## Scroll window
+//! ## Scroll window (T76)
 //!
-//! `ChatListState.scroll_offset` is core-owned state this view never writes
-//! to — views only read `AppState`. Instead `scroll_offset` (the private fn
-//! below, not the state field) recomputes a window offset from scratch every
-//! frame: if the selected row's index already fits in the first `height`
-//! rows the offset is 0, otherwise the offset is the smallest value that
-//! puts the selection on the last visible row (`idx - height + 1`, clamped
-//! so the window never runs past the end of the list). This is a pure
-//! function of `(row count, viewport height, selected index)`, so it needs
-//! no persisted scroll state and always agrees with the current selection.
+//! `ChatListState.scroll_offset` is core-owned state this view reads but
+//! never writes — views only read `AppState`, so a wheel step never lands
+//! here directly; core's `state::chat_list::scroll_viewport` owns that
+//! mutation, and `draw` just interprets the result each frame. Rendering the
+//! window is a two-step split that mirrors the split in the field's own doc
+//! comment:
+//!
+//! - `display_offset_for_scroll` translates `scroll_offset` — an index into
+//!   `visible_rows`, i.e. real chat rows only, since core has no notion of
+//!   this view's synthetic `DisplayRow::Archive`/`PinnedSeparator` entries —
+//!   into a start index over `display`. `scroll_offset == 0` always maps to
+//!   display index `0` rather than to wherever `visible_rows()[0]` lands, so
+//!   the archive pseudo-row (when present) still shows at the very top of an
+//!   unscrolled list instead of always being one wheel-tick out of reach.
+//! - `resolve_offset` then applies the one adjustment core *can't* make
+//!   without knowing the pane's rendered height: if the selection sits below
+//!   what the wheel-derived window currently shows, the window is pulled
+//!   down (never up — core already guarantees `scroll_offset` never sits
+//!   past `selected`'s row, so the window is never above it to begin with)
+//!   just far enough to put the selection back on screen. This is what makes
+//!   `↑`/`↓` recover from a wheel scroll that carried the viewport away from
+//!   the selection, without a wheel scroll fighting `↑`/`↓` for control the
+//!   rest of the time.
+//!
+//! Both functions are pure — `resolve_offset` over `(row count, viewport
+//! height, wheel-derived offset, selected index)` — so nothing here needs
+//! per-frame mutable state beyond what `AppState` already carries.
 //!
 //! ## Sidebar organization (T43, spec §11)
 //!
@@ -45,8 +63,7 @@
 //!
 //! Below those, the row list itself is `visible_rows` (already pinned-first,
 //! see `state::chat_list`'s docs) with two additions folded into the same
-//! scroll window so selection math stays a single pure function of `(row
-//! count, height, selected index)`:
+//! `display` list the scroll window above operates over:
 //!
 //! - A non-selectable archive pseudo-row at the very top, when
 //!   `active_list == Main` and `archive_visible`. It shows the summed
@@ -273,13 +290,14 @@ fn draw_display_rows(
     }
     // Only `DisplayRow::Chat` participates in selection, so the archive
     // pseudo-row and the separator are never a scroll anchor — they just
-    // ride along in whatever window a real chat's selection produces.
+    // ride along in whatever window the wheel or the selection produces.
     let selected_idx = list.selected.and_then(|sel| {
         display
             .iter()
             .position(|row| matches!(row, DisplayRow::Chat(id) if *id == sel))
     });
-    let offset = scroll_offset(display.len(), height, selected_idx);
+    let core_offset = display_offset_for_scroll(display, list.scroll_offset);
+    let offset = resolve_offset(display.len(), height, core_offset, selected_idx);
 
     // The hit region for a row is recorded here, off the same
     // `(offset, index)` pair that decides where the row is painted, so the
@@ -411,16 +429,58 @@ fn folder_label(id: ChatListId) -> String {
     }
 }
 
+/// Translates `scroll_offset` — core's index into `visible_rows`, i.e. real
+/// chat rows only — into a start index over `display`, which additionally
+/// carries the archive pseudo-row and the pinned/unpinned separator this
+/// view inserts. See the module docs' "Scroll window" section.
+///
+/// `scroll_offset == 0` is special-cased to display index `0` rather than
+/// computed like every other offset, so the archive row (when present)
+/// still shows at the very top of an unscrolled list: core's index space
+/// has no notion of that synthetic row, so without this case `scroll_offset
+/// == 0` would map to wherever `visible_rows()[0]` lands in `display`,
+/// permanently scrolling the archive row one tick above reach.
+fn display_offset_for_scroll(display: &[DisplayRow], scroll_offset: usize) -> usize {
+    if scroll_offset == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for (i, row) in display.iter().enumerate() {
+        if matches!(row, DisplayRow::Chat(_)) {
+            if seen == scroll_offset {
+                return i;
+            }
+            seen += 1;
+        }
+    }
+    // `scroll_offset` pointed past the last chat row — stale relative to a
+    // `display` that just shrank (e.g. a filter narrowing the results in
+    // the same frame core computed it against a wider list). Falling back
+    // to the last row keeps this in bounds rather than reading past the end
+    // of `display`; core's own clamp corrects the field by the next frame.
+    display.len().saturating_sub(1)
+}
+
 /// See the module docs' "Scroll window" section for the invariant this
-/// implements: a pure, stateless clamp of the viewport to the selection.
-fn scroll_offset(total: usize, height: usize, selected_idx: Option<usize>) -> usize {
+/// implements: `core_offset` (the wheel's, via
+/// `display_offset_for_scroll`) is the starting point, and the only
+/// adjustment made here is pulling the window down to keep `selected_idx`
+/// on screen from below — core already guarantees `core_offset` never sits
+/// past the selection, so this never needs to pull the window back up.
+fn resolve_offset(
+    total: usize,
+    height: usize,
+    core_offset: usize,
+    selected_idx: Option<usize>,
+) -> usize {
     if height == 0 || total <= height {
         return 0;
     }
     let max_offset = total - height;
+    let offset = core_offset.min(max_offset);
     match selected_idx {
-        None => 0,
-        Some(idx) => idx.saturating_sub(height - 1).min(max_offset),
+        Some(idx) if idx >= offset + height => idx.saturating_sub(height - 1).min(max_offset),
+        _ => offset,
     }
 }
 
@@ -669,6 +729,31 @@ mod tests {
         out
     }
 
+    /// Same drive as [`render_to_string`], but keeps the [`HitMap`] `draw`
+    /// filled in alongside the flattened buffer, so a test can look up
+    /// where a row painted and then probe that exact cell (T76: proving a
+    /// click still resolves the right chat after a wheel scroll).
+    fn render_with_hits(width: u16, height: u16, state: &AppState) -> (String, HitMap) {
+        let theme = Theme::default_dark();
+        let mut hits = HitMap::new();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw(area, state, &theme, f, &mut hits);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::with_capacity(buffer.content.len() + buffer.area.height as usize);
+        for row in buffer.content.chunks(buffer.area.width as usize) {
+            for cell in row {
+                out.push_str(cell.symbol());
+            }
+            out.push('\n');
+        }
+        (out, hits)
+    }
+
     #[test]
     fn populated_list_with_badges_and_selection_120x40() {
         let state = fixture_state(seeded_chat_list(Some(1)));
@@ -821,17 +906,123 @@ mod tests {
     }
 
     #[test]
-    fn scroll_offset_keeps_selection_visible_without_over_scrolling() {
-        // Selection inside the first window: no scroll needed.
-        assert_eq!(scroll_offset(20, 5, Some(2)), 0);
-        // Selection past the window: scroll the minimum to reveal it.
-        assert_eq!(scroll_offset(20, 5, Some(10)), 6);
+    fn resolve_offset_follows_selection_down_but_never_up() {
+        // No wheel scroll (core_offset 0), selection inside the first
+        // window already: no adjustment needed.
+        assert_eq!(resolve_offset(20, 5, 0, Some(2)), 0);
+        // Selection past the window: pulled down just enough to reveal it.
+        assert_eq!(resolve_offset(20, 5, 0, Some(10)), 6);
         // Never scrolls past the point where the last row is at the bottom.
-        assert_eq!(scroll_offset(20, 5, Some(19)), 15);
-        // Short lists never scroll.
-        assert_eq!(scroll_offset(3, 5, Some(2)), 0);
-        // No selection: show the top of the list.
-        assert_eq!(scroll_offset(20, 5, None), 0);
+        assert_eq!(resolve_offset(20, 5, 0, Some(19)), 15);
+        // Short lists never scroll, whatever core_offset claims.
+        assert_eq!(resolve_offset(3, 5, 2, Some(2)), 0);
+        // No selection: honour core_offset as-is (clamped to the end).
+        assert_eq!(resolve_offset(20, 5, 0, None), 0);
+        assert_eq!(resolve_offset(20, 5, 4, None), 4);
+        assert_eq!(resolve_offset(20, 5, 999, None), 15);
+        // A wheel scroll that already shows the selection is left alone —
+        // it is not pulled back up toward the top of the window.
+        assert_eq!(resolve_offset(20, 5, 8, Some(9)), 8);
+        // A wheel scroll that left the selection below the window still
+        // gets pulled down to reveal it, same as the no-scroll case.
+        assert_eq!(resolve_offset(20, 5, 0, Some(12)), 8);
+    }
+
+    #[test]
+    fn display_offset_for_scroll_maps_visible_rows_index_into_display() {
+        let display = vec![
+            DisplayRow::Archive(3),
+            DisplayRow::Chat(ChatId(1)),
+            DisplayRow::Chat(ChatId(2)),
+            DisplayRow::PinnedSeparator,
+            DisplayRow::Chat(ChatId(3)),
+            DisplayRow::Chat(ChatId(4)),
+        ];
+        // scroll_offset 0 always lands on display index 0, so the archive
+        // row shows at the top of an unscrolled list even though it has no
+        // index of its own in core's `visible_rows`-space.
+        assert_eq!(display_offset_for_scroll(&display, 0), 0);
+        // scroll_offset 1 is the second real chat row (ChatId(2)) — the
+        // archive row is skipped, not counted.
+        assert_eq!(display_offset_for_scroll(&display, 1), 2);
+        // scroll_offset 2 is the third chat row (ChatId(3)); the separator
+        // sitting right before it in `display` is skipped too.
+        assert_eq!(display_offset_for_scroll(&display, 2), 4);
+        // Past the last chat row: falls back to the end of `display` rather
+        // than panicking or reading out of bounds.
+        assert_eq!(display_offset_for_scroll(&display, 99), display.len() - 1);
+    }
+
+    /// The bug this task fixes: a wheel scroll used to move the selection,
+    /// because the render window was derived purely from `selected`. Now
+    /// `list.scroll_offset` alone drives the window, and it can leave the
+    /// selection scrolled off-screen — exactly what a real wheel scroll
+    /// does before the user next presses `↑`/`↓`.
+    #[test]
+    fn scroll_offset_moves_the_window_independent_of_selection() {
+        let mut list = seeded_chat_list(Some(1)); // selected: Alice, row 0
+        list.scroll_offset = 3; // wheel-scrolled to "#rust-de", row 3
+        let state = fixture_state(list);
+        // Header is 2 rows (no tabs/filter/archive here); 3 more give a
+        // rows_area exactly 3 rows tall — less than the 8 total rows, so
+        // the window actually has something to hide.
+        let rendered = render_to_string(120, 5, &state);
+        assert!(rendered.contains("#rust-de"));
+        assert!(rendered.contains("Bob"));
+        // Alice is selected but scrolled off above the window — the wheel
+        // moved the viewport, not the selection, and this state must not
+        // be "corrected" back to showing the selection.
+        assert!(!rendered.contains("Alice"));
+    }
+
+    /// The wheel-driven window still honours a keyboard-moved selection
+    /// once it falls off the *bottom* — the one adjustment `resolve_offset`
+    /// is allowed to make, since core can't do it without the pane height.
+    #[test]
+    fn keyboard_selection_below_the_window_pulls_it_back_into_view() {
+        let mut list = seeded_chat_list(Some(8)); // selected: Carol, row 7 (last)
+        list.scroll_offset = 0; // no wheel scroll: fresh, top of the list
+        let state = fixture_state(list);
+        let rendered = render_to_string(120, 5, &state);
+        assert!(rendered.contains("Carol"));
+    }
+
+    /// Scrolling away from the top (T76) hides the archive pseudo-row along
+    /// with the pinned chats above the scroll target — `scroll_offset == 0`
+    /// is the only value that shows it, per `display_offset_for_scroll`'s
+    /// contract.
+    #[test]
+    fn scrolling_past_the_top_hides_the_archive_row() {
+        let mut list = sidebar_organization_chat_list();
+        list.scroll_offset = 1; // wheel-scrolled past Alice, to Boss
+        let state = fixture_state(list);
+        // Header with tabs costs 4 rows; 3 more give a rows_area smaller
+        // than the list's 6 display rows.
+        let rendered = render_to_string(120, 7, &state);
+        assert!(rendered.contains("Boss"));
+        assert!(rendered.contains("Team Rust"));
+        assert!(!rendered.contains("Archived  12"));
+        assert!(!rendered.contains("Alice"));
+    }
+
+    /// The part most likely to break silently per the task brief: after a
+    /// wheel scroll, a click must resolve the chat actually painted at that
+    /// row, not whatever chat used to be there before the window moved.
+    #[test]
+    fn click_after_scroll_resolves_the_row_actually_painted() {
+        let mut list = seeded_chat_list(Some(1)); // selected: Alice, row 0
+        list.scroll_offset = 3; // wheel-scrolled to "#rust-de", row 3
+        let state = fixture_state(list);
+        let (rendered, hits) = render_with_hits(120, 5, &state);
+        let lines: Vec<&str> = rendered.lines().collect();
+        // rows_area starts at y = 2 (label + blank), one row per visible
+        // chat: #rust-de (id 4), Bob (id 5), Archived (id 6).
+        assert!(lines[2].contains("#rust-de"));
+        assert_eq!(hits.target_at(5, 2), Some(HitTarget::ChatRow(ChatId(4))));
+        assert!(lines[3].contains("Bob"));
+        assert_eq!(hits.target_at(5, 3), Some(HitTarget::ChatRow(ChatId(5))));
+        assert!(lines[4].contains("Archived"));
+        assert_eq!(hits.target_at(5, 4), Some(HitTarget::ChatRow(ChatId(6))));
     }
 
     #[test]
