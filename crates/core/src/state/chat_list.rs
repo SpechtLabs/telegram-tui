@@ -558,11 +558,19 @@ fn move_selection(app: &mut AppState, delta: i32) {
 ///
 /// The window bookkeeping itself is `conversation::open`'s (the same call
 /// `palette`'s open path makes), so the `ConversationState` a chat gets is
-/// built in exactly one place regardless of which pane opened it.
+/// built in exactly one place regardless of which pane opened it. Likewise
+/// for `conversation::close_previous_chat` (T77): whatever chat this Enter
+/// replaces gets `CloseChat` before the new `OpenChat`, from one shared
+/// implementation rather than two that could drift.
 fn open_selected(app: &mut AppState) -> Vec<Effect> {
     let Some(chat_id) = app.chat_list.selected else {
         return Vec::new();
     };
+    // Read before `open()` overwrites `open_chat`: `CloseChat` for whatever
+    // chat this Enter is leaving (T77's audit finding #6), ordered before
+    // the new `OpenChat` below so this single-pane-per-client's "which chat
+    // is open" story is never briefly two chats rather than briefly none.
+    let mut effects = conversation::close_previous_chat(app, chat_id);
     conversation::open(app, chat_id);
     if let Some(convo) = app.conversations.get_mut(&chat_id) {
         convo.paging = PagingState::Loading {
@@ -570,7 +578,7 @@ fn open_selected(app: &mut AppState) -> Vec<Effect> {
             only_local: true,
         };
     }
-    let mut effects = vec![
+    effects.extend([
         Effect::Td(TdRequest::OpenChat { chat_id }),
         Effect::Td(TdRequest::GetChatHistory {
             chat_id,
@@ -578,7 +586,7 @@ fn open_selected(app: &mut AppState) -> Vec<Effect> {
             limit: 50,
             only_local: true,
         }),
-    ];
+    ]);
     // T72: reopening a chat whose window is still loaded has unread messages
     // to mark right now; a first open has none until its page lands, and
     // `conversation::apply_history_page` fires this again then.
@@ -795,6 +803,62 @@ mod tests {
                 only_local: true,
             })
         ));
+    }
+
+    /// T77's audit finding #6: switching chats without telling TDLib the old
+    /// one closed left every chat a session ever opened marked open forever.
+    #[test]
+    fn enter_on_a_different_chat_closes_the_one_it_replaces() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 10));
+        handle_td(&mut app, &new_chat_with_order(2, "Bob", 20));
+        app.chat_list.selected = Some(ChatId(1));
+        handle_key(&mut app, Key::Enter);
+        assert_eq!(app.open_chat, Some(ChatId(1)));
+
+        app.chat_list.selected = Some(ChatId(2));
+        let effects = handle_key(&mut app, Key::Enter).expect("chat list claims Enter");
+
+        assert_eq!(app.open_chat, Some(ChatId(2)));
+        // Close-before-open (module docs on `close_previous_chat`): never a
+        // frame where this single-pane client claims two chats are open.
+        assert_eq!(effects.len(), 3);
+        assert!(matches!(
+            effects[0],
+            Effect::Td(TdRequest::CloseChat { chat_id: ChatId(1) })
+        ));
+        assert!(matches!(
+            effects[1],
+            Effect::Td(TdRequest::OpenChat { chat_id: ChatId(2) })
+        ));
+        assert!(matches!(
+            effects[2],
+            Effect::Td(TdRequest::GetChatHistory {
+                chat_id: ChatId(2),
+                ..
+            })
+        ));
+    }
+
+    /// Re-selecting the chat that's already open is a common, ordinary
+    /// action (T72's re-open-marks-read path) — it must not emit a
+    /// close/open churn pair for the same chat id.
+    #[test]
+    fn re_entering_the_open_chat_emits_no_close_open_churn() {
+        let mut app = fixture_state();
+        handle_td(&mut app, &new_chat_with_order(1, "Alice", 10));
+        app.chat_list.selected = Some(ChatId(1));
+        handle_key(&mut app, Key::Enter);
+        assert_eq!(app.open_chat, Some(ChatId(1)));
+
+        let effects = handle_key(&mut app, Key::Enter).expect("chat list claims Enter");
+
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Td(TdRequest::CloseChat { .. }))),
+            "re-opening the already-open chat must not close it: {effects:?}"
+        );
     }
 
     /// T72: reopening a chat whose window is still loaded marks its unread

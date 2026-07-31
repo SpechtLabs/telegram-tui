@@ -231,14 +231,18 @@ fn invoke_selected(app: &mut AppState) -> Vec<Effect> {
 /// Mirrors `chat_list`'s Enter-on-chat effects (architecture §4.6):
 /// `conversation::open` does the bookkeeping (ensures a `ConversationState`
 /// exists, sets `open_chat`), and the caller issues `OpenChat` plus the
-/// first `GetChatHistory` page — the same two effects `chat_list::handle_key`
-/// emits on Enter.
+/// first `GetChatHistory` page — the same effects `chat_list::handle_key`
+/// emits on Enter, preceded by `CloseChat` for whatever chat this replaces
+/// (`conversation::close_previous_chat`, T77).
 ///
 /// T59 (local-first history): also mirrors `chat_list::open_selected`'s
 /// `only_local: true` request and its `paging` bookkeeping — see that
 /// function's doc comment for why `paging` is set unconditionally rather
 /// than only on first insert.
 fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
+    // Mirrors `chat_list::open_selected`'s `close_previous_chat` call — see
+    // its comment for the ordering rationale (T77's audit finding #6).
+    let mut effects = conversation::close_previous_chat(app, chat_id);
     conversation::open(app, chat_id);
     if let Some(convo) = app.conversations.get_mut(&chat_id) {
         convo.paging = PagingState::Loading {
@@ -246,7 +250,7 @@ fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
             only_local: true,
         };
     }
-    let mut effects = vec![
+    effects.extend([
         Effect::Td(TdRequest::OpenChat { chat_id }),
         Effect::Td(TdRequest::GetChatHistory {
             chat_id,
@@ -254,7 +258,7 @@ fn open_chat(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
             limit: 50,
             only_local: true,
         }),
-    ];
+    ]);
     // T72: mirrors `chat_list::open_selected` here too — see its call site
     // for why an already-loaded window needs this and a cold open does not.
     effects.extend(conversation::mark_visible_read(app, chat_id));
@@ -666,6 +670,49 @@ mod tests {
         ));
         // Enter closes the palette itself; the focus pop is the router's.
         assert!(app.palette.is_none());
+    }
+
+    /// T77's audit finding #6: opening a chat from the palette while a
+    /// different one is open behaves identically to `chat_list`'s Enter —
+    /// same `close_previous_chat` call, same effect order. See
+    /// `chat_list::tests::enter_on_a_different_chat_closes_the_one_it_replaces`.
+    #[test]
+    fn opening_a_different_chat_from_the_palette_closes_the_one_it_replaces() {
+        let mut app = fixture_state();
+        insert_chat(&mut app, 1, "Alice", 10);
+        insert_chat(&mut app, 2, "Bob", 20);
+        app.open_chat = Some(ChatId(1));
+        open(&mut app);
+        // Select Bob explicitly rather than assume result ordering.
+        let idx = app
+            .palette
+            .as_ref()
+            .unwrap()
+            .results
+            .iter()
+            .position(|item| matches!(item, PaletteItem::Chat { id: ChatId(2), .. }))
+            .expect("Bob is a palette result");
+        app.palette.as_mut().unwrap().selected = idx;
+
+        let effects = handle_key(&mut app, Key::Enter).expect("palette claims Enter");
+
+        assert_eq!(app.open_chat, Some(ChatId(2)));
+        assert_eq!(effects.len(), 3);
+        assert!(matches!(
+            effects[0],
+            Effect::Td(TdRequest::CloseChat { chat_id: ChatId(1) })
+        ));
+        assert!(matches!(
+            effects[1],
+            Effect::Td(TdRequest::OpenChat { chat_id: ChatId(2) })
+        ));
+        assert!(matches!(
+            effects[2],
+            Effect::Td(TdRequest::GetChatHistory {
+                chat_id: ChatId(2),
+                ..
+            })
+        ));
     }
 
     /// T72: same read-marking contract as `chat_list::open_selected` — the

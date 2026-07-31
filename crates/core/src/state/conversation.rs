@@ -226,6 +226,30 @@ pub fn open(app: &mut AppState, chat_id: ChatId) {
     app.open_chat = Some(chat_id);
 }
 
+/// `CloseChat` for whichever chat is being left, if any and if it differs
+/// from `new_chat_id` — TDLib's `openChat`/`closeChat` pair marks which chat
+/// a client is actively viewing (governing that chat's per-chat update
+/// subscription), and without a matching close, every chat a session has
+/// ever opened stays marked open indefinitely.
+///
+/// Deliberately not folded into `open()`: that function is pure bookkeeping
+/// by design (its own doc comment) and this needs to read `app.open_chat`'s
+/// *outgoing* value, so callers must invoke it before `open()` overwrites
+/// that field, not as part of the same call.
+///
+/// Re-opening the chat that is already open (`new_chat_id == app.open_chat`,
+/// the common case of re-selecting the current row) returns nothing — this
+/// is what keeps that path from emitting a close/open churn pair for the
+/// same chat.
+pub fn close_previous_chat(app: &AppState, new_chat_id: ChatId) -> Vec<Effect> {
+    match app.open_chat {
+        Some(previous) if previous != new_chat_id => {
+            vec![Effect::Td(TdRequest::CloseChat { chat_id: previous })]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Tells TDLib which messages the user has actually seen in `chat_id`, so it
 /// clears the unread badge and syncs the read state to the user's other
 /// clients. See the module docs for the trigger points and the storm control;
@@ -1113,6 +1137,27 @@ mod tests {
             }
         );
         assert_eq!(app.open_chat, Some(CHAT));
+    }
+
+    #[test]
+    fn close_previous_chat_targets_the_outgoing_chat_only_when_it_differs() {
+        let mut app = fixture_state();
+        const OTHER: ChatId = ChatId(2);
+
+        // Nothing open yet: no chat to close.
+        assert!(close_previous_chat(&app, CHAT).is_empty());
+
+        open(&mut app, CHAT);
+        // Same chat again: no close/open churn against itself.
+        assert!(close_previous_chat(&app, CHAT).is_empty());
+
+        // A different chat: close the one being left.
+        let effects = close_previous_chat(&app, OTHER);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Td(TdRequest::CloseChat { chat_id: CHAT })
+        ));
     }
 
     // --- prepend / anchor stability -----------------------------------
