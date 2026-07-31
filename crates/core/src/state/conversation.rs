@@ -51,6 +51,7 @@ use crate::model::message::MessageView;
 use crate::model::time::Millis;
 use crate::state::focus::Focus;
 use crate::state::history::{self, PagingDirective, PagingState};
+use crate::state::media;
 use crate::state::selection::SelectionState;
 use crate::td::error::TdError;
 use crate::td::request::TdRequest;
@@ -125,6 +126,10 @@ pub fn handle_td(app: &mut AppState, upd: &TdUpdate) -> Vec<Effect> {
     match upd {
         TdUpdate::NewMessage(msg) => {
             append_new_message(app, msg);
+            // T66: the arrival changes what's visible near the anchor
+            // (`Scroll::Bottom` especially — a new message is by
+            // definition the newest thing loaded).
+            return media::auto_download_photos(app, msg.chat_id);
         }
         TdUpdate::MessagesDeleted {
             chat_id,
@@ -314,7 +319,7 @@ pub fn apply_history_page(
         return Vec::new();
     };
 
-    match outcome {
+    let mut effects = match outcome {
         Ok(msgs) => {
             let oldest_loaded = convo.messages.front().map(|m| m.id);
             let received = msgs.len();
@@ -373,7 +378,13 @@ pub fn apply_history_page(
             history::on_history_error(&mut convo.paging, retry_after, app.now);
             Vec::new()
         }
-    }
+    };
+
+    // T66: a prepended page (or even a failed/empty attempt, harmlessly —
+    // storm control makes a redundant call a no-op) is exactly the kind of
+    // change to the visible window auto-download exists to react to.
+    effects.extend(media::auto_download_photos(app, chat_id));
+    effects
 }
 
 /// Merges `new_msgs` into the front of `existing`, deduped by id (against
@@ -493,8 +504,13 @@ pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
         _ => return None,
     };
     let now = app.now;
-    let convo = app.conversations.get_mut(&chat_id)?;
-    Some(move_anchor(convo, chat_id, delta, now))
+    let mut effects = {
+        let convo = app.conversations.get_mut(&chat_id)?;
+        move_anchor(convo, chat_id, delta, now)
+    };
+    // T66: every anchor step changes what's near it.
+    effects.extend(media::auto_download_photos(app, chat_id));
+    Some(effects)
 }
 
 /// Moves the scroll anchor by `delta` messages (negative = toward older,

@@ -44,7 +44,7 @@ use crate::model::message::{MessageCaps, MessageContent, MessageView, SendState}
 use crate::state::auth::InputField;
 use crate::state::conversation::{self, ConversationState};
 use crate::state::focus::{Focus, ModalKind};
-use crate::state::media::MediaState;
+use crate::state::media::{self, MediaState};
 use crate::td::error::TdError;
 use crate::td::request::TdRequest;
 
@@ -267,6 +267,9 @@ fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Eff
         })]
     };
     effects.extend(conversation::anchor_to(convo, chat_id, message_id, now));
+    // T66: selection landing on (or stepping to) a message drags the scroll
+    // anchor with it, so it's a "the anchor moved" trigger like any other.
+    effects.extend(media::auto_download_photos(app, chat_id));
     effects
 }
 

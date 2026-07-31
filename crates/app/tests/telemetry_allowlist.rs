@@ -684,6 +684,7 @@ fn boot(consent_needed: bool) -> Boot {
         has_credentials: true,
         width: 140,
         height: 40,
+        auto_download_photos: true,
     }
 }
 

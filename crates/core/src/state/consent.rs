@@ -97,6 +97,7 @@ mod tests {
             has_credentials: false,
             width: 120,
             height: 40,
+            auto_download_photos: true,
         }
     }
 

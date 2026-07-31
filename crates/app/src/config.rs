@@ -70,6 +70,16 @@ pub struct Config {
     /// behalf — over ssh into a host whose terminal type is misreported, or
     /// under a multiplexer the probe does not know about.
     pub inline_images: bool,
+    /// Auto-download photos near the scroll anchor so they render inline
+    /// without the user pressing `⏎ download` on each one
+    /// (docs/design-language.md §6; `tgt_core::state::media`'s
+    /// "Auto-download" module docs). Default on. Unlike `mouse`/
+    /// `inline_images`, this one *does* reach `tgt-core` — it's `Boot`
+    /// wired straight into `AppState.media.auto_download_photos`, since
+    /// `update()` is what decides whether to emit a `DownloadFile` effect,
+    /// not this crate. Scoped to photos only; video/audio/documents stay
+    /// manual regardless of this setting.
+    pub auto_download_photos: bool,
     /// Raw `"ctrl+p"`-style string; parsed into a `Key` by `boot_fields`.
     pub palette_key: String,
     pub telemetry_mode: TelemetryMode,
@@ -91,6 +101,7 @@ impl Default for Config {
             layout_breakpoint_cols: 100,
             mouse: true,
             inline_images: true,
+            auto_download_photos: true,
             palette_key: "ctrl+p".to_string(),
             telemetry_mode: TelemetryMode::Vendor,
             telemetry_endpoint: None,
@@ -122,6 +133,7 @@ pub struct BootFields {
     pub layout_breakpoint_cols: u16,
     pub telemetry_mode: TelemetryMode,
     pub has_credentials: bool,
+    pub auto_download_photos: bool,
 }
 
 impl Config {
@@ -140,6 +152,7 @@ impl Config {
             layout_breakpoint_cols: self.layout_breakpoint_cols,
             telemetry_mode: self.telemetry_mode,
             has_credentials: self.api_id.is_some() && self.api_hash.is_some(),
+            auto_download_photos: self.auto_download_photos,
         }
     }
 
@@ -235,7 +248,14 @@ impl Config {
         out.push_str("# terminal speaks kitty, iTerm2 or sixel. Off, or on a terminal without\n");
         out.push_str("# one, a photo shows as a single descriptive line instead. Inside tmux\n");
         out.push_str("# images stay off unless TGT_FORCE_GRAPHICS=1 says passthrough is set up.\n");
-        out.push_str(&format!("inline_images = {}\n\n", self.inline_images));
+        out.push_str(&format!("inline_images = {}\n", self.inline_images));
+        out.push_str("# Auto-download photos near where you're reading, so they can render\n");
+        out.push_str("# inline without pressing enter-download on each one. Videos, audio and\n");
+        out.push_str("# documents are never auto-downloaded regardless of this setting.\n");
+        out.push_str(&format!(
+            "auto_download_photos = {}\n\n",
+            self.auto_download_photos
+        ));
 
         out.push_str("[keys]\n");
         out.push_str("# Global command-palette shortcut, e.g. \"ctrl+p\" or a bare character.\n");
@@ -366,7 +386,13 @@ const KNOWN_SECTIONS: &[&str] = &["app", "keys", "telemetry", "credentials", "co
 
 fn known_keys(section: &str) -> &'static [&'static str] {
     match section {
-        "app" => &["theme", "layout_breakpoint_cols", "mouse", "inline_images"],
+        "app" => &[
+            "theme",
+            "layout_breakpoint_cols",
+            "mouse",
+            "inline_images",
+            "auto_download_photos",
+        ],
         "keys" => &["palette"],
         "telemetry" => &["mode", "endpoint", "protocol", "headers"],
         "credentials" => &["api_id", "api_hash"],
@@ -441,6 +467,11 @@ fn parse(text: &str) -> eyre::Result<Config> {
             cfg.inline_images = v
                 .as_bool()
                 .ok_or_else(|| eyre::eyre!("[app].inline_images must be a boolean"))?;
+        }
+        if let Some(v) = app.get("auto_download_photos") {
+            cfg.auto_download_photos = v
+                .as_bool()
+                .ok_or_else(|| eyre::eyre!("[app].auto_download_photos must be a boolean"))?;
         }
     }
 
@@ -696,6 +727,46 @@ mod tests {
         );
         // And a non-boolean is a loud error, like every other typed key.
         assert!(parse("[app]\ninline_images = \"yes\"\n").is_err());
+    }
+
+    /// Auto-download is on unless the config says otherwise
+    /// (docs/design-language.md §6) and, like `inline_images`, a config
+    /// written before the key existed keeps that default. Drives
+    /// `render`/`parse` directly rather than `load`, matching
+    /// `inline_images_default_on_and_can_be_turned_off`'s reasoning for
+    /// doing the same.
+    #[test]
+    fn auto_download_photos_default_on_and_can_be_turned_off() {
+        let defaults = Config::default();
+        assert!(
+            defaults.auto_download_photos,
+            "auto-download is on by default"
+        );
+        let generated = defaults.render();
+        assert!(
+            generated.contains("auto_download_photos = true"),
+            "the generated template should document the key:\n{generated}"
+        );
+        assert!(
+            parse(&generated)
+                .expect("the generated template must parse")
+                .auto_download_photos,
+            "the template has to round-trip through the parser"
+        );
+
+        assert!(
+            !parse("[app]\nauto_download_photos = false\n")
+                .expect("parse should succeed")
+                .auto_download_photos
+        );
+        // A config from before the key existed still boots with it on.
+        assert!(
+            parse("[app]\ntheme = \"midnight\"\n")
+                .expect("parse should succeed")
+                .auto_download_photos
+        );
+        // And a non-boolean is a loud error, like every other typed key.
+        assert!(parse("[app]\nauto_download_photos = \"yes\"\n").is_err());
     }
 
     #[test]

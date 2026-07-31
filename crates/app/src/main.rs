@@ -400,6 +400,7 @@ fn boot_from(
         has_credentials: fields.has_credentials,
         width: size.width,
         height: size.height,
+        auto_download_photos: fields.auto_download_photos,
     }
 }
 
