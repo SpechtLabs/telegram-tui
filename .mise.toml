@@ -13,6 +13,12 @@ rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
 pinact = "4.1.0"
 
+# Documentation website (docs/): VuePress builds under bun, and the same
+# markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
+# and `mise run docs-build` locally are exactly what CI does.
+bun = "1.3.14"
+markdownlint-cli2 = "0.23.2"
+
 [env]
 # Sentry crash reporting is compiled in from this variable (`option_env!`), so a
 # build without it is inert. Committed rather than kept in a secret because a
@@ -20,15 +26,16 @@ pinact = "4.1.0"
 # read access, and it is meant to ship inside client binaries. Keeping it here
 # means a contributor's build reports too — and `environment` is split on
 # `debug_assertions`, so their debug runs land somewhere other than the
-# production issue stream. CI passes the same value from a repository secret,
-# which simply overrides this.
-TGT_SENTRY_DSN = "https://af72d07f6ba84fa2d7e3a932f2246fa5@o4510777486016512.ingest.de.sentry.io/4511831345463376"
-
-# Documentation website (docs/): VuePress builds under bun, and the same
-# markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
-# and `mise run docs-build` locally are exactly what CI does.
-bun = "1.3.14"
-markdownlint-cli2 = "0.23.2"
+# production issue stream.
+#
+# The template is what makes the release workflow's TGT_SENTRY_DSN secret an
+# override rather than a no-op: a plain assignment here would win over the
+# inherited environment (verified — mise applies [env] on top of the process
+# environment), so the secret would be silently ignored. An unset secret
+# reaches the runner as an empty string rather than as nothing at all, and
+# `{% if %}` treats both the same, so a missing secret falls back to the value
+# below instead of baking in an empty DSN.
+TGT_SENTRY_DSN = "{% if env.TGT_SENTRY_DSN %}{{ env.TGT_SENTRY_DSN }}{% else %}https://af72d07f6ba84fa2d7e3a932f2246fa5@o4510777486016512.ingest.de.sentry.io/4511831345463376{% endif %}"
 
 # mise's rust backend keeps only a symlink in its own installs dir; the real
 # toolchain lives in ~/.rustup, which mise-action does not cache. On a cache
@@ -59,13 +66,25 @@ description = "Check formatting without writing (gate 1)"
 depends = ["toolchain"]
 run = "cargo fmt --all -- --check"
 
+# The checking gates below blank TGT_SENTRY_DSN. `option_env!` reads it when
+# the crate is compiled, not when it runs, so without this every `mise run
+# test` would bake the production ingest key into a test binary and a
+# panicking test could file a real issue. `crash.rs` treats an empty value the
+# same as an absent one, so this is the "inert build" path it asserts on.
+# A task-level `env` overrides both the [env] default above and anything
+# inherited (verified), which is what makes the blanking reliable. `build`,
+# `run` and `package` deliberately do not do this: those produce the artifacts
+# that are meant to report.
+
 [tasks.lint]
 description = "Clippy across every target, warnings are errors (gate 2)"
 depends = ["toolchain"]
+env = { TGT_SENTRY_DSN = "" }
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.test]
 description = "Run the whole test suite (gate 3)"
+env = { TGT_SENTRY_DSN = "" }
 run = "cargo test --workspace"
 
 [tasks.boundaries]
@@ -78,6 +97,7 @@ depends = ["fmt-check", "lint", "test", "boundaries"]
 
 [tasks.snapshots]
 description = "Fail on any pending insta snapshot (take them with `cargo insta accept`)"
+env = { TGT_SENTRY_DSN = "" }
 run = "cargo insta test --workspace --check"
 
 [tasks.build]

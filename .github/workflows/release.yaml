@@ -137,7 +137,17 @@ jobs:
       # Builds the release binary, lays out bin/ + lib/, makes the loader path
       # relative to the executable, and proves the result runs from a moved
       # directory before it is allowed to ship (architecture.md §9.2).
+      #
+      # This is the step that invokes cargo, so it is the step the Sentry DSN
+      # has to be on: crash.rs reads it through `option_env!`, which is a
+      # compile-time read. .mise.toml carries the same value as a committed
+      # default and defers to this one when it is set, so an absent or empty
+      # secret is a normal state and not a failure — it just means releases
+      # report to the committed project rather than to a retargeted one.
+      # Never echo it: the value must not reach the log.
       - name: Package
+        env:
+          TGT_SENTRY_DSN: ${{ secrets.TGT_SENTRY_DSN }}
         run: mise run package
 
       # A tag whose binary reports a different version means the Cargo.toml
