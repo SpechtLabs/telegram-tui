@@ -357,8 +357,34 @@ fn restore_terminal() {
 /// produces the event in the first place. There is no configuration that
 /// turns it off, so nothing flags it: the teardown always sends the disable,
 /// and a terminal that never had it on ignores that.
+///
+/// # A terminal that cannot bracket pastes is not a startup failure
+///
+/// `Unsupported` is swallowed, and that is load-bearing rather than
+/// defensive. On Windows without VT support, crossterm routes commands to
+/// the console API instead of writing sequences (`command.rs:123-130`
+/// checks `is_ansi_code_supported`, which asks the *process's* console, not
+/// this writer), and `EnableBracketedPaste::execute_winapi` returns
+/// `ErrorKind::Unsupported` with "Bracketed paste not implemented in the
+/// legacy Windows API". Propagating that would mean `tgt` refusing to start
+/// on a legacy Windows console — trading a working client for a paste
+/// nicety. The degraded behaviour is the pre-existing one: a multi-line
+/// paste arrives as keystrokes.
+///
+/// Only `Unsupported` is swallowed. A real write failure still propagates,
+/// because that means the terminal handle itself is broken.
 fn enable_modes_into(out: &mut impl io::Write, mouse: bool) -> io::Result<()> {
-    execute!(out, EnableBracketedPaste)?;
+    match execute!(out, EnableBracketedPaste) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            tracing::warn!(
+                %err,
+                "this terminal cannot bracket pastes; a pasted newline will \
+                 be delivered as Enter"
+            );
+        }
+        Err(err) => return Err(err),
+    }
     if mouse {
         execute!(out, EnableMouseCapture)?;
     }
@@ -561,13 +587,62 @@ mod tests {
     /// Both callers of the teardown go through `restore_modes_into`:
     /// `TerminalGuard::drop` on every ordinary exit, and `panic::install`'s
     /// hook on an unwinding one.
+    /// A sink that fails every write with a chosen kind, so the
+    /// `Unsupported` carve-out can be exercised on any platform rather than
+    /// only on the one that produces it naturally.
+    struct FailingSink(io::ErrorKind);
+
+    impl io::Write for FailingSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The carve-out that keeps `tgt` starting on a terminal that cannot
+    /// bracket pastes, and the limit on it.
+    ///
+    /// This is the regression the Windows CI job caught: `run_tui` calls
+    /// `enable_modes_into` with `?`, and on a legacy Windows console
+    /// `EnableBracketedPaste` answers `Unsupported`, so before this the
+    /// client refused to start there. Losing paste bracketing is a degraded
+    /// terminal; refusing to run is a broken client.
+    ///
+    /// The second half matters as much: swallowing *every* error would hide
+    /// a genuinely broken terminal handle behind a silent success.
+    #[test]
+    fn setup_tolerates_an_unsupported_mode_but_not_a_broken_terminal() {
+        enable_modes_into(&mut FailingSink(io::ErrorKind::Unsupported), false)
+            .expect("a terminal without bracketed paste must still start");
+
+        let broken = enable_modes_into(&mut FailingSink(io::ErrorKind::BrokenPipe), false);
+        assert_eq!(
+            broken
+                .expect_err("a broken handle must not be swallowed")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    /// Byte-level assertions only hold where crossterm writes sequences.
+    ///
+    /// On Windows it may not: `queue` consults `is_ansi_code_supported`,
+    /// which asks the *process's* console rather than the writer it was
+    /// handed, so a test writing into a `Vec` still takes the console-API
+    /// branch when that console has no VT support (`command.rs:123-130`).
+    /// Nothing then reaches the buffer, and for `EnableBracketedPaste` the
+    /// call fails outright. The Windows half of this pair asserts the
+    /// property that actually matters there instead.
+    #[cfg(not(windows))]
     #[test]
     fn setup_always_turns_bracketed_paste_on() {
         // 2004 is the DEC private mode for bracketed paste; `h` enables it.
         const ENABLE_PASTE: &[u8] = b"\x1b[?2004h";
 
         let mut without_mouse = Vec::new();
-        enable_modes_into(&mut without_mouse, false).expect("writing to a Vec cannot fail");
+        enable_modes_into(&mut without_mouse, false).expect("the sequences are supported here");
         assert!(
             contains(&without_mouse, ENABLE_PASTE),
             "bracketed paste must be enabled even with mouse reporting off, or a \
@@ -576,7 +651,7 @@ mod tests {
         );
 
         let mut with_mouse = Vec::new();
-        enable_modes_into(&mut with_mouse, true).expect("writing to a Vec cannot fail");
+        enable_modes_into(&mut with_mouse, true).expect("the sequences are supported here");
         assert!(
             contains(&with_mouse, ENABLE_PASTE),
             "and with it on: {:?}",
@@ -589,6 +664,28 @@ mod tests {
         );
     }
 
+    /// The Windows half, and it is not a skip — it pins the thing that
+    /// broke.
+    ///
+    /// `EnableBracketedPaste::execute_winapi` returns
+    /// `ErrorKind::Unsupported` ("Bracketed paste not implemented in the
+    /// legacy Windows API"), and `run_tui` calls this with `?`. Propagating
+    /// it would make `tgt` refuse to start on a legacy Windows console for
+    /// the sake of a paste nicety. So the assertion here is that setup
+    /// *succeeds* whether or not the terminal can bracket pastes.
+    ///
+    /// It passes on a console that does support VT as well, where the
+    /// sequences are written normally — either way, no error.
+    #[cfg(windows)]
+    #[test]
+    fn setup_survives_a_terminal_that_cannot_bracket_pastes() {
+        let mut buf = Vec::new();
+        enable_modes_into(&mut buf, false)
+            .expect("an unsupported bracketed paste must not fail startup");
+        enable_modes_into(&mut buf, true).expect("nor with mouse reporting on");
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn the_teardown_always_turns_bracketed_paste_back_off() {
         // 2004 is the DEC private mode for bracketed paste; `l` disables it.
@@ -625,6 +722,20 @@ mod tests {
         );
     }
 
+    /// The teardown's Windows counterpart. `DisableBracketedPaste`'s
+    /// `execute_winapi` returns `Ok(())` rather than `Unsupported`, so this
+    /// is the weaker claim that it stays infallible — `restore_terminal`
+    /// swallows errors anyway, but a teardown that started failing would be
+    /// worth knowing about.
+    #[cfg(windows)]
+    #[test]
+    fn the_teardown_never_fails_on_windows() {
+        let mut buf = Vec::new();
+        restore_modes_into(&mut buf, false).expect("teardown must not fail");
+        restore_modes_into(&mut buf, true).expect("nor with mouse capture released");
+    }
+
+    #[cfg(not(windows))]
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
             .windows(needle.len())
