@@ -63,16 +63,17 @@ use std::collections::VecDeque;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use tgt_core::app::AppState;
 use tgt_core::model::ids::MessageId;
-use tgt_core::model::message::MessageView;
+use tgt_core::model::message::{MessageView, ReactionView, SendState};
 use tgt_core::state::conversation::{ConversationState, Scroll};
+use unicode_width::UnicodeWidthStr;
 
 use crate::render::cache::{LayoutCache, LayoutKey};
-use crate::render::message_layout::{groups_with, layout_message};
+use crate::render::message_layout::{LayoutOptions, groups_with, layout_message_opts};
 use crate::theme::Theme;
 
 /// Renders the open chat's message window into `area`, border included (the
@@ -222,6 +223,19 @@ fn build_window(
             msg_lines.truncate(keep);
         }
 
+        // Reactions and receipts are appended here, per frame, after the
+        // cache lookup — never folded into the cached lines themselves.
+        // Both can change (a reaction toggled, `last_read_outbox` advancing)
+        // without `message_id` or `width` changing, which are the only
+        // things that invalidate a `LayoutKey` entry; caching them would
+        // leave stale reaction counts and checkmarks on screen. See the
+        // module docs' "Grouped-cache resolution" for the same reasoning
+        // applied to grouping.
+        append_reactions(&mut msg_lines, msg, width, theme);
+        if msg.is_outgoing {
+            append_receipt(&mut msg_lines, msg, convo.last_read_outbox, width, theme);
+        }
+
         let mut block: Vec<WindowRow> = Vec::with_capacity(msg_lines.len() + 1);
         if idx > 0 && !grouped {
             block.push(WindowRow {
@@ -322,7 +336,17 @@ fn rendered_lines(
         theme_generation,
         spoilers_revealed,
     };
-    let full = cache.get_or_insert_with(key, || layout_message(msg, width, theme));
+    let full = cache.get_or_insert_with(key, || {
+        layout_message_opts(
+            msg,
+            width,
+            theme,
+            LayoutOptions {
+                grouped: false,
+                spoilers_revealed,
+            },
+        )
+    });
     if grouped {
         slice_grouped(full)
     } else {
@@ -338,6 +362,109 @@ fn slice_grouped(full: &[Line<'static>]) -> Vec<Line<'static>> {
         Vec::new()
     } else {
         full[1..].to_vec()
+    }
+}
+
+/// Pushes a `👍 3  ❤ 1`-style row onto `lines` when `msg` carries reactions;
+/// a no-op otherwise, so a message without reactions costs nothing (same
+/// discipline as an absent caption in `message_layout`). A reaction the
+/// viewer chose (`chosen_by_me`) is bolded in the accent color; the rest are
+/// muted. The row aligns with the message's side: right for own messages
+/// (flush with the pane's right edge, like the rail), left with a two-column
+/// indent for incoming ones (matching the rail-plus-space inset the cached
+/// body lines carry).
+fn append_reactions(lines: &mut Vec<Line<'static>>, msg: &MessageView, width: u16, theme: &Theme) {
+    if msg.reactions.is_empty() {
+        return;
+    }
+    let content = reaction_spans(&msg.reactions, theme);
+    let content_width = Line::from(content.clone()).width() as u16;
+
+    let mut spans = Vec::with_capacity(content.len() + 1);
+    if msg.is_outgoing {
+        let pad = width.saturating_sub(content_width);
+        spans.push(Span::raw(" ".repeat(pad as usize)));
+        spans.extend(content);
+    } else {
+        spans.push(Span::raw("  "));
+        spans.extend(content);
+    }
+    lines.push(Line::from(spans));
+}
+
+fn reaction_spans(reactions: &[ReactionView], theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(reactions.len() * 2);
+    for (i, reaction) in reactions.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if reaction.chosen_by_me {
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.text_muted)
+        };
+        spans.push(Span::styled(
+            format!("{} {}", reaction.emoji, reaction.count),
+            style,
+        ));
+    }
+    spans
+}
+
+/// Pushes this own message's read-receipt marker: `⋯` while sending, `✗` on
+/// failure (danger), else `✓`/`✓✓` from `last_read_outbox` (spec: "Sent" vs
+/// "read"). Only called for `msg.is_outgoing` messages — incoming messages
+/// have no receipt of our own to show.
+///
+/// Tries to tack the marker onto the trailing blank space of `lines`' last
+/// row first (own message rows are usually padded flush to `width` already,
+/// so this rarely fires — see the module docs on cache/uncached rows); when
+/// there is no room it gets a row of its own, right-aligned the same way.
+fn append_receipt(
+    lines: &mut Vec<Line<'static>>,
+    msg: &MessageView,
+    last_read_outbox: MessageId,
+    width: u16,
+    theme: &Theme,
+) {
+    let (marker, style) = receipt_marker(msg, last_read_outbox, theme);
+    let marker_cols = marker.width() as u16;
+
+    let fits_on_last_row = lines
+        .last()
+        .map(|last| last.width() as u16 + 1 + marker_cols <= width)
+        .unwrap_or(false);
+
+    if fits_on_last_row {
+        let last = lines.last_mut().expect("checked above");
+        let used = last.width() as u16;
+        let pad = width.saturating_sub(used + marker_cols);
+        last.spans.push(Span::raw(" ".repeat(pad as usize)));
+        last.spans.push(Span::styled(marker, style));
+    } else {
+        let pad = width.saturating_sub(marker_cols);
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(pad as usize)),
+            Span::styled(marker, style),
+        ]));
+    }
+}
+
+fn receipt_marker(
+    msg: &MessageView,
+    last_read_outbox: MessageId,
+    theme: &Theme,
+) -> (&'static str, Style) {
+    match &msg.send_state {
+        SendState::Sending => ("⋯", Style::new().fg(theme.text_muted)),
+        SendState::Failed(_) => ("✗", Style::new().fg(theme.danger)),
+        SendState::Sent => {
+            if msg.id <= last_read_outbox {
+                ("✓✓", Style::new().fg(theme.text_muted))
+            } else {
+                ("✓", Style::new().fg(theme.text_muted))
+            }
+        }
     }
 }
 
@@ -366,7 +493,9 @@ mod tests {
     use tgt_core::model::entity::FormattedText;
     use tgt_core::model::ids::{ChatId, FileId, MessageId, UserId};
     use tgt_core::model::key::KeyBindings;
-    use tgt_core::model::message::{MessageCaps, MessageContent, ReplyPreview, SendState, Sender};
+    use tgt_core::model::message::{
+        MessageCaps, MessageContent, ReactionView, ReplyPreview, SendState, Sender,
+    };
     use tgt_core::model::time::Millis;
     use tgt_core::state::auth::{AuthField, AuthState, InputField};
     use tgt_core::state::chat_list::ChatListState;
@@ -750,6 +879,122 @@ mod tests {
             },
         );
         assert_eq!(resolve_anchor(&convo), (0, 0));
+    }
+
+    // --- reactions and receipts (T35) --------------------------------
+
+    /// Spec: a reaction the viewer picked renders differently from one they
+    /// didn't. This checks the actual `Style`s, not just the text, so a
+    /// regression that drops the highlight but keeps the right characters on
+    /// screen still fails.
+    #[test]
+    fn own_reaction_is_bold_accent_others_are_muted() {
+        let mut msg = text_msg(1, Sender::User(UserId(1)), "Alice", false, 0, "nice", None);
+        msg.reactions = vec![
+            ReactionView {
+                emoji: "👍".to_string(),
+                count: 3,
+                chosen_by_me: true,
+            },
+            ReactionView {
+                emoji: "❤".to_string(),
+                count: 1,
+                chosen_by_me: false,
+            },
+        ];
+        let convo = conversation(vec![msg], Scroll::Bottom);
+        let mut cache = LayoutCache::new();
+
+        let rows = build_window(&convo, 0, 40, 10, &theme(), &mut cache);
+        let reaction_row = rows
+            .iter()
+            .find(|r| r.line.spans.iter().any(|s| s.content.contains('👍')))
+            .expect("reaction row missing");
+
+        let mine = reaction_row
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains('👍'))
+            .unwrap();
+        assert_eq!(mine.content.as_ref(), "👍 3");
+        assert_eq!(mine.style.fg, Some(theme().accent));
+        assert!(mine.style.add_modifier.contains(Modifier::BOLD));
+
+        let others = reaction_row
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains('❤'))
+            .unwrap();
+        assert_eq!(others.content.as_ref(), "❤ 1");
+        assert_eq!(others.style.fg, Some(theme().text_muted));
+        assert!(!others.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Two own messages straddling `last_read_outbox`: the older one was
+    /// read (`✓✓`), the newer one has only been sent so far (`✓`).
+    #[test]
+    fn sent_vs_read_checkmarks_straddle_last_read_outbox() {
+        let me = Sender::User(UserId(3));
+        let older = text_msg(1, me, "You", true, 0, "on it", None);
+        let newer = text_msg(2, me, "You", true, 60, "done", None);
+        let mut convo = conversation(vec![older, newer], Scroll::Bottom);
+        convo.last_read_outbox = MessageId(1);
+        let mut cache = LayoutCache::new();
+
+        let rows = build_window(&convo, 0, 40, 10, &theme(), &mut cache);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        let read_row = texts
+            .iter()
+            .find(|t| t.trim_end().ends_with("✓✓"))
+            .expect("read message must show ✓✓");
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t != read_row && t.trim_end().ends_with("✓✓")),
+            "only the read message should show ✓✓: {texts:#?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.trim_end().ends_with('✓') && !t.trim_end().ends_with("✓✓")),
+            "the unread-by-peer message must show a single ✓: {texts:#?}"
+        );
+    }
+
+    /// Full-frame snapshot: an incoming message with a mixed own/other
+    /// reaction row, and two own messages straddling `last_read_outbox` so
+    /// both checkmark states show up in the same frame.
+    #[test]
+    fn reactions_and_receipts_120x30() {
+        let alice = Sender::User(UserId(1));
+        let me = Sender::User(UserId(3));
+        let mut liked = text_msg(1, alice, "Alice", false, 0, "final answer", None);
+        liked.reactions = vec![
+            ReactionView {
+                emoji: "👍".to_string(),
+                count: 3,
+                chosen_by_me: true,
+            },
+            ReactionView {
+                emoji: "❤".to_string(),
+                count: 1,
+                chosen_by_me: false,
+            },
+        ];
+        let read = text_msg(2, me, "You", true, 60, "on it", None);
+        let unread = text_msg(3, me, "You", true, 120, "done", None);
+
+        let mut convo = conversation(vec![liked, read, unread], Scroll::Bottom);
+        convo.last_read_outbox = MessageId(2);
+        let state = fixture_state(Some(convo));
+
+        insta::assert_snapshot!(render_to_string(120, 30, &state));
     }
 
     // --- visible_range ------------------------------------------------
