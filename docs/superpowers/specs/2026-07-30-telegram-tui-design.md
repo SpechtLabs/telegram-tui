@@ -397,17 +397,34 @@ No credentials are compiled into the binary.
 
 ### 9.2 Login paths
 
-Both are offered on one screen; the user picks.
+The screen defaults to QR. Arriving at it fires `requestQrCodeAuthentication`
+immediately, with no upfront "phone or QR?" choice, and shows a loading
+placeholder until TDLib returns the link. Once
+`authorizationStateWaitOtherDeviceConfirmation { link }` arrives, it renders as
+a QR code drawn with Unicode half-blocks using the `qrcode` crate, sized to fit
+the viewport, and falls back to the raw link if the terminal is too small. The
+QR refreshes in place whenever TDLib issues a new link.
 
-- **Phone** → `setAuthenticationPhoneNumber` → code entry
-  (`authorizationStateWaitCode`, showing the delivery method TDLib reports) →
-  optional `authorizationStateWaitPassword` for 2FA, with the password hint
-  displayed.
-- **QR** → `requestQrCodeAuthentication` →
-  `authorizationStateWaitOtherDeviceConfirmation { link }` → render the link as a
-  QR code using the `qrcode` crate drawn with Unicode half-blocks, sized to fit
-  the viewport. Falls back to displaying the raw link if the terminal is too
-  small. The QR refreshes when TDLib issues a new link.
+Underneath the QR, or its placeholder, sits "Sign in with phone number
+instead," reachable with Up/Down and confirmed with Enter, which reveals the
+phone number field. That reveal is a local UI change, not a request. What
+happens when the user then types a number and presses Enter depends on how far
+TDLib's own authorization state has moved:
+
+- If the QR link hasn't come back yet, Enter calls `setAuthenticationPhoneNumber`
+  directly — the same call this screen made before it defaulted to QR — and
+  proceeds to code entry (`authorizationStateWaitCode`, showing the delivery
+  method TDLib reports) and, for accounts with 2FA, `authorizationStateWaitPassword`
+  with the password hint displayed.
+- If the link has already arrived, TDLib's `AuthManager` refuses that call
+  outright: `setAuthenticationPhoneNumber` isn't legal once
+  `WaitOtherDeviceConfirmation` has been entered. The client calls `logOut`
+  instead, which tears down the pending QR session, and the app recreates the
+  TDLib client to reach a clean `authorizationStateWaitPhoneNumber`. The typed
+  number stays in the field through that round trip rather than being
+  cleared, so the user presses Enter once more to actually send it — nothing
+  resubmits on its own, because a background state change is never what
+  should trigger network I/O.
 
 Error states (`PHONE_NUMBER_INVALID`, `PHONE_CODE_INVALID`, `FLOOD_WAIT_n`) are
 surfaced inline on the relevant field, with flood-wait rendered as a live

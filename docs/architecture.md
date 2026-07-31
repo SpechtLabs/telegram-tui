@@ -811,8 +811,19 @@ use crate::model::time::Millis;
 use crate::td::error::TdError;
 use crate::td::update::AuthPhase;
 
+/// The auth screen defaults to QR: arriving at `WaitPhoneNumber` fires
+/// `RequestQrCodeAuthentication` immediately, guarded by `method.is_none()`
+/// so it can't refire on TDLib's repeat `updateAuthorizationState`s (T77).
+/// `PhoneSelected` is the arrow-highlighted-but-unconfirmed "sign in with
+/// phone number instead" affordance shown under the QR; `Phone` is that
+/// same escape hatch confirmed with Enter. Submitting from `Phone` while
+/// TDLib is already past `WaitPhoneNumber` cannot call
+/// `SetAuthenticationPhoneNumber` — TDLib's `AuthManager` rejects it once
+/// `WaitOtherDeviceConfirmation` has been entered — so it calls `LogOut`
+/// instead and relies on a TDLib client restart, not yet built in
+/// `tgt-app`, to get back to a fresh `WaitPhoneNumber` (§9.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoginMethod { Phone, Qr }
+pub enum LoginMethod { Qr, PhoneSelected, Phone }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputField {
