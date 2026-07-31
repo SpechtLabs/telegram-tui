@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::model::hit::{ClickButton, HitTarget, ScrollArea};
 use crate::model::ids::{ChatId, FileId, MessageId};
 use crate::model::key::Key;
 use crate::model::message::{FileSnapshot, MessageCaps, MessageView};
@@ -15,6 +16,19 @@ pub enum Action {
     Key(Key),
     /// Bracketed paste (terminals paste dropped files as plain text paths).
     Paste(String),
+    /// A mouse button went down over a hit-tested target (architecture
+    /// §7.5). Coordinates are already resolved by `tgt-ui`'s `HitMap`;
+    /// `update()` never sees a `Rect` or a cell position.
+    Click {
+        target: HitTarget,
+        button: ClickButton,
+    },
+    /// A mouse wheel step over a hit-tested scrollable area (architecture
+    /// §7.5). `up: true` is away from the user (scroll up).
+    Scroll {
+        area: ScrollArea,
+        up: bool,
+    },
     Resize {
         width: u16,
         height: u16,

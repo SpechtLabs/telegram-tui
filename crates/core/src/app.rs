@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use crate::action::{Action, TdResult};
 use crate::effect::{Effect, TelemetryMode};
-use crate::model::ids::ChatId;
+use crate::model::hit::{ClickButton, HitTarget, ScrollArea};
+use crate::model::ids::{ChatId, MessageId};
 use crate::model::key::{Key, KeyBindings};
 use crate::model::message::{MessageContent, MessageView, SendState};
 use crate::model::time::Millis;
@@ -13,7 +14,7 @@ use crate::state::auth::{self, AuthField, AuthState, InputField, LoginMethod};
 use crate::state::chat_list::{self, ChatListState, ChatLoadPhase};
 use crate::state::composer::{self, ComposerState};
 use crate::state::consent::{self, ConsentChoice, ConsentState};
-use crate::state::conversation::{self, ConversationState};
+use crate::state::conversation::{self, ConversationState, Scroll};
 use crate::state::focus::{Focus, FocusStack};
 use crate::state::media::{self, MediaState};
 use crate::state::modal::{self, ModalState};
@@ -211,6 +212,8 @@ impl App {
                 self.dirty = true;
                 Vec::new()
             }
+            Action::Click { target, button } => self.dispatch_click(target, button),
+            Action::Scroll { area, up } => self.dispatch_scroll(area, up),
             Action::Td(update) => self.route_td(&update),
             Action::TdResult(TdResult::AuthRequestDone { outcome }) => {
                 // Always render-worthy: at minimum the in-flight spinner
@@ -755,6 +758,196 @@ impl App {
             }
             _ => self.state.modal_ui = None,
         }
+    }
+
+    /// Mouse routing (architecture §7.5). Hit-testing already happened at
+    /// the `tgt-ui` boundary — `Action::Click`/`Action::Scroll` name a
+    /// semantic target, never a coordinate — so this is pure `update()`
+    /// dispatch like every other action, just keyed off a target instead of
+    /// a key.
+    ///
+    /// Overlays are keyboard-only for now (spec delegates the mouse story to
+    /// this task alone): a modal, the palette or help swallow every click
+    /// and every scroll exactly as they swallow every key, and nothing off
+    /// `Screen::Main` accepts either.
+    fn mouse_blocked(&self) -> bool {
+        self.state.screen != Screen::Main
+            || matches!(
+                self.state.focus.current(),
+                Focus::Modal(_) | Focus::Palette | Focus::Help
+            )
+    }
+
+    fn dispatch_click(&mut self, target: HitTarget, button: ClickButton) -> Vec<Effect> {
+        if self.mouse_blocked() {
+            return Vec::new();
+        }
+        match (target, button) {
+            (HitTarget::ChatRow(chat_id), ClickButton::Left) => self.click_chat_row(chat_id),
+            (HitTarget::ArchiveRow, ClickButton::Left) => {
+                chat_list::toggle_archive(&mut self.state);
+                self.dirty = true;
+                Vec::new()
+            }
+            (HitTarget::FolderTab(list), ClickButton::Left) => {
+                self.state.chat_list.active_list = list;
+                // Mirrors `chat_list::reset_selection_to_first_visible`
+                // (private to that module): selection resets to the new
+                // list's first visible row rather than carrying over a
+                // selection that belongs to the list just left.
+                self.state.chat_list.selected = chat_list::visible_rows(&self.state.chat_list)
+                    .first()
+                    .copied();
+                self.dirty = true;
+                Vec::new()
+            }
+            (HitTarget::Composer, ClickButton::Left) => {
+                if self.state.open_chat.is_some() {
+                    self.state.focus.replace_base(Focus::Composer);
+                    self.dirty = true;
+                }
+                Vec::new()
+            }
+            (HitTarget::Message(message_id), ClickButton::Right) => {
+                self.click_message_right(message_id)
+            }
+            // Left-click on a message, and right-click on anything else,
+            // are no-ops in v1 (architecture §7.5): claimed (nothing falls
+            // through to a pane below, there is none left to fall to), but
+            // nothing changes.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Left-click on a sidebar row: the same open path `⏎` takes. Driven
+    /// through `chat_list::handle_key`'s real `Enter` arm rather than
+    /// re-implemented here — a `Focus::ChatList` level is pushed just for
+    /// the call (that handler only *reads* the focus to decide it applies;
+    /// it never touches the stack itself) and popped straight back off, so
+    /// the bracket leaves the stack exactly as it found it. The focus
+    /// transition afterward is the one `route_chat_list_key` runs for `⏎`.
+    fn click_chat_row(&mut self, chat_id: ChatId) -> Vec<Effect> {
+        self.state.chat_list.selected = Some(chat_id);
+        self.state.focus.push(Focus::ChatList);
+        let effects = chat_list::handle_key(&mut self.state, Key::Enter).unwrap_or_default();
+        self.state.focus.pop();
+        if self.state.open_chat.is_some() {
+            self.state.focus.replace_base(Focus::Composer);
+        }
+        self.dirty = true;
+        effects
+    }
+
+    /// Right-click on a message: enters selection mode on exactly that
+    /// message, or — already in selection mode — just moves the cursor
+    /// there. Mirrors `route_composer_key`'s `↑`-on-empty wiring: the focus
+    /// push this function makes speculatively is undone if
+    /// `selection::enter_at` came back with nothing selected (message not
+    /// loaded, or no chat open at all), and a push is skipped entirely when
+    /// selection mode is already up so a stray click can't stack levels.
+    fn click_message_right(&mut self, message_id: MessageId) -> Vec<Effect> {
+        let already_selecting = matches!(self.state.focus.current(), Focus::Selection);
+        if !already_selecting {
+            self.state.focus.push(Focus::Selection);
+        }
+        let effects = selection::enter_at(&mut self.state, message_id);
+        if !already_selecting && !self.selection_is_active() {
+            self.state.focus.pop();
+        }
+        self.dirty = true;
+        effects
+    }
+
+    fn dispatch_scroll(&mut self, area: ScrollArea, up: bool) -> Vec<Effect> {
+        if self.mouse_blocked() {
+            return Vec::new();
+        }
+        let effects = match area {
+            ScrollArea::ChatList => self.scroll_chat_list(up),
+            ScrollArea::Conversation => self.scroll_conversation(up),
+        };
+        self.dirty = true;
+        effects
+    }
+
+    /// Wheel over the sidebar: moves `chat_list.selected` like `↑`/`↓` do,
+    /// without touching the focus stack — a chat-list scroll is claimed by
+    /// the pane regardless of what holds the keyboard (architecture §7.5),
+    /// which is exactly what the `Focus::ChatList` push/pop bracket in
+    /// [`Self::click_chat_row`] buys here too: `chat_list::handle_key`'s
+    /// real `Up`/`Down` arms run, and the stack is back to whatever it was
+    /// before this call returns.
+    fn scroll_chat_list(&mut self, up: bool) -> Vec<Effect> {
+        self.state.focus.push(Focus::ChatList);
+        let key = if up { Key::Up } else { Key::Down };
+        let effects = chat_list::handle_key(&mut self.state, key).unwrap_or_default();
+        self.state.focus.pop();
+        effects
+    }
+
+    /// Wheel over the conversation viewport: the same anchor step and
+    /// near-top paging trigger as `Up`/`Down` in `conversation::handle_key`,
+    /// claimed independently of focus for the same reason
+    /// [`Self::scroll_chat_list`] is. `conversation::move_anchor` itself is
+    /// private to that module, so this mirrors its stepping logic using the
+    /// `pub(crate)` primitives (`index_of`, `trigger_paging_if_near_top`)
+    /// already exposed there for exactly this kind of reuse, plus the
+    /// `ConversationState` fields it operates on (all `pub`), rather than
+    /// widening `conversation.rs`'s public surface for one more entry point
+    /// that says the same thing `handle_key`'s claim rule already does.
+    fn scroll_conversation(&mut self, up: bool) -> Vec<Effect> {
+        let Some(chat_id) = self.state.open_chat else {
+            return Vec::new();
+        };
+        let now = self.state.now;
+        let delta: isize = if up { -1 } else { 1 };
+        let Some(convo) = self.state.conversations.get_mut(&chat_id) else {
+            return Vec::new();
+        };
+        if convo.messages.is_empty() {
+            return Vec::new();
+        }
+        let last_idx = (convo.messages.len() - 1) as isize;
+        let current_idx = match convo.scroll {
+            Scroll::Bottom => {
+                if delta >= 0 {
+                    return Vec::new();
+                }
+                last_idx + 1
+            }
+            Scroll::At { message_id, .. } => {
+                match conversation::index_of(&convo.messages, message_id) {
+                    Some(idx) => idx as isize,
+                    // Anchor older than everything loaded: waiting on the page
+                    // that contains it, same as `move_anchor`'s own arm for this
+                    // case. Stepping it by `delta` is meaningless with nothing
+                    // loaded around it to step through.
+                    None if convo
+                        .messages
+                        .front()
+                        .is_some_and(|oldest| message_id < oldest.id) =>
+                    {
+                        return conversation::trigger_paging_if_near_top(convo, chat_id, now);
+                    }
+                    None => {
+                        convo.scroll = Scroll::Bottom;
+                        return Vec::new();
+                    }
+                }
+            }
+        };
+        let target_idx = current_idx + delta;
+        if target_idx > last_idx {
+            convo.scroll = Scroll::Bottom;
+            return Vec::new();
+        }
+        let clamped_idx = target_idx.clamp(0, last_idx) as usize;
+        let new_id = convo.messages[clamped_idx].id;
+        convo.scroll = Scroll::At {
+            message_id: new_id,
+            line_offset: 0,
+        };
+        conversation::trigger_paging_if_near_top(convo, chat_id, now)
     }
 
     fn selection_is_active(&self) -> bool {
@@ -2286,5 +2479,271 @@ mod routing {
                 "Telemetry(message.send)"
             ]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Mouse routing (architecture §7.5)
+    // -----------------------------------------------------------------
+
+    /// Left-click on a sidebar row produces the exact same effect sequence
+    /// `⏎` does, and lands focus on the composer the same way.
+    #[test]
+    fn click_chat_row_selects_and_opens() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        assert_eq!(app.state().chat_list.selected, None);
+        app.take_dirty();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::ChatRow(ChatId(1)),
+            button: ClickButton::Left,
+        });
+        assert_eq!(
+            describe(&effects),
+            ["Td(OpenChat)", "Td(GetChatHistory)", "Telemetry(chat.open)"]
+        );
+        assert_eq!(app.state().chat_list.selected, Some(ChatId(1)));
+        assert_eq!(app.state().open_chat, Some(ChatId(1)));
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert_eq!(app.state().focus.depth(), 1);
+        assert!(app.take_dirty());
+    }
+
+    /// Right-click on a message names the message under the cursor exactly
+    /// (not "the newest loaded" the way `↑`-on-empty does), and a second
+    /// right-click while already in selection mode moves the cursor there
+    /// instead of stacking a second `Focus::Selection` level.
+    #[test]
+    fn right_click_message_enters_selection_with_chips() {
+        let mut app = chat_open();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::Message(MessageId(10)),
+            button: ClickButton::Right,
+        });
+        // The older of the two loaded messages sits at index 0 of a
+        // two-message window — within `PAGE_TRIGGER_MESSAGES` of the oldest
+        // loaded message — so anchoring there also fires the same paging
+        // request `Up` would (unlike selecting the newest message below,
+        // which re-pins to `Scroll::Bottom` and skips the check entirely).
+        assert_eq!(
+            describe(&effects),
+            ["Td(GetMessageProperties)", "Td(GetChatHistory)"]
+        );
+        assert_eq!(selected_message(&app), Some(MessageId(10)));
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+        assert_eq!(app.state().focus.depth(), 2);
+        assert!(app.take_dirty());
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::Message(NEWEST),
+            button: ClickButton::Right,
+        });
+        assert_eq!(describe(&effects), ["Td(GetMessageProperties)"]);
+        assert_eq!(selected_message(&app), Some(NEWEST));
+        assert_eq!(app.state().focus.depth(), 2, "no second level stacked");
+    }
+
+    #[test]
+    fn folder_tab_click_switches_list() {
+        use crate::model::chat::{ChatKind, ChatListId, ChatPositionEntry, ChatView};
+
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Main Chat", 10)));
+        app.update(Action::Td(TdUpdate::NewChat(ChatView {
+            id: ChatId(2),
+            kind: ChatKind::Private,
+            title: "Work Chat".to_string(),
+            positions: vec![ChatPositionEntry {
+                list: ChatListId::Folder(1),
+                order: 20,
+                is_pinned: false,
+            }],
+            unread_count: 0,
+            unread_mention_count: 0,
+            last_message: None,
+            is_muted: false,
+        })));
+        app.take_dirty();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::FolderTab(ChatListId::Folder(1)),
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.state().chat_list.active_list, ChatListId::Folder(1));
+        // Selection resets to the new list's first visible row, the same
+        // rule `cycle_folder` follows for the `[`/`]` keys.
+        assert_eq!(app.state().chat_list.selected, Some(ChatId(2)));
+        assert!(app.take_dirty());
+    }
+
+    #[test]
+    fn archive_row_click_toggles() {
+        use crate::model::chat::{ChatListId, ChatPositionEntry};
+
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Td(chat(2, "Old thread", 20)));
+        for position in [
+            ChatPositionEntry {
+                list: ChatListId::Main,
+                order: 0,
+                is_pinned: false,
+            },
+            ChatPositionEntry {
+                list: ChatListId::Archive,
+                order: 7,
+                is_pinned: false,
+            },
+        ] {
+            app.update(Action::Td(TdUpdate::ChatPosition {
+                chat_id: ChatId(2),
+                position,
+            }));
+        }
+        app.take_dirty();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::ArchiveRow,
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.state().chat_list.active_list, ChatListId::Archive);
+        assert_eq!(visible_rows(&app.state().chat_list), vec![ChatId(2)]);
+        assert!(app.take_dirty());
+
+        // Clicking it again toggles back to Main, same as the `a` key.
+        app.update(Action::Click {
+            target: HitTarget::ArchiveRow,
+            button: ClickButton::Left,
+        });
+        assert_eq!(app.state().chat_list.active_list, ChatListId::Main);
+    }
+
+    /// Overlays are keyboard-only for now: a modal claims every click and
+    /// every scroll exactly as it claims every key.
+    #[test]
+    fn clicks_ignored_under_modal() {
+        let mut app = selection_with_delete_chip();
+        app.update(Action::Key(Key::Char('x')));
+        assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
+        app.take_dirty();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::ChatRow(CHAT),
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert!(!app.take_dirty());
+        assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
+
+        let effects = app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: true,
+        });
+        assert!(effects.is_empty());
+        assert!(!app.take_dirty());
+        assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
+    }
+
+    #[test]
+    fn scroll_conversation_moves_anchor_and_can_trigger_paging() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        let msgs: Vec<_> = (1..=21).map(|id| message(1, id)).collect();
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok(msgs),
+        }));
+        app.take_dirty();
+
+        // From `Bottom`, the first wheel-up step anchors on the newest
+        // loaded message — same as `Up` from an empty composer's viewport.
+        let effects = app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: true,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(21),
+                line_offset: 0,
+            }
+        );
+        assert!(app.take_dirty());
+
+        // The second step lands within `PAGE_TRIGGER_MESSAGES` (20) of the
+        // oldest loaded message, which asks for the page before it — the
+        // wheel keeps the exact paging trigger `Up` has.
+        let effects = app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: true,
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Td(TdRequest::GetChatHistory {
+                    chat_id: CHAT,
+                    from_message_id: MessageId(1),
+                    only_local: false,
+                    ..
+                })]
+            ),
+            "expected a page request from the oldest loaded message, got {effects:?}"
+        );
+    }
+
+    /// The chat-list wheel claims the pane on its own — moving `selected`
+    /// even while the keyboard focus is elsewhere — and gives the focus
+    /// stack back exactly as found.
+    #[test]
+    fn scroll_chat_list_moves_selection_without_focus_change() {
+        let mut app = chat_open();
+        app.update(Action::Td(chat(2, "Bob", 20)));
+        assert_eq!(app.state().chat_list.selected, Some(ChatId(1)));
+        app.take_dirty();
+
+        let focus_before = app.state().focus.current().clone();
+        let effects = app.update(Action::Scroll {
+            area: ScrollArea::ChatList,
+            up: true,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.state().chat_list.selected, Some(ChatId(2)));
+        assert_eq!(*app.state().focus.current(), focus_before);
+        assert_eq!(app.state().focus.depth(), 1);
+        assert!(app.take_dirty());
+    }
+
+    #[test]
+    fn composer_click_focuses_composer() {
+        let mut app = chat_open();
+        app.update(Action::Key(Key::Tab));
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        app.take_dirty();
+
+        let effects = app.update(Action::Click {
+            target: HitTarget::Composer,
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert!(app.take_dirty());
+
+        // With no chat open there is nowhere for the cursor to land: a
+        // click on the (empty) composer pane is a no-op.
+        let mut app = logged_in();
+        let effects = app.update(Action::Click {
+            target: HitTarget::Composer,
+            button: ClickButton::Left,
+        });
+        assert!(effects.is_empty());
+        assert!(!app.take_dirty());
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
     }
 }

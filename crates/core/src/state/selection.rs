@@ -105,7 +105,30 @@ pub fn enter(app: &mut AppState) -> Vec<Effect> {
     else {
         return Vec::new();
     };
-    select(app, chat_id, newest)
+    enter_at(app, newest)
+}
+
+/// Enters selection mode on `message_id` specifically, or moves an
+/// already-active selection there. The mouse counterpart of [`enter`]
+/// (architecture §7.5, right-click on a message): a click names the exact
+/// message under the cursor rather than always starting at the newest one.
+///
+/// Same "nothing to select" contract as `enter`: no open chat, or
+/// `message_id` not currently loaded in its window, returns nothing and
+/// leaves the selection (if any) untouched — the router undoes a focus push
+/// it made speculatively when this comes back empty, exactly as it does for
+/// `enter`.
+pub fn enter_at(app: &mut AppState, message_id: MessageId) -> Vec<Effect> {
+    let Some(chat_id) = app.open_chat else {
+        return Vec::new();
+    };
+    let Some(convo) = app.conversations.get(&chat_id) else {
+        return Vec::new();
+    };
+    if conversation::index_of(&convo.messages, message_id).is_none() {
+        return Vec::new();
+    }
+    select(app, chat_id, message_id)
 }
 
 /// Leaves selection mode: drops the selection of the open chat. Called by the

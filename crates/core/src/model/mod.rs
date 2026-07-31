@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod chips;
 pub mod entity;
+pub mod hit;
 pub mod ids;
 pub mod key;
 pub mod message;
