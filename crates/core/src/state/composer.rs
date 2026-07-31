@@ -277,6 +277,7 @@ mod tests {
             conversations: HashMap::new(),
             open_chat: Some(CHAT),
             composer: ComposerState::default(),
+            modal_ui: None,
             palette: None,
             chat_search: None,
             toasts: ToastState::default(),

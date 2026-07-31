@@ -696,6 +696,7 @@ use crate::state::consent::ConsentState;
 use crate::state::conversation::ConversationState;
 use crate::state::focus::FocusStack;
 use crate::state::media::MediaState;
+use crate::state::modal::ModalState;
 use crate::state::palette::PaletteState;
 use crate::state::presence::PresenceState;
 use crate::state::search::ChatSearchState;
@@ -716,6 +717,11 @@ pub struct AppState {
     pub conversations: HashMap<ChatId, ConversationState>,
     pub open_chat: Option<ChatId>,
     pub composer: ComposerState,
+    /// Transient UI state (a cursor) of the modal named by `Focus::Modal(_)`;
+    /// the modal's identity and parameters stay on the focus stack (§4.5).
+    /// `Some` exactly while a modal is on top of the stack — the router
+    /// creates it on push and drops it on pop, so the two cannot disagree.
+    pub modal_ui: Option<ModalState>,
     pub palette: Option<PaletteState>,
     pub chat_search: Option<ChatSearchState>,
     pub toasts: ToastState,

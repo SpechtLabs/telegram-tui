@@ -5,17 +5,14 @@
 //!
 //! What this module owns is the modal's *transient UI state*: for
 //! `ConfirmDelete`, a cursor over its two options ("Delete for me" /
-//! "Delete for everyone", spec §6.3). `ModalState` is not a field on
-//! `AppState` yet — every other `state/*.rs` handler follows the canonical
+//! "Delete for everyone", spec §6.3). It lives in `AppState::modal_ui`
+//! (T28's placement decision), where the router creates it on push and drops
+//! it on pop, but `handle_key` below still takes it as an explicit second
+//! parameter rather than reaching through `app`: a `&mut` field of the same
+//! struct cannot be borrowed alongside `&mut AppState`. This is a
+//! deliberate, documented deviation from the canonical
 //! `fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>>`
-//! shape, but this modal needs somewhere to keep a cursor that survives
-//! across keystrokes while it is open, and `AppState` has no slot for it
-//! until T28 (key routing integration, sole owner of `app.rs`) decides
-//! where `Option<ModalState>` is stored and threads it through. Until then
-//! `handle_key` below takes it as an explicit second parameter; T28 is
-//! expected to reset it to `ModalState::default()` whenever `Focus::Modal(_)`
-//! is pushed and drop it on pop. This is a deliberate, documented deviation
-//! from the canonical two-argument handler shape, scoped to this file.
+//! shape, scoped to this file.
 //!
 //! See docs/architecture.md §4.5 (`ModalKind`), §4.4 (`Effect`), §4.7
 //! (`TdRequest::DeleteMessages`); spec §6.3 (destructive confirmation UX).
@@ -34,8 +31,7 @@ pub enum DeleteChoice {
 }
 
 /// Transient per-modal UI state that outlives a single keystroke but not the
-/// modal itself. See the module doc comment for where this is meant to live
-/// once T28 wires storage into `AppState`.
+/// modal itself; stored in `AppState::modal_ui`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ModalState {
     /// 0 = "Delete for me", 1 = "Delete for everyone". Meaningless for any
@@ -154,6 +150,7 @@ mod tests {
             conversations: HashMap::new(),
             open_chat: Some(CHAT),
             composer: ComposerState::default(),
+            modal_ui: None,
             palette: None,
             chat_search: None,
             toasts: ToastState::default(),

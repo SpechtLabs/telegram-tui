@@ -325,8 +325,11 @@ async fn empty_history_response_retries_then_succeeds() {
     .await;
 
     // Scroll off the bottom: the anchor lands inside the paging window and
-    // asks for the page before the oldest loaded message.
-    app.press(KeyCode::Up).await;
+    // asks for the page before the oldest loaded message. `PageUp` rather
+    // than `Up` since T28 wired the §6.2 routing table — with the composer
+    // focused, `Up` on an empty input enters selection mode, and the page
+    // keys are what reach the viewport from there.
+    app.press(KeyCode::PageUp).await;
 
     app.advance_until("the retried page to land", |core, _| {
         core.app()
