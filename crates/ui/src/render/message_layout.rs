@@ -108,12 +108,50 @@
 //! to `layout_message_opts` with the real `revealed_spoilers` bit in its own
 //! task; until then messages render with spoilers hidden regardless of
 //! `ConversationState`, matching today's (pre-T33) on-screen behavior.
+//!
+//! ## File cards: the static/dynamic split (T37)
+//!
+//! [`layout_message`]'s output is cached (`render::cache`) keyed on
+//! `(message_id, width, theme_generation, spoilers_revealed)`. Download and
+//! upload progress change none of those, so a card that baked "34%" into the
+//! cached lines would freeze at whatever percentage was on screen the first
+//! time that message got laid out — the exact same staleness hazard the
+//! module docs above already call out for reactions and read receipts (see
+//! `view::conversation::append_reactions`), solved the same way: split the
+//! content into a cacheable part and a per-frame part.
+//!
+//! - [`file_card`] (private, called from [`body`]) renders only what
+//!   `(message_id, width, theme_generation)` can never invalidate: the kind
+//!   icon, the file name, and the size. This is what ends up in the cached
+//!   lines. It carries no download affordance and no progress — as of T37 a
+//!   file message's cached row reads `📎 name · 2.4 MB`, not `📎 name · 2.4
+//!   MB · ⏎ download` (that line used to include the affordance; see the
+//!   T37 commit for the exact test/snapshot deltas this caused).
+//! - [`file_card_line`] and [`file_card_upload_line`] are pure functions of
+//!   `(content, live file/upload state, theme)` — no cache involved. They
+//!   render the *complete* card line (icon, name, size or progress bar, and
+//!   the `⏎ download` / `⏎ open` affordance) fresh from whatever
+//!   `MediaState` holds right now. They are not called from anywhere in this
+//!   module or from the cache-filling path; they exist for the view layer to
+//!   call once per frame, the same way `append_reactions` re-derives its row
+//!   every frame instead of trusting the cache.
+//!
+//! `// T40 wires view-side call`: nothing in this crate calls
+//! [`file_card_line`] / [`file_card_upload_line`] yet. Until the
+//! conversation view (owned elsewhere) is wired to call them per frame and
+//! splice the result in place of (or over) the cached static card row, the
+//! on-screen file card keeps showing the static icon/name/size line the
+//! cache has always produced — no worse than before T37, just not yet
+//! carrying a live affordance or progress bar. Baking either of those into
+//! the cache instead would be worse: a permanently stale progress bar. Wiring
+//! the view call is T40's job, not this file's.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use tgt_core::model::entity::{EntityKind, FormattedText, TextEntity};
-use tgt_core::model::message::{MessageContent, MessageView};
+use tgt_core::model::message::{FileSnapshot, MessageContent, MessageView};
+use tgt_core::state::media::UploadProgress;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -282,40 +320,19 @@ fn body(
 
     match &msg.content {
         MessageContent::Text(text) => text_lines(text, base, inner, theme, spoilers_revealed),
-        MessageContent::Photo {
-            width,
-            height,
-            caption,
-            ..
-        } => {
-            // A photo has no file name or size in the model; its dimensions
-            // are the useful identifier until T38 renders it inline.
-            let mut lines = file_card(&format!("photo {width}×{height}"), None, inner, theme);
+        MessageContent::Photo { caption, .. }
+        | MessageContent::Video { caption, .. }
+        | MessageContent::Document { caption, .. } => {
+            let (icon, name, size) =
+                file_card_identity(&msg.content).expect("Photo/Video/Document have a file card");
+            let mut lines = file_card(icon, &name, size, inner, theme);
             lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
             lines
         }
-        MessageContent::Video {
-            file_name,
-            size,
-            caption,
-            ..
-        } => {
-            let mut lines = file_card(file_name, Some(*size), inner, theme);
-            lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
-            lines
-        }
-        MessageContent::Audio {
-            file_name, size, ..
-        } => file_card(file_name, Some(*size), inner, theme),
-        MessageContent::Document {
-            file_name,
-            size,
-            caption,
-            ..
-        } => {
-            let mut lines = file_card(file_name, Some(*size), inner, theme);
-            lines.extend(text_lines(caption, base, inner, theme, spoilers_revealed));
-            lines
+        MessageContent::Audio { .. } => {
+            let (icon, name, size) =
+                file_card_identity(&msg.content).expect("Audio has a file card");
+            file_card(icon, &name, size, inner, theme)
         }
         MessageContent::Sticker { emoji } => {
             wrap_paragraphs(vec![Span::styled(emoji.clone(), base)], inner)
@@ -584,20 +601,30 @@ fn blockquote_lines(
     .collect()
 }
 
-/// The placeholder card of spec §7.1:
-/// `📎 architecture.pdf · 2.4 MB · ⏎ download`. One line at any sane width;
-/// T37 replaces it with download progress and real affordances.
-fn file_card(name: &str, size: Option<u64>, inner: u16, theme: &Theme) -> Vec<Line<'static>> {
-    let mut label = format!("📎 {name}");
+/// The **cacheable** half of a file card (see the module docs' "File cards:
+/// the static/dynamic split"): icon, name, and size, with no download
+/// affordance and no progress. `size` is `None` for content with no size in
+/// the model (`Photo`); everything else always has one. One line at any sane
+/// width. Wraps to `inner` like any other body content, though a file name
+/// long enough to need it would be unusual.
+///
+/// This is deliberately *not* `📎 name · 2.4 MB · ⏎ download` any more — the
+/// affordance moved to [`file_card_line`], which a caller re-derives every
+/// frame instead of trusting the cache. See the module docs for why.
+fn file_card(
+    icon: &str,
+    name: &str,
+    size: Option<u64>,
+    inner: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut label = format!("{icon} {name}");
     if let Some(size) = size {
         label.push_str(" · ");
         label.push_str(&format_size(size));
     }
     wrap_paragraphs(
-        vec![
-            Span::styled(label, Style::new().fg(theme.text)),
-            Span::styled(" · ⏎ download", Style::new().fg(theme.text_muted)),
-        ],
+        vec![Span::styled(label, Style::new().fg(theme.text))],
         inner,
     )
 }
@@ -617,6 +644,164 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.1} GB", size / GB)
     }
+}
+
+/// The kind icon, display name, and size (`None` for content with no size in
+/// the model) for a file-bearing message — `None` for content with no file
+/// card at all (`Text`, `Sticker`, `Unsupported`). Shared by the cached
+/// static card ([`file_card`], via [`body`]) and the dynamic
+/// [`file_card_line`] / [`file_card_upload_line`] so the two renderings can
+/// never disagree on what a message's name or icon is.
+///
+/// Icons: 📎 document, 🖼 photo, 🎞 video, 🎵 audio (spec §7.1 uses 📎 for
+/// the one example it shows; the others are this task's addition).
+fn file_card_identity(content: &MessageContent) -> Option<(&'static str, String, Option<u64>)> {
+    match content {
+        MessageContent::Text(_)
+        | MessageContent::Sticker { .. }
+        | MessageContent::Unsupported { .. } => None,
+        // A photo has no file name or size in the model; its dimensions are
+        // the useful identifier until T38 renders it inline.
+        MessageContent::Photo { width, height, .. } => {
+            Some(("🖼", format!("photo {width}×{height}"), None))
+        }
+        MessageContent::Video {
+            file_name, size, ..
+        } => Some(("🎞", file_name.clone(), Some(*size))),
+        MessageContent::Audio {
+            file_name, size, ..
+        } => Some(("🎵", file_name.clone(), Some(*size))),
+        MessageContent::Document {
+            file_name, size, ..
+        } => Some(("📎", file_name.clone(), Some(*size))),
+    }
+}
+
+/// The number of filled cells (out of [`PROGRESS_BAR_CELLS`]) and a whole
+/// percentage for `done / total`, or `None` when `total == 0` (TDLib has not
+/// reported a size yet — the indeterminate case).
+fn progress_fraction(done: u64, total: u64) -> Option<(usize, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
+    let filled = (ratio * PROGRESS_BAR_CELLS as f64).floor() as usize;
+    let pct = (ratio * 100.0).round() as u64;
+    Some((filled.min(PROGRESS_BAR_CELLS), pct))
+}
+
+/// Cells in a progress bar: `▓▓▓░░░░░░░ 34%` at `PROGRESS_BAR_CELLS = 10`.
+/// Used for both download and upload bars, so the two always look alike.
+const PROGRESS_BAR_CELLS: usize = 10;
+
+/// `▓▓▓░░░░░░░ 34%`, or `…` when `total == 0` (indeterminate: TDLib has not
+/// reported a size yet).
+fn progress_bar_text(done: u64, total: u64) -> String {
+    match progress_fraction(done, total) {
+        None => "…".to_string(),
+        Some((filled, pct)) => format!(
+            "{}{} {pct}%",
+            "▓".repeat(filled),
+            "░".repeat(PROGRESS_BAR_CELLS - filled)
+        ),
+    }
+}
+
+/// The dim `· ⏎ download` affordance shared by the "no snapshot yet" and
+/// "snapshot exists but isn't downloading or complete" cases below.
+fn download_affordance_span(theme: &Theme) -> Span<'static> {
+    Span::styled("⏎ download", Style::new().fg(theme.text_muted))
+}
+
+/// Dynamic, per-frame companion to the cached [`file_card`] line — see the
+/// module docs' "File cards: the static/dynamic split". Not called from
+/// [`layout_message`] or the cache-filling path; a caller (the conversation
+/// view, T40) re-derives this every frame from live `MediaState`, the same
+/// way `view::conversation::append_reactions` re-derives its row instead of
+/// trusting the cache.
+///
+/// Returns `None` for message content with no file card (`Text`, `Sticker`,
+/// `Unsupported`) — nothing to render.
+///
+/// `file` reflects [`FileSnapshot`] lookup by the content's `file_id`,
+/// performed by the caller (this function has no access to `MediaState`):
+///
+/// - `None` (no download ever started): `📎 name · 2.4 MB · ⏎ download`.
+/// - `Some(f)` with `f.is_downloading`: `📎 name · ▓▓▓░░░░░░░ 34%`
+///   (10-cell bar from `downloaded_size / expected_size`; `expected_size ==
+///   0` renders the indeterminate `…` in place of the bar and percentage).
+/// - `Some(f)` with `f.is_completed`: `📎 name · 2.4 MB · ⏎ open`, the
+///   affordance in `theme.accent`.
+/// - `Some(f)` otherwise (a snapshot exists — e.g. a cancelled download —
+///   but is neither downloading nor complete): falls back to the "not
+///   downloaded" `⏎ download` rendering.
+pub fn file_card_line(
+    content: &MessageContent,
+    file: Option<&FileSnapshot>,
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    let (icon, name, size) = file_card_identity(content)?;
+    let text_style = Style::new().fg(theme.text);
+    let muted_style = Style::new().fg(theme.text_muted);
+
+    let mut spans = vec![Span::styled(format!("{icon} {name}"), text_style)];
+
+    if let Some(file) = file
+        && file.is_downloading
+    {
+        spans.push(Span::styled(" · ", muted_style));
+        spans.push(Span::styled(
+            progress_bar_text(file.downloaded_size, file.expected_size),
+            text_style,
+        ));
+        return Some(Line::from(spans));
+    }
+
+    if let Some(size) = size {
+        spans.push(Span::styled(
+            format!(" · {}", format_size(size)),
+            text_style,
+        ));
+    }
+    spans.push(Span::styled(" · ", muted_style));
+
+    if file.is_some_and(|f| f.is_completed) {
+        spans.push(Span::styled("⏎ open", Style::new().fg(theme.accent)));
+    } else {
+        spans.push(download_affordance_span(theme));
+    }
+
+    Some(Line::from(spans))
+}
+
+/// The upload-side counterpart to [`file_card_line`], for a pending (own,
+/// not-yet-sent) message backed by a `MediaState::uploads` entry: `↑ name ·
+/// ▓▓░░░░░░░░ 20%`. Same static/dynamic split and per-frame-recompute
+/// contract as [`file_card_line`] — see its docs and the module docs.
+///
+/// Always shows the `↑` glyph rather than the kind icon: an in-flight
+/// upload is a state of its own, not a photo/video/audio/document
+/// distinction. Uses the same 10-cell bar as [`file_card_line`] so the two
+/// look alike; `progress.total == 0` renders the indeterminate `…`.
+///
+/// Returns `None` for content with no file card, like [`file_card_line`].
+pub fn file_card_upload_line(
+    content: &MessageContent,
+    progress: &UploadProgress,
+    theme: &Theme,
+) -> Option<Line<'static>> {
+    let (_icon, name, _size) = file_card_identity(content)?;
+    let text_style = Style::new().fg(theme.text);
+    let muted_style = Style::new().fg(theme.text_muted);
+
+    Some(Line::from(vec![
+        Span::styled(format!("↑ {name}"), text_style),
+        Span::styled(" · ", muted_style),
+        Span::styled(
+            progress_bar_text(progress.uploaded, progress.total),
+            text_style,
+        ),
+    ]))
 }
 
 /// Slice `text.text` into styled runs according to its entities.
@@ -1109,6 +1294,14 @@ mod tests {
         assert_eq!(line_text(&lines[1]), "▏ ↳ …");
     }
 
+    // T37: the cached card line lost its `⏎ download` affordance (it moved
+    // to `file_card_line`, recomputed per frame — see the module docs' "File
+    // cards: the static/dynamic split"). These three assertions changed
+    // shape from pre-T37 accordingly: `document_renders_a_file_card_line`
+    // and `document_caption_follows_the_card` dropped the trailing
+    // `· ⏎ download`, and `photo_card_shows_dimensions` additionally picked
+    // up the 🖼 icon (photos previously shared the document's 📎).
+
     #[test]
     fn document_renders_a_file_card_line() {
         let msg = message(MessageContent::Document {
@@ -1123,10 +1316,7 @@ mod tests {
         let lines = layout_message(&msg, 60, &theme());
 
         assert_eq!(lines.len(), 2);
-        assert_eq!(
-            line_text(&lines[1]),
-            "▏ 📎 architecture.pdf · 2.4 MB · ⏎ download"
-        );
+        assert_eq!(line_text(&lines[1]), "▏ 📎 architecture.pdf · 2.4 MB");
     }
 
     #[test]
@@ -1142,7 +1332,7 @@ mod tests {
         });
         let lines = layout_message(&msg, 60, &theme());
 
-        assert_eq!(line_text(&lines[1]), "▏ 📎 notes.txt · 512 B · ⏎ download");
+        assert_eq!(line_text(&lines[1]), "▏ 📎 notes.txt · 512 B");
         assert_eq!(line_text(&lines[2]), "▏ have a look");
     }
 
@@ -1158,7 +1348,7 @@ mod tests {
             },
         });
         let lines = layout_message(&msg, 60, &theme());
-        assert_eq!(line_text(&lines[1]), "▏ 📎 photo 800×600 · ⏎ download");
+        assert_eq!(line_text(&lines[1]), "▏ 🖼 photo 800×600");
     }
 
     #[test]
@@ -1710,10 +1900,187 @@ mod tests {
 
     #[test]
     fn size_formatting() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(2_516_582), "2.4 MB");
-        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+        // (input bytes, expected humanized string) — one row per unit
+        // boundary, plus the "just under the next unit" cases that are
+        // where an off-by-one in the threshold comparisons would show up.
+        let cases: &[(u64, &str)] = &[
+            (0, "0 B"),
+            (1, "1 B"),
+            (1023, "1023 B"),
+            (1024, "1.0 KB"),
+            (1536, "1.5 KB"),
+            (1024 * 1024 - 1, "1024.0 KB"),
+            (2_516_582, "2.4 MB"),
+            (1024 * 1024 * 1024 - 1, "1024.0 MB"),
+            (3 * 1024 * 1024 * 1024, "3.0 GB"),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(format_size(*bytes), *expected, "format_size({bytes})");
+        }
+    }
+
+    // --- file_card_line / file_card_upload_line (T37) --------------------
+
+    fn document_content() -> MessageContent {
+        MessageContent::Document {
+            file_id: FileId(7),
+            file_name: "architecture.pdf".to_string(),
+            size: 2_516_582,
+            caption: FormattedText {
+                text: String::new(),
+                entities: Vec::new(),
+            },
+        }
+    }
+
+    fn file_snapshot(
+        downloaded: u64,
+        expected: u64,
+        is_downloading: bool,
+        is_completed: bool,
+    ) -> FileSnapshot {
+        FileSnapshot {
+            id: FileId(7),
+            expected_size: expected,
+            downloaded_size: downloaded,
+            is_downloading,
+            is_completed,
+            local_path: None,
+        }
+    }
+
+    #[test]
+    fn file_card_line_undownloaded_document_snapshot() {
+        let content = document_content();
+        let line = file_card_line(&content, None, &theme()).expect("document has a file card");
+        insta::assert_snapshot!(line_text(&line));
+    }
+
+    #[test]
+    fn file_card_line_forty_percent_download_progress_snapshot() {
+        let content = document_content();
+        // A round 400/1000 rather than the document's real size, so the
+        // expected 40% is exact and the snapshot isn't hostage to
+        // floating-point rounding on an arbitrary byte count.
+        let file = file_snapshot(400, 1000, true, false);
+        let line =
+            file_card_line(&content, Some(&file), &theme()).expect("document has a file card");
+        insta::assert_snapshot!(line_text(&line));
+    }
+
+    #[test]
+    fn file_card_line_completed_snapshot() {
+        let content = document_content();
+        let file = file_snapshot(2_516_582, 2_516_582, false, true);
+        let theme = theme();
+        let line = file_card_line(&content, Some(&file), &theme).expect("document has a file card");
+        insta::assert_snapshot!(line_text(&line));
+
+        let affordance = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "⏎ open")
+            .expect("no open affordance span");
+        assert_eq!(affordance.style.fg, Some(theme.accent));
+    }
+
+    /// A snapshot that exists but is neither downloading nor complete (e.g.
+    /// a cancelled download) falls back to the "not downloaded" rendering
+    /// rather than showing a frozen 0% bar.
+    #[test]
+    fn file_card_line_cancelled_snapshot_falls_back_to_download_affordance() {
+        let content = document_content();
+        let file = file_snapshot(0, 2_516_582, false, false);
+        let line =
+            file_card_line(&content, Some(&file), &theme()).expect("document has a file card");
+        assert_eq!(
+            line_text(&line),
+            "📎 architecture.pdf · 2.4 MB · ⏎ download"
+        );
+    }
+
+    #[test]
+    fn file_card_line_indeterminate_progress_when_expected_size_zero() {
+        let content = document_content();
+        let file = file_snapshot(0, 0, true, false);
+        let line =
+            file_card_line(&content, Some(&file), &theme()).expect("document has a file card");
+        assert_eq!(line_text(&line), "📎 architecture.pdf · …");
+    }
+
+    #[test]
+    fn file_card_upload_line_pending_snapshot() {
+        let content = document_content();
+        let progress = UploadProgress {
+            chat_id: ChatId(2),
+            uploaded: 200,
+            total: 1000,
+        };
+        let line =
+            file_card_upload_line(&content, &progress, &theme()).expect("document has a file card");
+        insta::assert_snapshot!(line_text(&line));
+    }
+
+    #[test]
+    fn file_card_upload_line_indeterminate_when_total_zero() {
+        let content = document_content();
+        let progress = UploadProgress {
+            chat_id: ChatId(2),
+            uploaded: 0,
+            total: 0,
+        };
+        let line =
+            file_card_upload_line(&content, &progress, &theme()).expect("document has a file card");
+        assert_eq!(line_text(&line), "↑ architecture.pdf · …");
+    }
+
+    #[test]
+    fn file_card_line_uses_kind_specific_icons() {
+        let theme = theme();
+        let video = MessageContent::Video {
+            file_id: FileId(1),
+            file_name: "clip.mp4".to_string(),
+            size: 100,
+            duration_secs: 5,
+            caption: FormattedText {
+                text: String::new(),
+                entities: Vec::new(),
+            },
+        };
+        let audio = MessageContent::Audio {
+            file_id: FileId(2),
+            file_name: "song.mp3".to_string(),
+            size: 100,
+            duration_secs: 5,
+        };
+        let photo = MessageContent::Photo {
+            file_id: FileId(3),
+            width: 10,
+            height: 20,
+            caption: FormattedText {
+                text: String::new(),
+                entities: Vec::new(),
+            },
+        };
+
+        assert!(line_text(&file_card_line(&video, None, &theme).unwrap()).starts_with("🎞 "));
+        assert!(line_text(&file_card_line(&audio, None, &theme).unwrap()).starts_with("🎵 "));
+        assert!(line_text(&file_card_line(&photo, None, &theme).unwrap()).starts_with("🖼 "));
+    }
+
+    #[test]
+    fn file_card_line_none_for_content_without_a_file() {
+        let theme = theme();
+        let text = MessageContent::Text(FormattedText {
+            text: "hi".to_string(),
+            entities: Vec::new(),
+        });
+        assert!(file_card_line(&text, None, &theme).is_none());
+        let progress = UploadProgress {
+            chat_id: ChatId(1),
+            uploaded: 0,
+            total: 0,
+        };
+        assert!(file_card_upload_line(&text, &progress, &theme).is_none());
     }
 }

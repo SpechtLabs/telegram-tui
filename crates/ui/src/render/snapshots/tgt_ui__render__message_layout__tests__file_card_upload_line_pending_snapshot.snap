@@ -1,0 +1,5 @@
+---
+source: crates/ui/src/render/message_layout.rs
+expression: line_text(&line)
+---
+↑ architecture.pdf · ▓▓░░░░░░░░ 20%
