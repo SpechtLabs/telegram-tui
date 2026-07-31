@@ -183,16 +183,27 @@ async fn phone_login_reaches_ready() {
     })
     .await;
 
-    app.advance_until_phase("the phone/QR method choice", AuthPhase::WaitPhoneNumber)
+    app.advance_until_phase("the QR-first screen", AuthPhase::WaitPhoneNumber)
         .await;
     assert_eq!(app.core.app().state().screen, Screen::Auth);
 
-    // Picking Phone is itself the confirmation (state::auth): from here the
-    // keys go straight into the phone field and Enter submits it.
-    app.press(KeyCode::Char('p')).await;
+    // QR-first (T77): the request fires on arrival, before any key is
+    // pressed. Wait for it so it can't race the phone request below.
+    app.advance_until("the automatic QR request", |_, fake| {
+        fake.received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::RequestQrCodeAuthentication))
+    })
+    .await;
+
+    // Down highlights "sign in with phone number instead", Enter reveals
+    // the field — TDLib rejects setAuthenticationPhoneNumber once a QR link
+    // has been issued, so this has to happen before the link comes back for
+    // the phone number to actually be submittable (state::auth module docs).
+    app.press(KeyCode::Down).await;
+    app.press(KeyCode::Enter).await;
     app.advance_until("the phone field to take focus", |core, _| {
         core.app().state().auth.method == Some(LoginMethod::Phone)
-            && core.app().state().auth.active_field == AuthField::Phone
     })
     .await;
 
@@ -227,6 +238,7 @@ async fn phone_login_reaches_ready() {
         app.requests(),
         vec![
             "SetTdlibParameters",
+            "RequestQrCodeAuthentication",
             "SetAuthenticationPhoneNumber",
             "CheckAuthenticationCode",
             "LoadChats",
@@ -234,11 +246,11 @@ async fn phone_login_reaches_ready() {
     );
     let received = app.fake.received();
     assert!(matches!(
-        &received[1],
+        &received[2],
         TdRequest::SetAuthenticationPhoneNumber { phone } if phone == "+4915112345678"
     ));
     assert!(matches!(
-        &received[2],
+        &received[3],
         TdRequest::CheckAuthenticationCode { code } if code == "54321"
     ));
     assert_eq!(app.core.app().state().auth.field_error, None);
@@ -248,11 +260,10 @@ async fn phone_login_reaches_ready() {
 async fn qr_login_reaches_ready() {
     let mut app = Harness::new(&read_fixture("auth_qr.jsonl"));
 
-    app.advance_until_phase("the phone/QR method choice", AuthPhase::WaitPhoneNumber)
+    // QR-first (T77): arriving at WaitPhoneNumber fires the request on its
+    // own, no key press needed.
+    app.advance_until_phase("the QR-first screen", AuthPhase::WaitPhoneNumber)
         .await;
-
-    app.press(KeyCode::Char('q')).await;
-    app.press(KeyCode::Enter).await;
 
     // The link phase is a screen of its own: the user is looking at a QR
     // code while TDLib waits for the other device.
@@ -296,9 +307,17 @@ async fn flood_wait_surfaces_countdown_not_generic_error() {
     // only to make one submission fail.
     let mut app = Harness::new(&to_jsonl(&flood_wait_script()));
 
-    app.advance_until_phase("the phone/QR method choice", AuthPhase::WaitPhoneNumber)
+    app.advance_until_phase("the QR-first screen", AuthPhase::WaitPhoneNumber)
         .await;
-    app.press(KeyCode::Char('p')).await;
+    app.advance_until("the automatic QR request", |_, fake| {
+        fake.received()
+            .iter()
+            .any(|r| matches!(r, TdRequest::RequestQrCodeAuthentication))
+    })
+    .await;
+
+    app.press(KeyCode::Down).await;
+    app.press(KeyCode::Enter).await;
     app.advance_until("the phone field to take focus", |core, _| {
         core.app().state().auth.method == Some(LoginMethod::Phone)
     })
@@ -376,6 +395,13 @@ fn phone_script() -> Vec<ScriptStep> {
             respond: RespondWith::Ok(TdResponse::Ok),
         },
         ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitPhoneNumber)),
+        // QR-first (T77): the request fires on arrival regardless of which
+        // path the user ends up taking, so it's always the next request the
+        // app sends, even on the phone path exercised here.
+        ScriptStep::Await {
+            expect: expect("RequestQrCodeAuthentication"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
         ScriptStep::Await {
             expect: expect("SetAuthenticationPhoneNumber"),
             respond: RespondWith::Ok(TdResponse::Ok),
@@ -421,6 +447,12 @@ fn flood_wait_script() -> Vec<ScriptStep> {
             respond: RespondWith::Ok(TdResponse::Ok),
         },
         ScriptStep::Emit(TdUpdate::Auth(AuthPhase::WaitPhoneNumber)),
+        // QR-first (T77): fires on arrival even though this test escapes to
+        // phone before the link ever comes back.
+        ScriptStep::Await {
+            expect: expect("RequestQrCodeAuthentication"),
+            respond: RespondWith::Ok(TdResponse::Ok),
+        },
         ScriptStep::Await {
             expect: expect("SetAuthenticationPhoneNumber"),
             respond: RespondWith::Err(TdError::FloodWait { seconds: 42 }),
