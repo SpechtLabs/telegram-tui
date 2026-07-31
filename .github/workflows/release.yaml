@@ -69,6 +69,24 @@ jobs:
           install: true
           cache: true
 
+      # Deliberately a different key from ci.yml's. Sharing one means restoring
+      # ~1.3 GB of debug artifacts this job cannot use, and then skipping the
+      # save because CI already claimed the key, so target/release would never
+      # persist across releases. The last restore-key still falls back to CI's
+      # cache, which is worth having on a cold first run for the registry (the
+      # downloaded TDLib lives there).
+      - name: Cache cargo registry and release target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
       # Builds the release binary, lays out bin/ + lib/, rewrites the dylib
       # install name to @rpath, and proves the result runs from a moved
       # directory before it is allowed to ship (architecture.md §9.2).
