@@ -15,6 +15,15 @@
 //! Anything else pushes a `Toast` (title/body are in-app only, per the
 //! doc-comment on `Toast`) and returns `Effect::Alert`, whose own payload is
 //! structurally empty (see `core/src/effect.rs` and `tgt-app`'s `notify.rs`).
+//!
+//! `on_action_failed` is the second, unconditional source: `App::dispatch`
+//! calls it from the `EditDone`/`DeleteDone`/`ForwardDone`/`ReactionDone`
+//! `TdResult` arms when `outcome` is `Err`, since none of those four mutate
+//! any state on their own — the push update that follows a success
+//! (`MessageContentChanged`, `MessagesDeleted`, ...) is the only thing that
+//! otherwise tells the user anything happened at all. None of the three
+//! suppression rules above apply to it: a failure the user's own keypress
+//! caused is not the unsolicited-message case those rules were written for.
 
 use std::collections::VecDeque;
 
@@ -62,10 +71,42 @@ pub fn on_new_message(app: &mut AppState, msg: &MessageView) -> Vec<Effect> {
     let title = chat
         .map(|c| c.title.clone())
         .unwrap_or_else(|| "New message".to_string());
+    push_toast(app, msg.chat_id, title, preview_text(&msg.content))
+}
+
+/// Unconditional counterpart to `on_new_message`: raised for a failed
+/// message action (edit/delete/forward/react) whose `TdResult` completion
+/// `App::dispatch` would otherwise drop silently. Unlike an incoming
+/// message, a failure the user caused themselves is never suppressed by
+/// mute or by the chat being focused — those rules exist so a chat you are
+/// not looking at doesn't spam you, and both are exactly the chats a user
+/// just took an action in.
+///
+/// `body` is the ready-made, already-worded message (e.g. "Couldn't delete
+/// message") — this module has no per-action vocabulary of its own, that
+/// lives with the `TdRequest` variants in `App::dispatch`. In-app toast text
+/// may name the chat and the action freely (module docs, spec §6.4): the
+/// PII restriction is scoped to the terminal escape sequence `Effect::Alert`
+/// triggers, which carries no payload at all.
+pub fn on_action_failed(app: &mut AppState, chat_id: ChatId, body: String) -> Vec<Effect> {
+    let title = app
+        .chat_list
+        .chats
+        .get(&chat_id)
+        .map(|c| c.title.clone())
+        .unwrap_or_else(|| "Chat".to_string());
+    push_toast(app, chat_id, title, body)
+}
+
+/// Shared enqueue-and-cap step behind both toast sources: push, then drop
+/// the oldest past `TOAST_MAX`. Always raises the alert — a toast that
+/// enqueues but never rings the bell would be silently missed exactly like
+/// the bug this task fixes.
+fn push_toast(app: &mut AppState, chat_id: ChatId, title: String, body: String) -> Vec<Effect> {
     let toast = Toast {
-        chat_id: msg.chat_id,
+        chat_id,
         title,
-        body: preview_text(&msg.content),
+        body,
         expires_at: app.now.saturating_add(TOAST_TTL_MS),
     };
     app.toasts.toasts.push_back(toast);
@@ -269,6 +310,63 @@ mod tests {
         assert!(app.toasts.toasts.is_empty());
         // Badge maintenance (unread_count etc.) is chat_list's job, not
         // this module's; nothing here asserts on it.
+    }
+
+    /// `on_action_failed` ignores every `on_new_message` suppression rule:
+    /// a chat both muted and currently open still toasts, because the
+    /// failure was caused by looking at and acting on it, not by an
+    /// unsolicited push.
+    #[test]
+    fn action_failed_ignores_mute_and_focus() {
+        let mut app = fixture_state();
+        app.chat_list
+            .chats
+            .insert(CHAT_A, chat(CHAT_A, "Muted Group", true));
+        app.open_chat = Some(CHAT_A);
+
+        let effects = on_action_failed(&mut app, CHAT_A, "Couldn't delete the message".to_string());
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::Alert));
+        assert_eq!(app.toasts.toasts.len(), 1);
+        assert_eq!(app.toasts.toasts[0].title, "Muted Group");
+        assert_eq!(app.toasts.toasts[0].body, "Couldn't delete the message");
+    }
+
+    /// A chat that dropped out of `chat_list.chats` (unlikely, but not ruled
+    /// out — nothing pins the completion's `chat_id` to a chat that is still
+    /// known) gets a generic title instead of a missing toast.
+    #[test]
+    fn action_failed_falls_back_to_a_generic_title_for_an_unknown_chat() {
+        let mut app = fixture_state();
+
+        let effects = on_action_failed(&mut app, CHAT_A, "Couldn't send the reaction".to_string());
+
+        assert_eq!(effects.len(), 1);
+        assert_eq!(app.toasts.toasts[0].title, "Chat");
+    }
+
+    /// Shares the same cap-at-three, drop-oldest queue as incoming-message
+    /// toasts — `push_toast` is the one enqueue path both go through.
+    #[test]
+    fn action_failed_shares_the_same_queue_cap_as_new_message_toasts() {
+        let mut app = fixture_state();
+        app.chat_list.chats.insert(CHAT_A, chat(CHAT_A, "A", false));
+        on_new_message(&mut app, &message(CHAT_A, "1", false));
+        on_new_message(&mut app, &message(CHAT_A, "2", false));
+        on_action_failed(&mut app, CHAT_A, "Couldn't delete the message".to_string());
+        on_action_failed(&mut app, CHAT_A, "Couldn't forward the message".to_string());
+
+        assert_eq!(app.toasts.toasts.len(), TOAST_MAX);
+        let bodies: Vec<&str> = app.toasts.toasts.iter().map(|t| t.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec![
+                "2",
+                "Couldn't delete the message",
+                "Couldn't forward the message"
+            ]
+        );
     }
 
     #[test]

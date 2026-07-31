@@ -307,14 +307,141 @@ impl App {
                 self.dirty = true;
                 search::handle_td_result(&mut self.state, chat_id, &outcome)
             }
-            // The remaining completions land with the tasks that own their
-            // state. T32 wired the dispatcher end of all of them, so
-            // `EditDone`/`DeleteDone`/`ForwardDone`/`ReactionDone` and the
-            // `Io` results genuinely arrive here now — they are no-ops
-            // because what the user sees of them is the push update that
-            // follows (`MessageContentChanged`, `MessagesDeleted`, ...); it
-            // is their *failure* that still needs a home, which is T44's
-            // toasts. Left total over `Action` either way.
+            // `editMessageText`/`deleteMessages`/`toggleReaction` answer with
+            // nothing but success or failure — the visible change, if any,
+            // arrives as its own push (`MessageContentChanged`,
+            // `MessagesDeleted`, a reaction update). So `Ok` sets no toast
+            // and touches no state; it does mint the one telemetry event
+            // this action gets, now that `telemetry_for` no longer fires an
+            // optimistic `ok` for these three at request time (see that
+            // function's doc comment). Reporting outcome only once, from
+            // here, keeps one action attempt mapped to one event — the
+            // alternative (an `ok` at request time plus an `error`
+            // correction here on failure) inflates both counts in any
+            // consumer that sums outcomes: 10 attempts with 1 failure would
+            // read as 11 events (10 ok, 1 error) instead of 10 (9 ok, 1
+            // error), understating the true failure rate and getting worse
+            // as it climbs.
+            //
+            // `Err` is the case that had nowhere to go before this task: a
+            // toast (`toasts::on_action_failed`, reusing the queue
+            // `on_new_message` already built — all three carry a real
+            // `chat_id`, so no shape change) and the `error` half of the
+            // outcome pair.
+            Action::TdResult(TdResult::EditDone {
+                chat_id, outcome, ..
+            }) => {
+                let action = schema::actions::MESSAGE_EDIT;
+                match &outcome {
+                    Ok(()) => {
+                        vec![Effect::Telemetry(
+                            self.chat_event(TelemetryEvent::ok(action), chat_id),
+                        )]
+                    }
+                    Err(err) => {
+                        self.dirty = true;
+                        let mut effects = vec![Effect::Telemetry(self.chat_event(
+                            TelemetryEvent::error(action, err.telemetry_kind()),
+                            chat_id,
+                        ))];
+                        effects.extend(toasts::on_action_failed(
+                            &mut self.state,
+                            chat_id,
+                            "Couldn't save the edit".to_string(),
+                        ));
+                        effects
+                    }
+                }
+            }
+            Action::TdResult(TdResult::DeleteDone { chat_id, outcome }) => {
+                let action = schema::actions::MESSAGE_DELETE;
+                match &outcome {
+                    Ok(()) => {
+                        vec![Effect::Telemetry(
+                            self.chat_event(TelemetryEvent::ok(action), chat_id),
+                        )]
+                    }
+                    Err(err) => {
+                        self.dirty = true;
+                        let mut effects = vec![Effect::Telemetry(self.chat_event(
+                            TelemetryEvent::error(action, err.telemetry_kind()),
+                            chat_id,
+                        ))];
+                        effects.extend(toasts::on_action_failed(
+                            &mut self.state,
+                            chat_id,
+                            "Couldn't delete the message".to_string(),
+                        ));
+                        effects
+                    }
+                }
+            }
+            Action::TdResult(TdResult::ReactionDone {
+                chat_id, outcome, ..
+            }) => {
+                let action = schema::actions::MESSAGE_REACT;
+                match &outcome {
+                    Ok(()) => {
+                        vec![Effect::Telemetry(
+                            self.chat_event(TelemetryEvent::ok(action), chat_id),
+                        )]
+                    }
+                    Err(err) => {
+                        self.dirty = true;
+                        let mut effects = vec![Effect::Telemetry(self.chat_event(
+                            TelemetryEvent::error(action, err.telemetry_kind()),
+                            chat_id,
+                        ))];
+                        effects.extend(toasts::on_action_failed(
+                            &mut self.state,
+                            chat_id,
+                            "Couldn't send the reaction".to_string(),
+                        ));
+                        effects
+                    }
+                }
+            }
+            // Forward could not make the same move as the three above: `Ok`
+            // stays a genuine no-op (the optimistic event `telemetry_for`
+            // already emitted at request time, tagged with `from_chat_id`,
+            // is this action's only `ok` — minting a second one here on
+            // success would be exactly the double-count this task is
+            // trying to avoid elsewhere). `ForwardDone` carries only
+            // `to_chat_id`; replacing the request-time event with one from
+            // here would silently swap what a forward event's chat_hash
+            // means (source vs. destination), which is a bigger, more
+            // product-facing change than this fix and not this task's to
+            // make unasked. So `Err` is reported from here, the only place
+            // it exists, tagged by the destination chat — the one thing
+            // this completion actually carries.
+            Action::TdResult(TdResult::ForwardDone {
+                to_chat_id,
+                outcome,
+            }) => match outcome {
+                Ok(()) => Vec::new(),
+                Err(err) => {
+                    self.dirty = true;
+                    let action = schema::actions::MESSAGE_FORWARD;
+                    let mut effects = vec![Effect::Telemetry(self.chat_event(
+                        TelemetryEvent::error(action, err.telemetry_kind()),
+                        to_chat_id,
+                    ))];
+                    effects.extend(toasts::on_action_failed(
+                        &mut self.state,
+                        to_chat_id,
+                        "Couldn't forward the message".to_string(),
+                    ));
+                    effects
+                }
+            },
+            // `Action::Io(_)` and `TdResult::LogOutDone` stay dropped here,
+            // deliberately, past this task's scope: `ConfigSaved` and
+            // `LogOutDone` failures want either `Toast.chat_id` widened to
+            // `Option<ChatId>` (a shared type — docs/architecture.md first)
+            // or a second, chat-less notification path, and logout has no
+            // allowlisted telemetry action yet at all, unlike the four
+            // above which already had one firing optimistically. Those are
+            // product decisions, not wiring.
             _ => Vec::new(),
         }
     }
@@ -985,6 +1112,12 @@ impl App {
     /// send is `message.send` whether it came from the composer, a Resend
     /// chip or (later) the palette, and it is `message.reply` exactly when
     /// the request itself carries a `reply_to`.
+    /// `Edit`/`Delete`/`React` are deliberately absent here: this task moved
+    /// them off the optimistic "request fired" event onto their `TdResult`
+    /// completion (see the `dispatch` arms for `EditDone`/`DeleteDone`/
+    /// `ReactionDone`), which reports the real outcome instead of always
+    /// reporting `ok`. `Forward` stays — see the doc comment on the
+    /// `ForwardDone` arm for why it could not make the same move.
     fn telemetry_for(&self, effect: &Effect) -> Option<TelemetryEvent> {
         let Effect::Td(request) = effect else {
             return None;
@@ -1000,16 +1133,13 @@ impl App {
                 };
                 (action, *chat_id)
             }
-            TdRequest::EditMessageText { chat_id, .. } => (schema::actions::MESSAGE_EDIT, *chat_id),
-            TdRequest::DeleteMessages { chat_id, .. } => {
-                (schema::actions::MESSAGE_DELETE, *chat_id)
-            }
             // The source chat, matching every other message event: what was
-            // forwarded is a fact about where it came from.
+            // forwarded is a fact about where it came from. `ForwardDone`
+            // only carries the destination, so this is the one place that
+            // fact is still available — see the completion arm's docs.
             TdRequest::ForwardMessages { from_chat_id, .. } => {
                 (schema::actions::MESSAGE_FORWARD, *from_chat_id)
             }
-            TdRequest::ToggleReaction { chat_id, .. } => (schema::actions::MESSAGE_REACT, *chat_id),
             TdRequest::OpenChat { chat_id } => (schema::actions::CHAT_OPEN, *chat_id),
             // The query text is never part of the event — only that a search
             // ran, and in what kind of chat (§4.8's allowlist).
@@ -1018,15 +1148,16 @@ impl App {
             }
             _ => return None,
         };
-        Some(self.chat_event(action, chat_id))
+        Some(self.chat_event(TelemetryEvent::ok(action), chat_id))
     }
 
-    /// An allowlisted event about a chat: the hashed id always, the kind when
-    /// the sidebar knows it. Both are schema keys (§4.8); neither can carry a
-    /// title, a name or a message.
-    fn chat_event(&self, action: &'static str, chat_id: ChatId) -> TelemetryEvent {
-        let event = TelemetryEvent::ok(action)
-            .with_chat_hash(hashing::hash_id(&self.state.telemetry_salt, chat_id.0));
+    /// Attaches the two allowlisted per-chat fields (§4.8) to an event
+    /// already built by `TelemetryEvent::ok`/`error`/`cancelled`: the hashed
+    /// id always, the kind when the sidebar knows it. Neither field, nor
+    /// anything else this function touches, can carry a title, a name or a
+    /// message.
+    fn chat_event(&self, event: TelemetryEvent, chat_id: ChatId) -> TelemetryEvent {
+        let event = event.with_chat_hash(hashing::hash_id(&self.state.telemetry_salt, chat_id.0));
         match self.state.chat_list.chats.get(&chat_id) {
             Some(chat) => event.with_chat_kind(chat.kind.telemetry_str()),
             None => event,
@@ -1770,6 +1901,8 @@ mod tests {
 mod routing {
     use super::tests::{boot_fixture, chat, logged_in, message};
     use super::*;
+    use crate::td::error::TdError;
+    use crate::telemetry::Outcome;
 
     #[test]
     fn help_opens_from_chat_list_swallows_keys_and_esc_closes() {
@@ -1900,11 +2033,13 @@ mod routing {
         );
 
         // Confirm: the modal's request, one level popped, storage dropped.
+        // No `Telemetry(message.delete)` here any more — this task moved
+        // that event off the optimistic request-time emission and onto
+        // `DeleteDone`'s completion, so the outcome it reports is real; see
+        // `telemetry_for`'s doc comment and the `DeleteDone` arm in
+        // `dispatch`.
         let effects = app.update(Action::Key(Key::Enter));
-        assert_eq!(
-            describe(&effects),
-            ["Td(DeleteMessages)", "Telemetry(message.delete)"]
-        );
+        assert_eq!(describe(&effects), ["Td(DeleteMessages)"]);
         assert_eq!(*app.state().focus.current(), Focus::Selection);
         assert!(app.state().modal_ui.is_none());
     }
@@ -1920,6 +2055,145 @@ mod routing {
         assert!(app.state().modal_ui.is_none());
         // Exactly one level: selection mode survives the dismissal.
         assert_eq!(selected_message(&app), Some(NEWEST));
+    }
+
+    /// A successful `DeleteDone` is a genuine no-op except for the one
+    /// telemetry event this action gets now that `telemetry_for` no longer
+    /// fires an optimistic one at request time: no toast, no alert, no
+    /// dirty frame — the `MessagesDeleted` push TDLib sends next is what
+    /// actually changes anything on screen.
+    #[test]
+    fn delete_done_ok_reports_telemetry_only() {
+        let mut app = chat_open();
+        app.take_dirty();
+
+        let effects = app.update(Action::TdResult(TdResult::DeleteDone {
+            chat_id: CHAT,
+            outcome: Ok(()),
+        }));
+
+        assert_eq!(effects.len(), 1, "expected exactly one effect: {effects:?}");
+        let Effect::Telemetry(event) = &effects[0] else {
+            panic!("expected a telemetry event: {effects:?}");
+        };
+        assert_eq!(event.action, schema::actions::MESSAGE_DELETE);
+        assert_eq!(event.outcome, Outcome::Ok);
+        assert!(event.error_kind.is_none());
+        assert!(event.chat_hash.is_some(), "chat_hash should always be set");
+        assert!(app.state().toasts.toasts.is_empty());
+        assert!(!app.take_dirty(), "a bare Ok has nothing new to render");
+    }
+
+    /// This task's actual fix: a failed `DeleteDone` — previously dropped
+    /// entirely by the catch-all — now raises a toast, rings the bell, and
+    /// reports the real outcome instead of the `ok` `telemetry_for` used to
+    /// fire optimistically at request time.
+    #[test]
+    fn delete_done_err_toasts_and_reports_the_real_outcome() {
+        let mut app = chat_open();
+        app.take_dirty();
+
+        let effects = app.update(Action::TdResult(TdResult::DeleteDone {
+            chat_id: CHAT,
+            outcome: Err(TdError::NetTimeout),
+        }));
+
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Alert)),
+            "a failure the user caused must ring the bell: {effects:?}"
+        );
+        let event = effects.iter().find_map(|e| match e {
+            Effect::Telemetry(event) => Some(event),
+            _ => None,
+        });
+        let event = event.expect("expected a telemetry event");
+        assert_eq!(event.action, schema::actions::MESSAGE_DELETE);
+        assert_eq!(event.outcome, Outcome::Error);
+        assert_eq!(event.error_kind, Some(TdError::NetTimeout.telemetry_kind()));
+
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+        assert_eq!(app.state().toasts.toasts[0].chat_id, CHAT);
+        assert!(app.take_dirty(), "the new toast is render-worthy");
+    }
+
+    /// `EditDone` and `ReactionDone` mirror `DeleteDone` exactly (same
+    /// shape in `App::dispatch`): this is a lighter check that the other
+    /// two got the same wiring, not a repeat of the full assertion above.
+    #[test]
+    fn edit_and_reaction_failures_also_toast_and_report_errors() {
+        for (make_result, action) in [
+            (
+                (|| TdResult::EditDone {
+                    chat_id: CHAT,
+                    message_id: NEWEST,
+                    outcome: Err(TdError::Other {
+                        code: 400,
+                        message: "not allowed".to_string(),
+                    }),
+                }) as fn() -> TdResult,
+                schema::actions::MESSAGE_EDIT,
+            ),
+            (
+                || TdResult::ReactionDone {
+                    chat_id: CHAT,
+                    message_id: NEWEST,
+                    outcome: Err(TdError::Other {
+                        code: 400,
+                        message: "not allowed".to_string(),
+                    }),
+                },
+                schema::actions::MESSAGE_REACT,
+            ),
+        ] {
+            let mut app = chat_open();
+            let effects = app.update(Action::TdResult(make_result()));
+
+            assert!(effects.iter().any(|e| matches!(e, Effect::Alert)));
+            assert!(effects.iter().any(|e| matches!(
+                e,
+                Effect::Telemetry(event) if event.action == action && event.outcome == Outcome::Error
+            )));
+            assert_eq!(app.state().toasts.toasts.len(), 1);
+        }
+    }
+
+    /// Forward could not move onto the same "one event, at completion"
+    /// shape as the other three (see the `ForwardDone` arm's doc comment):
+    /// `telemetry_for` still fires the optimistic `ok` at request time,
+    /// tagged by the source chat, so a successful `ForwardDone` stays a
+    /// total no-op here — minting a second `ok` would double-count the one
+    /// action. A failure is still reported, from the only place it can be:
+    /// tagged by the destination chat, since that is all `ForwardDone`
+    /// carries.
+    #[test]
+    fn forward_done_ok_is_a_no_op_but_failure_still_toasts() {
+        let mut app = chat_open();
+        const DEST: ChatId = ChatId(9);
+
+        let effects = app.update(Action::TdResult(TdResult::ForwardDone {
+            to_chat_id: DEST,
+            outcome: Ok(()),
+        }));
+        assert!(
+            effects.is_empty(),
+            "the request-time event already reported this: {effects:?}"
+        );
+        assert!(app.state().toasts.toasts.is_empty());
+
+        let effects = app.update(Action::TdResult(TdResult::ForwardDone {
+            to_chat_id: DEST,
+            outcome: Err(TdError::Offline),
+        }));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Alert)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Telemetry(event)
+                if event.action == schema::actions::MESSAGE_FORWARD
+                    && event.outcome == Outcome::Error
+                    && event.error_kind == Some(TdError::Offline.telemetry_kind())
+        )));
+        assert_eq!(app.state().toasts.toasts.len(), 1);
+        assert_eq!(app.state().toasts.toasts[0].chat_id, DEST);
     }
 
     #[test]
