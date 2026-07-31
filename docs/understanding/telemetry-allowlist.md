@@ -15,7 +15,7 @@ For the practical controls, see [Telemetry controls](../guides/telemetry.md). Th
 
 Not "aren't", not "shouldn't be". Cannot.
 
-The qualifier is doing real work and it was added deliberately. `tgt` also sends crash reports, which are governed by nothing on this page; [what the proof doesn't cover](#what-the-proof-doesn-t-cover) is the section that says so, and it's worth reading before you take the sentence above as a claim about the whole client.
+The qualifier is doing real work and it was added deliberately. `tgt` also sends crash reports, which are governed by nothing on this page; [what the proof doesn't cover](#what-the-proof-doesnt-cover) is the section that says so, and it's worth reading before you take the sentence above as a claim about the whole client.
 
 ## Layer 1: the event type can't hold free text
 
