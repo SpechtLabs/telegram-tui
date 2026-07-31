@@ -16,16 +16,21 @@ Three documents outrank the code, and two of them are load-bearing when making c
 
 ## Commands
 
-Four commands gate every change. All four must pass before anything merges; CI runs exactly these on `macos-15`:
+`.mise.toml` holds the task definitions and CI calls those same tasks, so a green `mise run check` locally means a green pipeline. Prefer them over raw cargo invocations:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-./scripts/check-crate-boundaries.sh
+mise run check       # fmt-check + lint + test + boundaries: the merge gate
+mise run test        # or fmt-check / lint / boundaries individually
+mise run snapshots   # fail on any pending insta snapshot
+mise run build       # release build
+mise run package     # dist/ layout + tarball + relocation proof
+mise run install     # into $TGT_PREFIX (default ~/.local): bin/tgt + lib/libtdjson
+mise tasks           # the full list
 ```
 
-Toolchain comes from `mise` (rust 1.97.1, cargo-insta 1.48.0, both pinned exactly). `rust-toolchain.toml` pins the compiler independently, so plain `cargo` picks the right one outside a mise shell. `cargo-insta` may need `PATH="$HOME/.local/share/mise/shims:$PATH"` or `mise exec --`.
+The four gates behind `check` are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `./scripts/check-crate-boundaries.sh`. All four must pass before anything merges.
+
+Toolchain comes from `mise` (rust 1.97.1, cargo-insta 1.48.0, both pinned exactly). `rust-toolchain.toml` pins the compiler independently, so plain `cargo` picks the right one outside a mise shell. `cargo-insta` may need `PATH="$HOME/.local/share/mise/shims:$PATH"` or `mise exec --`. Editing `.mise.toml` requires `mise trust` before the tasks run again.
 
 Narrower runs while iterating:
 

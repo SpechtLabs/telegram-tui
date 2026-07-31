@@ -1,0 +1,143 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits"
+  ],
+  "timezone": "Europe/Berlin",
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "Dependency Dashboard",
+  "prHourlyLimit": 2,
+  "prConcurrentLimit": 8,
+  "rebaseWhen": "behind-base-branch",
+  "rangeStrategy": "bump",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "labels": [
+    "dependencies"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ],
+    "automerge": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the Rust toolchain pinned in rust-toolchain.toml (kept in lockstep with .mise.toml).",
+      "managerFilePatterns": [
+        "/(^|/)rust-toolchain\\.toml$/"
+      ],
+      "matchStrings": [
+        "channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+(?:\\.\\d+)?)\""
+      ],
+      "depNameTemplate": "rust",
+      "packageNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Automerge digest, pin, patch, and minor updates once CI passes.",
+      "matchUpdateTypes": [
+        "digest",
+        "pin",
+        "pinDigest",
+        "patch",
+        "minor"
+      ],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Keep major updates explicit.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Group GitHub Actions updates together.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "groupSlug": "github-actions",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true,
+      "dependencyDashboardApproval": false
+    },
+    {
+      "description": "The Rust toolchain is pinned in two files that must never disagree.",
+      "matchDepNames": [
+        "rust"
+      ],
+      "groupName": "Rust toolchain",
+      "groupSlug": "rust-toolchain",
+      "rangeStrategy": "bump",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true,
+      "dependencyDashboardApproval": false
+    },
+    {
+      "description": "Group the remaining cargo dependencies into one PR.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "groupName": "cargo dependencies",
+      "groupSlug": "cargo-dependencies"
+    },
+    {
+      "description": "ratatui and crossterm are a matched pair: crossterm 0.29 belongs to ratatui 0.30. Moving one without the other breaks the backend.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "ratatui",
+        "ratatui-image",
+        "crossterm"
+      ],
+      "groupName": "ratatui stack",
+      "groupSlug": "ratatui-stack"
+    },
+    {
+      "description": "The OpenTelemetry crates are version-locked to each other; a partial bump does not compile.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "opentelemetry{/,}**",
+        "prost"
+      ],
+      "groupName": "opentelemetry stack",
+      "groupSlug": "opentelemetry-stack"
+    },
+    {
+      "description": "tdlib-rs changes the vendored TDLib and therefore the shipped dylib name and packaging. Always review by hand.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "tdlib-rs"
+      ],
+      "groupName": "tdlib-rs",
+      "groupSlug": "tdlib-rs",
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "tracing-batteries is a git pin that is currently unused (architecture.md §6.4); leave it alone until it is either wired up or dropped.",
+      "matchPackageNames": [
+        "tracing-batteries"
+      ],
+      "enabled": false
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+name: Pull Request Hygiene
+
+# release-please derives the next version and the changelog from commit
+# titles, and squash-merges take the PR title. An unconventional title is
+# therefore a silently wrong release, which is what this check prevents.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize]
+
+jobs:
+  pr-title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        id: lint_pr_title
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Scopes are optional; when present they should name the crate or
+          # area the change lands in.
+          scopes: |
+            core
+            ui
+            app
+            docs
+            ci
+            deps
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: always() && (steps.lint_pr_title.outputs.error_message != null)
+        with:
+          header: pr-title-lint-error
+          message: |
+            Thanks for the pull request! 👋
+
+            Titles here follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/),
+            because release-please turns them into the version bump and the changelog entry.
+            While this project is pre-1.0, a `!`/`BREAKING CHANGE` bumps the minor version and
+            everything else bumps the patch.
+
+            ```
+            ${{ steps.lint_pr_title.outputs.error_message }}
+            ```
+
+            Examples: `feat(ui): show delivery receipts`, `fix(core): stop paging past the oldest message`.
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: ${{ steps.lint_pr_title.outputs.error_message == null }}
+        with:
+          header: pr-title-lint-error
+          delete: true
+
+  labeler:
+    name: Label PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          sync-labels: true
+          dot: true

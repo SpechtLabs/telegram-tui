@@ -1,4 +1,80 @@
 # .mise.toml — local tooling, exact pins (repo convention)
+#
+# The tasks below are the single definition of "how this project is built and
+# checked". CI calls exactly these, so a green `mise run check` locally means a
+# green pipeline.
+
 [tools]
 rust = "1.97.1"                # mirrors rust-toolchain.toml
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
+
+[env]
+# Where `mise run install` puts the binary and TDLib's dylib. The packaged
+# layout is bin/ + ../lib, which is what the binary's @executable_path/../lib
+# rpath resolves against (architecture.md §9.2).
+TGT_PREFIX = "{{ env.HOME }}/.local"
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check formatting without writing (gate 1)"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Clippy across every target, warnings are errors (gate 2)"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run the whole test suite (gate 3)"
+run = "cargo test --workspace"
+
+[tasks.boundaries]
+description = "Assert the crate dependency boundaries hold (gate 4)"
+run = "./scripts/check-crate-boundaries.sh"
+
+[tasks.check]
+description = "The definition of done: every gate that must pass before merging"
+depends = ["fmt-check", "lint", "test", "boundaries"]
+
+[tasks.snapshots]
+description = "Fail on any pending insta snapshot (take them with `cargo insta accept`)"
+run = "cargo insta test --workspace --check"
+
+[tasks.build]
+description = "Release build of the tgt binary"
+run = "cargo build --release -p tgt-app"
+
+[tasks.run]
+description = "Run the client from source"
+run = "cargo run -p tgt-app"
+
+[tasks.package]
+description = "Build dist/ with the relocatable binary, its dylib, and a tarball"
+run = "./scripts/package.sh"
+
+[tasks.install]
+description = "Install tgt into $TGT_PREFIX (default ~/.local): bin/tgt + lib/libtdjson"
+depends = ["package"]
+run = '''
+set -euo pipefail
+install -d "$TGT_PREFIX/bin" "$TGT_PREFIX/lib"
+install -m 755 dist/tgt/bin/tgt "$TGT_PREFIX/bin/tgt"
+# Both the versioned dylib (what the binary's LC_LOAD_DYLIB actually names)
+# and the unversioned alias ship together; see architecture.md §9.2.
+cp -f dist/tgt/lib/libtdjson*.dylib "$TGT_PREFIX/lib/"
+echo "installed $("$TGT_PREFIX/bin/tgt" --version) to $TGT_PREFIX/bin/tgt"
+case ":$PATH:" in
+  *":$TGT_PREFIX/bin:"*) ;;
+  *) echo "note: $TGT_PREFIX/bin is not on your PATH" >&2 ;;
+esac
+'''
+
+[tasks.uninstall]
+description = "Remove tgt and its dylib from $TGT_PREFIX"
+run = '''
+set -euo pipefail
+rm -f "$TGT_PREFIX/bin/tgt" "$TGT_PREFIX"/lib/libtdjson*.dylib
+echo "removed tgt from $TGT_PREFIX"
+'''

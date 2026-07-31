@@ -4,12 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable so the release pipeline gates on the exact same checks rather
+  # than a second copy of them.
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
+  check:
+    name: Checks
+    # aarch64-apple-darwin is the only supported target (spec §2), so the
+    # gates run where the code actually ships.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -32,14 +41,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: cargo fmt --check
-        run: mise exec -- cargo fmt --all -- --check
+      # Each gate is its own step so a failure names itself in the UI. The
+      # commands live in .mise.toml, so `mise run check` locally runs exactly
+      # this set.
+      - name: Formatting
+        run: mise run fmt-check
 
-      - name: cargo clippy
-        run: mise exec -- cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy
+        run: mise run lint
 
-      - name: cargo test
-        run: mise exec -- cargo test --workspace
+      - name: Tests
+        run: mise run test
 
-      - name: crate boundary check
-        run: mise exec -- ./scripts/check-crate-boundaries.sh
+      - name: Crate boundaries
+        run: mise run boundaries
+
+      - name: Pending snapshots
+        run: mise run snapshots

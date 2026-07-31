@@ -1,0 +1,111 @@
+name: Release
+
+# release-please keeps a release PR open against main, accumulating the
+# conventional commits merged since the last tag. Merging that PR tags the
+# release and publishes the notes; this workflow then builds the macOS binary
+# and attaches it.
+#
+# Versioning is pre-1.0 (see .release-please-config.json): breaking changes
+# bump the minor, everything else bumps the patch.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build or repair (e.g. v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    needs: [ci]
+    if: github.event_name == 'push'
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release-please
+        with:
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+    outputs:
+      release_created: ${{ steps.release-please.outputs.release_created }}
+      tag_name: ${{ steps.release-please.outputs.tag_name }}
+
+  publish:
+    name: Build & Attach Binary
+    runs-on: macos-15
+    needs: [ci, release-please]
+    if: >-
+      always() &&
+      needs.ci.result == 'success' &&
+      (
+        (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true') ||
+        github.event_name == 'workflow_dispatch'
+      )
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+
+      - name: Install mise
+        uses: jdx/mise-action@v2
+        with:
+          version: 2026.6.10
+          install: true
+          cache: true
+
+      # Builds the release binary, lays out bin/ + lib/, rewrites the dylib
+      # install name to @rpath, and proves the result runs from a moved
+      # directory before it is allowed to ship (architecture.md §9.2).
+      - name: Package
+        run: mise run package
+
+      # A tag whose binary reports a different version means the Cargo.toml
+      # bump did not land. Fail loudly rather than shipping a mislabeled
+      # artifact.
+      - name: Verify binary version matches the tag
+        run: |
+          set -euo pipefail
+          built="$(dist/tgt/bin/tgt --version | awk '{print $2}')"
+          expected="${TAG#v}"
+          if [ "$built" != "$expected" ]; then
+            echo "::error::tag $TAG expects version $expected but the binary reports $built"
+            exit 1
+          fi
+          echo "verified: $built"
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 tgt-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the tarball
+        run: |
+          set -euo pipefail
+          tarball="$(ls dist/tgt-*.tar.gz)"
+          cosign sign-blob --yes --bundle "${tarball}.cosign.bundle" "$tarball"
+
+      - name: Attach artifacts to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" dist/tgt-*.tar.gz dist/tgt-*.cosign.bundle dist/SHA256SUMS --clobber

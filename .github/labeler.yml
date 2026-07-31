@@ -1,0 +1,38 @@
+# Pure domain: state, update(), TDLib boundary types, telemetry schema
+core:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/core/**"
+
+# Rendering: views, message layout, layout cache, theme, input mapping
+ui:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/ui/**"
+
+# Composition root: the binary, config, dispatcher, TdlibRuntime, telemetry wiring
+app:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/app/**"
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".mise.toml"
+          - "scripts/**"
+          - ".release-please-config.json"
+          - ".release-please-manifest.json"
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/*/tests/**"
+          - "**/snapshots/**"
