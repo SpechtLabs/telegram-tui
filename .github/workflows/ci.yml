@@ -22,6 +22,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental compilation is a pure cost on a runner: every job starts from a
+  # restored cache and compiles once, so nothing is ever recompiled to benefit
+  # from it — but it emits by far the most files in target/, which is what the
+  # cache has to tar up afterwards. Leaving it on cost the Windows job 8+
+  # minutes in "Post Cache" alone (Git's tar.exe is punishingly slow over many
+  # small files) for artifacts no later step reads.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   check:
@@ -64,6 +71,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            !target/debug/incremental
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
