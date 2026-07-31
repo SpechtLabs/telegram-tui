@@ -589,6 +589,7 @@ pub fn file_snapshot(
         id,
         expected_size: expected,
         downloaded_size: downloaded,
+        uploaded_size: 0,
         is_downloading,
         is_completed,
         local_path: None,

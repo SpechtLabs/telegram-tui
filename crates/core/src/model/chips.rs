@@ -30,6 +30,19 @@ pub enum Chip {
     /// hidden key binding, is what keeps the row "the truth about what is
     /// possible" for this action too.
     Reveal, // 'v'  (message has an unrevealed spoiler)
+    /// Abandon an upload still in flight (spec §452: uploads "are
+    /// cancellable"). Like [`Chip::Reveal`] it is not a TDLib capability —
+    /// `MediaState::uploads` holding an entry for the message is the local
+    /// fact that gates it — so `selection.rs` appends it after `chips_for`
+    /// runs rather than widening that function.
+    ///
+    /// Deliberately *not* suppressed on a failed send, unlike `Reveal`. The
+    /// two are opposites: a message that never reached the server has no
+    /// server-confirmed content to reveal, but an upload that is still
+    /// tracked is exactly the thing a user wants to abandon, and `Resend` is
+    /// the only other chip a failed send offers. Withholding cancel there
+    /// would leave a stuck upload with no way out but quitting.
+    CancelUpload, // 'k'  (an upload for this message is still in flight)
 }
 
 impl Chip {
@@ -45,6 +58,9 @@ impl Chip {
             Chip::Open => 'o',
             Chip::Resend => 's',
             Chip::Reveal => 'v',
+            // Not 'c' (Copy) and not 'x' (Delete); 'k' is free and reads as
+            // "kill" without colliding with either.
+            Chip::CancelUpload => 'k',
         }
     }
 
@@ -60,6 +76,7 @@ impl Chip {
             Chip::Open => "Open",
             Chip::Resend => "Resend",
             Chip::Reveal => "Reveal",
+            Chip::CancelUpload => "Cancel upload",
         }
     }
 }

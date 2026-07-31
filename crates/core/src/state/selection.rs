@@ -42,6 +42,7 @@ use crate::model::ids::{ChatId, FileId, MessageId};
 use crate::model::key::Key;
 use crate::model::message::{MessageCaps, MessageContent, MessageView, SendState};
 use crate::state::auth::InputField;
+use crate::state::composer;
 use crate::state::conversation::{self, ConversationState};
 use crate::state::focus::{Focus, ModalKind};
 use crate::state::media::{self, MediaState};
@@ -373,6 +374,12 @@ fn chips_for_message(
     if !send_failed && conversation::has_unrevealed_spoiler(msg, revealed_spoilers) {
         chips.push(Chip::Reveal);
     }
+    // Not gated on `send_failed`, unlike `Reveal` above: an upload that is
+    // still tracked is precisely what a user wants to abandon, and a failed
+    // send otherwise offers only `Resend`. See `Chip::CancelUpload`'s docs.
+    if media.uploads.contains_key(&msg.id) {
+        chips.push(Chip::CancelUpload);
+    }
     chips
 }
 
@@ -464,6 +471,18 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
         // for a message that no longer has anything left to reveal.
         Chip::Reveal => {
             let effects = conversation::reveal_spoilers(app, chat_id, message_id);
+            recompute_chips(app, chat_id, message_id);
+            effects
+        }
+        // `cancel_upload` drops the tracked entry synchronously and asks
+        // TDLib to delete the optimistic message — there is no cancel-upload
+        // RPC, so deleting the message it belongs to is the cancellation
+        // (`composer::cancel_upload`). The row is re-derived here for the
+        // same reason `Reveal` does it: the local fact that gated the chip
+        // is gone the instant it runs, and nothing comes back from TDLib to
+        // trigger a fresh derivation.
+        Chip::CancelUpload => {
+            let effects = composer::cancel_upload(app, message_id);
             recompute_chips(app, chat_id, message_id);
             effects
         }
@@ -1329,6 +1348,7 @@ mod tests {
                 id: FileId(7),
                 expected_size: 10,
                 downloaded_size: 10,
+                uploaded_size: 0,
                 is_downloading: false,
                 is_completed: true,
                 local_path: Some(PathBuf::from("/tmp/photo.jpg")),
@@ -1375,6 +1395,48 @@ mod tests {
         // The failed corpse is gone, and so is the selection pointing at it.
         assert!(app.conversations[&CHAT].messages.is_empty());
         assert!(app.conversations[&CHAT].selection.is_none());
+    }
+
+    /// Spec §452 says uploads "are cancellable". `composer::cancel_upload`
+    /// had been complete and unit-tested since it was written, with no
+    /// caller — this is the affordance that reaches it.
+    #[test]
+    fn cancel_upload_is_offered_while_an_upload_is_tracked_and_not_after() {
+        let mut app = with_messages(vec![msg(1)]);
+        media::start_upload(&mut app, MessageId(1), CHAT, 1_000);
+        enter(&mut app);
+        assert!(
+            selection(&app).chips.contains(&Chip::CancelUpload),
+            "expected CancelUpload in {:?}",
+            selection(&app).chips
+        );
+
+        let effects = handle_key(&mut app, Key::Char('k')).expect("CancelUpload answers to 'k'");
+
+        // No cancel-upload RPC exists, so cancelling is deleting the
+        // optimistic message the upload belongs to, un-revoked because the
+        // other side never saw it (`composer::cancel_upload`).
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Td(TdRequest::DeleteMessages { chat_id, message_ids, revoke: false })]
+                    if *chat_id == CHAT && message_ids == &[MessageId(1)]
+            ),
+            "expected an un-revoked DeleteMessages, got {effects:?}"
+        );
+        assert!(!app.media.uploads.contains_key(&MessageId(1)));
+        // Re-derived on the spot, like Reveal: the fact that gated the chip
+        // is gone and nothing comes back from TDLib to trigger a recompute.
+        assert!(!selection(&app).chips.contains(&Chip::CancelUpload));
+    }
+
+    /// A message with nothing in flight must not offer it — otherwise the
+    /// chip row stops being "the truth about what is possible".
+    #[test]
+    fn cancel_upload_is_not_offered_without_an_upload() {
+        let mut app = with_messages(vec![msg(1)]);
+        enter(&mut app);
+        assert!(!selection(&app).chips.contains(&Chip::CancelUpload));
     }
 
     #[test]

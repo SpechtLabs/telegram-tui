@@ -348,8 +348,43 @@ pub fn complete_upload(app: &mut AppState, message_id: MessageId) {
 
 fn upsert_file(app: &mut AppState, snapshot: FileSnapshot) {
     let file_id = snapshot.id;
+    let uploaded = snapshot.uploaded_size;
     app.media.files.insert(file_id, snapshot);
+    advance_upload_for_file(app, file_id, uploaded);
     recompute_selection_chips_for_file(app, file_id);
+}
+
+/// Moves the progress bar of whichever in-flight upload owns `file_id`.
+///
+/// # Why the file id is derived rather than stored
+///
+/// TDLib reports upload progress as an ordinary `updateFile` keyed by the
+/// *file* id it assigned, and [`UploadProgress`] is keyed by the optimistic
+/// *message* id, so the two have to be joined somehow. The obvious fix — put
+/// a `file_id` on `UploadProgress` at `start_upload` — is what
+/// `App::start_tracking_upload`'s doc comment proposed, and it is the worse
+/// one: `MessageContent` already carries the file id for every uploadable
+/// kind, so storing a second copy is a denormalisation that can disagree
+/// with the message it describes. Deriving it through [`file_id_of`] keeps
+/// one fact in one place.
+///
+/// The scan costs a pass over tracked uploads, which is empty in any session
+/// that is not currently sending and rarely more than one otherwise. It
+/// mirrors [`recompute_selection_chips_for_file`] directly above, which
+/// solves the same shape of problem the same way.
+fn advance_upload_for_file(app: &mut AppState, file_id: FileId, uploaded: u64) {
+    if uploaded == 0 || app.media.uploads.is_empty() {
+        return;
+    }
+    let owner = app.media.uploads.iter().find_map(|(message_id, progress)| {
+        let convo = app.conversations.get(&progress.chat_id)?;
+        let idx = conversation::index_of(&convo.messages, *message_id)?;
+        (file_id_of(&convo.messages[idx].content) == Some(file_id)).then_some(*message_id)
+    });
+
+    if let Some(message_id) = owner {
+        progress_upload(app, message_id, uploaded);
+    }
 }
 
 /// Re-derives the chip row of every open selection (across every tracked
@@ -514,6 +549,7 @@ mod tests {
             id: FILE,
             expected_size: 1_000,
             downloaded_size: 0,
+            uploaded_size: 0,
             is_downloading: true,
             is_completed: false,
             local_path: None,
@@ -756,6 +792,7 @@ mod tests {
             id: FILE,
             expected_size: 1_000,
             downloaded_size: 1_000,
+            uploaded_size: 0,
             is_downloading: false,
             is_completed: true,
             local_path: Some(PathBuf::from("/tmp/photo.jpg")),
@@ -780,6 +817,7 @@ mod tests {
             id: FILE,
             expected_size: 1_000,
             downloaded_size: 1_000,
+            uploaded_size: 0,
             is_downloading: false,
             is_completed: true,
             local_path: Some(PathBuf::from("/tmp/photo.jpg")),
@@ -855,6 +893,92 @@ mod tests {
 
         complete_upload(&mut app, msg_id);
         assert!(!app.media.uploads.contains_key(&msg_id));
+    }
+
+    /// The bug this closes: the bar rendered and never moved.
+    ///
+    /// TDLib reports upload progress as an ordinary `updateFile`, and until
+    /// `uploaded_size` reached `FileSnapshot` there was nothing in the
+    /// domain to move it with — `view/conversation.rs` drew
+    /// `file_card_upload_line` from a `UploadProgress` frozen at whatever
+    /// `start_upload` seeded. A bar stuck at 0% for the life of an upload
+    /// reads as a stall, which is worse than showing nothing.
+    #[test]
+    fn an_update_file_push_advances_the_upload_it_belongs_to() {
+        let msg_id = MessageId(-1);
+        let mut app = app_with_messages(vec![document_message(-1, FILE)], -1);
+        start_upload(&mut app, msg_id, CHAT, 1_000);
+        assert_eq!(app.media.uploads[&msg_id].uploaded, 0);
+
+        handle_td(
+            &mut app,
+            &TdUpdate::File(FileSnapshot {
+                id: FILE,
+                expected_size: 1_000,
+                downloaded_size: 0,
+                uploaded_size: 400,
+                is_downloading: false,
+                is_completed: false,
+                local_path: None,
+            }),
+        );
+
+        assert_eq!(
+            app.media.uploads[&msg_id].uploaded, 400,
+            "an updateFile carrying uploaded bytes must move the bar of the \
+             message that owns that file"
+        );
+    }
+
+    /// The join is by file id, not "whichever upload happens to be first".
+    /// Two files in flight at once is the case a naive implementation gets
+    /// wrong, and it is reachable — nothing serialises sends.
+    #[test]
+    fn an_update_file_push_moves_only_its_own_upload() {
+        let other_file = FileId(99);
+        let mut app = app_with_messages(
+            vec![document_message(-2, other_file), document_message(-1, FILE)],
+            -1,
+        );
+        start_upload(&mut app, MessageId(-2), CHAT, 1_000);
+        start_upload(&mut app, MessageId(-1), CHAT, 1_000);
+
+        handle_td(
+            &mut app,
+            &TdUpdate::File(FileSnapshot {
+                id: FILE,
+                expected_size: 1_000,
+                downloaded_size: 0,
+                uploaded_size: 700,
+                is_downloading: false,
+                is_completed: false,
+                local_path: None,
+            }),
+        );
+
+        assert_eq!(app.media.uploads[&MessageId(-1)].uploaded, 700);
+        assert_eq!(
+            app.media.uploads[&MessageId(-2)].uploaded,
+            0,
+            "the other upload must not move on a push that is not its file"
+        );
+    }
+
+    /// A download push carries `uploaded_size: 0`, and must not reset an
+    /// upload that happens to share the file id — which a forward does.
+    #[test]
+    fn a_download_push_does_not_disturb_an_upload() {
+        let msg_id = MessageId(-1);
+        let mut app = app_with_messages(vec![document_message(-1, FILE)], -1);
+        start_upload(&mut app, msg_id, CHAT, 1_000);
+        progress_upload(&mut app, msg_id, 600);
+
+        handle_td(&mut app, &TdUpdate::File(undownloaded_snapshot()));
+
+        assert_eq!(
+            app.media.uploads[&msg_id].uploaded, 600,
+            "a push with no uploaded bytes must leave the upload alone"
+        );
     }
 
     #[test]

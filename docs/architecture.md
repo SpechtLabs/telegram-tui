@@ -371,11 +371,18 @@ pub struct MessageCaps {
     pub can_be_saved: bool,
 }
 
+/// TDLib reports download and upload progress on the same `updateFile`,
+/// from two different halves of it: `local.downloaded_size` and
+/// `remote.uploaded_size`. Both are projected here, because an outgoing
+/// message's progress bar has no other source (T68).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileSnapshot {
     pub id: FileId,
     pub expected_size: u64,
     pub downloaded_size: u64,
+    /// Bytes TDLib has uploaded so far, from `file.remote.uploaded_size`.
+    /// Zero for anything that is not being sent.
+    pub uploaded_size: u64,
     pub is_downloading: bool,
     pub is_completed: bool,
     pub local_path: Option<PathBuf>,

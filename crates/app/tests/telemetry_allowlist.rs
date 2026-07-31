@@ -1452,6 +1452,7 @@ fn session_script() -> Vec<ScriptStep> {
                 id: FILE,
                 expected_size: FILE_BYTES,
                 downloaded_size: 0,
+                uploaded_size: 0,
                 is_downloading: true,
                 is_completed: false,
                 local_path: None,

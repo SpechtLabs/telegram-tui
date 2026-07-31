@@ -117,6 +117,14 @@ pub struct FileSnapshot {
     pub id: FileId,
     pub expected_size: u64,
     pub downloaded_size: u64,
+    /// Bytes TDLib has uploaded so far, from `file.remote.uploaded_size`.
+    /// Zero for anything that is not being sent.
+    ///
+    /// Separate from `downloaded_size` because TDLib keeps them in two
+    /// different halves of the same `updateFile` — `local` and `remote` —
+    /// and a message can be neither, either, or (for a forward) both. An
+    /// outgoing message's progress bar has no other source.
+    pub uploaded_size: u64,
     pub is_downloading: bool,
     pub is_completed: bool,
     pub local_path: Option<PathBuf>,

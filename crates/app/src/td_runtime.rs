@@ -1422,6 +1422,10 @@ fn map_file(file: td_types::File) -> FileSnapshot {
         id: FileId(file.id),
         expected_size: expected.max(0) as u64,
         downloaded_size: file.local.downloaded_size.max(0) as u64,
+        // The upload half of the same update. TDLib fills this while a file
+        // is being sent and leaves it at zero otherwise, so it needs no
+        // is-uploading flag alongside it.
+        uploaded_size: file.remote.uploaded_size.max(0) as u64,
         is_downloading: file.local.is_downloading_active,
         is_completed: file.local.is_downloading_completed,
         local_path: (!file.local.path.is_empty()).then(|| PathBuf::from(&file.local.path)),
@@ -2147,6 +2151,7 @@ mod tests {
                 id: FileId(9),
                 expected_size: 2048,
                 downloaded_size: 512,
+                uploaded_size: 0,
                 is_downloading: true,
                 is_completed: false,
                 local_path: Some(PathBuf::from("/tmp/x.jpg")),
