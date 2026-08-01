@@ -184,10 +184,24 @@ jobs:
       # GITHUB_TOKEN pushes, to prevent workflow loops) — acceptable here
       # since a lock-file sync following an already-checked version bump
       # cannot change what fmt/lint/test would report.
+      # The PR JSON goes through the environment, never interpolated into the
+      # shell. `${{ }}` substitution happens before bash parses the line, so
+      # embedding that JSON in a quoted string means the changelog's own text
+      # becomes syntax. This release proved it: the 0.2.0 breaking-change note
+      # contains "a user's own OTLP collector", whose apostrophe closed the
+      # single quote and left the next `(` unquoted —
+      #
+      #   syntax error near unexpected token `('
+      #
+      # The step failed, the Cargo.lock sync below never ran, and PR #8 sat
+      # with a lock still saying 0.1.7. An env var is passed as data, so no
+      # release note can ever be parsed as code again.
       - name: Extract the release PR's branch
         id: release-branch
         if: steps.release-please.outputs.prs_created == 'true'
-        run: echo "name=$(jq -r '.headBranchName' <<< '${{ steps.release-please.outputs.pr }}')" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_PR_JSON: ${{ steps.release-please.outputs.pr }}
+        run: echo "name=$(jq -r '.headBranchName' <<< "$RELEASE_PR_JSON")" >> "$GITHUB_OUTPUT"
 
       - name: Checkout the release PR branch
         if: steps.release-please.outputs.prs_created == 'true'
