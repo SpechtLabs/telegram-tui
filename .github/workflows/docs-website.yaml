@@ -9,6 +9,19 @@ on:
       - docs/**/*
       - .markdownlint-cli2.yaml
       - .github/workflows/docs-website.yaml
+      - assets/**
+      - scripts/install.sh
+      - .mise.toml
+      # The site publishes two files that live outside docs/: install.sh and
+      # the asciinema recording, copied in by `docs-install-script` and
+      # `docs-copy-demo-cast`. Without these paths a change to either source
+      # never redeploys, so the site keeps serving the previous copy while the
+      # repository looks up to date — exactly what happened when the recording
+      # was re-cut and /demo.cast stayed on the old one. .mise.toml is listed
+      # because those two tasks are defined in it.
+      - assets/**
+      - scripts/install.sh
+      - .mise.toml
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
