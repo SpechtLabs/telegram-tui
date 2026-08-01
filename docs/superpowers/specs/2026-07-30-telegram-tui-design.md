@@ -497,10 +497,14 @@ crash_reports = true   # anonymous crash reports; on unless turned off
 # Authorization = "Basic …"
 ```
 
-The retired `mode = "vendor" | "custom" | "off"` key still loads: `off` carries
-across as `enabled = false`, the other two as `enabled = true`, each with a
-warning naming the keys that replaced it. An opt-out written years ago must not
-be quietly upgraded into telemetry being back on.
+The retired `mode = "vendor" | "custom" | "off"` key refuses to load rather than
+carrying across: any file that still sets it is rejected at load with an error
+naming the file, the value found, and the replacement to write (`enabled = false`
+for `off`; `enabled = true` for `vendor` or `custom`). Every value is refused,
+not only `off` — a check that fires for some values and not others cannot be
+documented, and a typo such as `mode = "of"` in an opt-out would otherwise read
+as consent. This is the one config key exempted from the unknown-key rule below;
+a config that never set `mode` is unaffected.
 
 Unknown keys produce a warning rather than a hard failure, so a config written by
 a newer version does not brick an older binary.

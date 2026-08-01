@@ -87,8 +87,10 @@ x-scope-orgid = "my-tenant"
 
 If you set `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_PROTOCOL` (or their `_LOGS_` variants), the client withholds its own programmatic values so the SDK resolves them, and your environment wins. That withholding is not implemented for headers, so `[telemetry.headers]` is applied even when `OTEL_EXPORTER_OTLP_HEADERS` is set. That's an inconsistency rather than a design.
 
-::: tip Upgrading from an older config
-The old `mode = "vendor" | "custom" | "off"` key still loads. `off` carries across as `enabled = false`, and the other two as `enabled = true`, each with a warning in the log naming the keys that replaced it. An opt-out you wrote once won't be quietly upgraded into telemetry being back on.
+::: warning Upgrading from an older config
+The old `mode = "vendor" | "custom" | "off"` key is gone, and a config that still sets it refuses to load rather than being carried across automatically. The error names the file, the value it found, and the line to write instead — `enabled = false` for `mode = "off"`, `enabled = true` for `mode = "vendor"` or `mode = "custom"`.
+
+That refusal exists because the quieter alternative was tried and measured, not assumed to be fine: with the compatibility shim removed and nothing else in its place, `mode = "off"` loaded as `enabled = true` — an explicit opt-out silently becoming consent, with the only record of it a line in a log file nobody has reason to read. Every value under `mode` is refused, not only `off`, since a diagnostic that only sometimes appears can't be documented or predicted, and a typo like `mode = "of"` in an opt-out would otherwise read as consent too. If you never set `mode`, which is almost everyone, this changes nothing.
 :::
 
 ## The pseudonymous install id

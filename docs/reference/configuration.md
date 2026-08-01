@@ -27,7 +27,9 @@ The last two are master switches, so they silence crash reports and OTLP export 
 
 An unrecognised section, or an unrecognised key inside a known section, produces a warning in the log and is ignored. A config written by a newer build won't brick an older one. (`[telemetry.headers]` is exempt from the check, since it's a free-form map.)
 
-A key with the *wrong type* is a hard error, with a message naming the key: `[app].mouse must be a boolean`. Unrecognised enum values are soft. The retired `[telemetry].mode` is the one you'll still meet in an older file: `off` carries across as `enabled = false`, `vendor` and `custom` as `enabled = true`, both with a deprecation warning naming the keys that replaced it. A `mode` value that's none of those warns and is ignored outright, with no fallback. When a file sets both `mode` and `enabled`, `enabled` wins.
+A key with the *wrong type* is a hard error, with a message naming the key: `[app].mouse must be a boolean`. Unrecognised enum values are soft. `[telemetry].mode` is the one exception to "unknown keys warn, they don't fail": a file that still sets it — any value, present at all — refuses to load rather than starting with a warning. The error names the file, the value it found, and what to write instead (`enabled = false` for `mode = "off"`, `enabled = true` for `mode = "vendor"` or `"custom"`). Setting both `mode` and `enabled` is refused the same way; `mode`'s mere presence is what triggers it, regardless of what else is in the section.
+
+That's a deliberate exception, not an oversight: the ordinary "warn and skip" path was measured before being ruled out, not assumed unsafe. With no check at all, `mode = "off"` loaded as `enabled = true` — an explicit opt-out silently becoming consent, recorded nowhere a user would see it. Every `mode` value is refused, not only `off`, since a diagnostic that only fires for some values can't be documented or predicted, and `mode = "of"` — a typo in an opt-out — would otherwise read as consent. A config that never set `mode` is unaffected, which is nearly every config.
 
 ## Saving
 
