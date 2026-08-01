@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.6...v0.1.7) (2026-08-01)
+
+
+### Bug Fixes
+
+* **release:** stop a repair from downgrading Homebrew, guard against stale runs ([af28cb2](https://github.com/SpechtLabs/telegram-tui/commit/af28cb2e923e6c9aa5cd059703d6385d3ff6120c))
+
 ## [0.1.6](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.5...v0.1.6) (2026-07-31)
 
 
