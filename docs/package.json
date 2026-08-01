@@ -41,6 +41,7 @@
   },
   "dependencies": {
     "@vue/component-compiler-utils": "^3.3.0",
+    "asciinema-player": "^3.17.0",
     "lru-cache": "^11.5.2",
     "markdown-it-emoji": "^3.1.0",
     "mermaid": "^11.16.0",

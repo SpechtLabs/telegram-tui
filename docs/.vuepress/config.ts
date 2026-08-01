@@ -108,7 +108,16 @@ export default defineUserConfig({
           const rows = attrs.rows ? Number.parseInt(attrs.rows, 10) : 16;
           const rowsAttr = Number.isFinite(rows) ? ` :rows="${rows}"` : "";
           const titleAttr = title ? ` title="${title}"` : "";
-          return `\n<AsciinemaCast src="${src}"${titleAttr}${rowsAttr} />\n`;
+          // ClientOnly, not a bare <AsciinemaCast>: the real player (#77)
+          // does browser-only work (DOM event delegation) at module-import
+          // time, not just inside onMounted, so importing it at all crashes
+          // VuePress's SSR pass in Node — confirmed by watching `mise run
+          // docs-build` throw from inside asciinema-player's own module
+          // during "Rendering N pages" and, worse, still exit 0 and produce
+          // a page with nothing where the player should be. ClientOnly
+          // skips SSR for its children entirely and mounts them only in the
+          // browser, which is where a terminal player belongs anyway.
+          return `\n<ClientOnly><AsciinemaCast src="${src}"${titleAttr}${rowsAttr} /></ClientOnly>\n`;
         }
         return "\n";
       },

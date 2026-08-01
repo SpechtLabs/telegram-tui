@@ -42,6 +42,14 @@ config:
         icon: mdi:test-tube
         details: update() does no I/O and reads no clock, so the whole client replays from recorded TDLib sessions with no network and no account. Rendering is pinned by insta snapshots.
 
+  # vuepress-theme-plume's "home" layout renders *only* the blocks listed
+  # here — everything below the frontmatter is markdown body, which the
+  # layout otherwise drops entirely. `type: custom` is the block that
+  # renders it (VPHomeCustom.vue: `<Content vp-content />`), confirmed by
+  # reading the theme's own component rather than assumed: without this
+  # entry the ASCII mockup, the recording, and everything else written
+  # below this frontmatter block was never reachable on the live site,
+  # predating this task and unrelated to the player itself (#77).
   - type: custom
 
   - type: VPReleases
