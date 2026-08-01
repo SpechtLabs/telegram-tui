@@ -57,6 +57,11 @@ sha2 = { workspace = true }
 # `tgt update` stages a download before swapping it in. Already a dev-
 # dependency below; promoted because the update path is a real one.
 tempfile = "=3.27.0"
+# `--demo` (crate::demo) renders its placeholder cat photo to a real PNG on
+# disk, since inline image rendering resolves a file path, not pixels in
+# memory. Same exact version tgt-ui already resolves, so this shares one copy
+# of the crate rather than adding a second.
+image = "=0.25.10"
 sentry = { version = "=0.48.5", default-features = false, features = ["panic", "backtrace", "contexts", "debug-images", "release-health", "reqwest", "rustls"] }
 # The OTLP stack `tracing-batteries` also wraps, driven directly: its
 # `OpenTelemetry` battery installs its own global subscriber and filters only

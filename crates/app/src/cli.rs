@@ -1,6 +1,6 @@
 //! `clap` CLI surface (docs/architecture.md §2.3): `tgt`, `--no-telemetry`,
-//! and the `tgt telemetry show|reset-id` subcommand. `--version` comes for
-//! free from clap's derive.
+//! `--demo`, and the `tgt telemetry show|reset-id` subcommand. `--version`
+//! comes for free from clap's derive.
 
 use clap::{Parser, Subcommand};
 
@@ -15,8 +15,30 @@ pub struct Cli {
     #[arg(long)]
     pub no_telemetry: bool,
 
+    /// Run against a scripted, offline, in-memory chat history instead of a
+    /// real Telegram account — for demos and screen recordings. Never reads
+    /// or writes the real config, Keychain entry or TDLib database, and never
+    /// opens a socket (see `crate::demo` module docs). Mutually exclusive
+    /// with every subcommand: there is nothing to update or inspect about a
+    /// session that never touches real credentials. Checked by
+    /// [`Self::demo_conflicts_with_subcommand`] — `clap`'s declarative
+    /// `conflicts_with` does not reach an optional `#[command(subcommand)]`
+    /// field, which generates no argument id of its own to conflict against.
+    #[arg(long)]
+    pub demo: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    /// Whether this invocation combines `--demo` with a subcommand — checked
+    /// by `main.rs::dispatch_cli` before doing anything with either. See the
+    /// doc comment on [`Self::demo`] for why this is a runtime check rather
+    /// than a `clap` attribute.
+    pub fn demo_conflicts_with_subcommand(&self) -> bool {
+        self.demo && self.command.is_some()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -148,5 +170,22 @@ mod tests {
         let cli = Cli::try_parse_from(["tgt"]).unwrap();
         assert!(!cli.no_telemetry);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_demo_flag() {
+        let cli = Cli::try_parse_from(["tgt", "--demo"]).unwrap();
+        assert!(cli.demo);
+        assert!(cli.command.is_none());
+        assert!(!cli.demo_conflicts_with_subcommand());
+    }
+
+    #[test]
+    fn demo_flag_combined_with_a_subcommand_is_flagged_as_a_conflict() {
+        // clap happily parses this (see `Cli::demo`'s doc comment for why a
+        // declarative `conflicts_with` can't catch it); `dispatch_cli` is
+        // what turns the flag below into a rejection.
+        let cli = Cli::try_parse_from(["tgt", "--demo", "telemetry", "show"]).unwrap();
+        assert!(cli.demo_conflicts_with_subcommand());
     }
 }

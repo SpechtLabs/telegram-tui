@@ -5,6 +5,7 @@
 mod cli;
 mod config;
 mod crash;
+mod demo;
 mod dispatch;
 mod graphics;
 mod keychain;
@@ -52,6 +53,20 @@ fn main() -> eyre::Result<()> {
 }
 
 fn dispatch_cli(cli: Cli) -> eyre::Result<()> {
+    // See `Cli::demo_conflicts_with_subcommand`'s doc comment for why this
+    // is a runtime check rather than a `clap` `conflicts_with` attribute.
+    if cli.demo_conflicts_with_subcommand() {
+        return Err(eyre::eyre!(
+            "--demo cannot be combined with a subcommand: a session that \
+             never touches real credentials has nothing to update or inspect"
+        ));
+    }
+    // Offline, in-memory, structurally unable to reach a real account — see
+    // `crate::demo`'s module docs.
+    if cli.demo {
+        return demo::run();
+    }
+
     // Like `telemetry show`, this never starts the TUI, so stdout is free.
     if let Some(Command::Update {
         require_signature,

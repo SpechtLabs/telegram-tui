@@ -5471,6 +5471,7 @@ dependencies = [
  "crossterm",
  "etcetera",
  "human-errors",
+ "image",
  "insta",
  "keyring",
  "opentelemetry",
