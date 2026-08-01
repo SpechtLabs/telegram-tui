@@ -95,20 +95,50 @@ detect_target() {
     printf '%s-%s' "$arch_part" "$os_part"
 }
 
-# TDLib's prebuilt Linux library is linked against LLVM's libc++, which most
-# distributions do not install by default. Catching it here beats a binary
-# that dies with "libc++.so.1: cannot open shared object file" on first run.
+# This used to warn about a missing libc++, which is bundled in the tarball
+# and patched to its own runpath (scripts/package.sh) and so is not actually
+# a requirement any more -- confirmed on a real machine with zero system
+# libc++, which installed and ran fine. What that same round of testing
+# found instead: a real glibc floor. The prebuilt TDLib and the bundled
+# libc++ both carry glibc symbol versions from the newest GitHub-hosted
+# runners the release build ran on, currently 2.39, and there is no build
+# configuration that lowers it -- it comes from what TDLib itself links
+# against, not from how tgt is compiled. Below that floor the binary does
+# not start at all ("version `GLIBC_2.39' not found"), confirmed on real
+# aarch64 Debian 12 hardware (glibc 2.36).
+#
+# This check is advisory, not a gate, for the same reason the libc++ one it
+# replaced should have been: `getconf` reporting something this parser
+# doesn't recognise (no GNU_LIBC_VERSION at all, e.g. musl on Alpine; or an
+# unparseable value) is a reason to stay quiet, not to guess. The
+# `--version` probe after install is the real backstop regardless -- it
+# already fails and rolls back correctly on too-old glibc, which is how
+# this was found in the first place. Skipping straight to that probe would
+# work too; this just saves a download and an extraction on the way to the
+# same answer.
 check_linux_runtime() {
     [ "$(uname -s)" = "Linux" ] || return 0
-    if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libc++\.so\.1'; then
+
+    glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | cut -d' ' -f2)" || return 0
+    [ -n "$glibc" ] || return 0
+
+    major="$(printf '%s' "$glibc" | cut -d. -f1)"
+    minor="$(printf '%s' "$glibc" | cut -d. -f2)"
+    case "$major" in '' | *[!0-9]*) return 0 ;; esac
+    case "$minor" in '' | *[!0-9]*) return 0 ;; esac
+
+    if [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 39 ]; }; then
         return 0
     fi
+
     warn ""
-    warn "note: libc++ does not appear to be installed."
-    warn "      TDLib's prebuilt library needs it, and tgt will fail to start without it:"
-    warn "        Debian/Ubuntu:  sudo apt install libc++1 libc++abi1"
-    warn "        Fedora:         sudo dnf install libcxx libcxxabi"
-    warn "      Installing anyway; fix this before running tgt."
+    warn "note: this machine reports glibc $glibc; tgt's prebuilt TDLib needs 2.39 or newer"
+    warn "      and will very likely fail to start (\"version 'GLIBC_2.39' not found\")."
+    warn "      Confirmed working: Ubuntu 24.04+, Debian 13 (trixie)."
+    warn "      Confirmed NOT working: Debian 12, Ubuntu 22.04 LTS, RHEL/Rocky 9."
+    warn "      Building tgt from source does not help: it links the same prebuilt"
+    warn "      TDLib, which carries this floor no matter who compiles tgt itself."
+    warn "      Installing anyway; the version check right after install will confirm either way."
     warn ""
 }
 
@@ -321,7 +351,7 @@ Refusing to install. Please report this."
             die "the newly installed tgt could not start; your previous install has been restored."
         fi
         die "the newly installed tgt could not start, and there was no previous install to restore.
-On Linux this is usually the missing libc++ noted above."
+On Linux this is usually the glibc floor noted above (2.39 or newer required)."
     fi
     [ -e "$previous" ] && rm -rf "$previous"
 

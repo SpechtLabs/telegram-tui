@@ -54,10 +54,18 @@ has used the client there — its loader has no equivalent of the relocatable
 `bin/` + `lib/` layout the other two rely on, so there is nothing to publish.
 If you try it anyway, please open an issue about what broke.
 
-Two things to know on Linux. The prebuilt TDLib is linked against LLVM's
-libc++, so you need `libc++1` (and `libc++abi1`) installed or the binary will
-not start — the install script checks and tells you. The credential store also
-needs a running Secret Service provider, such as gnome-keyring.
+Two things to know on Linux. First, a real floor: **glibc 2.39 or newer**.
+TDLib publishes only a prebuilt library — this project links against it
+rather than compiling TDLib itself, on every install route including from
+source — and that prebuilt binary carries its own glibc requirement no build
+configuration on our end can lower. Confirmed working: Ubuntu 24.04+, Ubuntu
+24.10, Debian 13 (trixie). Confirmed *not* working: Debian 12 bookworm — the
+current Debian stable — Ubuntu 22.04 LTS, and RHEL/Rocky 9. Below 2.39 the
+binary won't start at all (`version 'GLIBC_2.39' not found`), on a source
+build the same as on a release tarball, since the same download runs either
+way. The install script checks and tells you before it downloads anything.
+Second, the credential store needs a running Secret Service provider, such as
+gnome-keyring.
 
 ## Install
 
@@ -102,7 +110,7 @@ The install script and building from source lay the tree out the same way: a pri
 
 Once installed via the script or from source, `tgt update` replaces it with the latest release: it refuses if the install isn't a private tree it owns (Homebrew, or a legacy shared prefix), keeps the old one until the new binary has proved it starts, and reports exactly what it verified. `tgt update --require-signature` refuses unless the release's cosign signature verifies against this project's release workflow — that needs `cosign` installed, which is why it's opt-in rather than the default.
 
-On Linux you also need libc++ at runtime (`libc++1` and `libc++abi1` on Debian/Ubuntu); the installer checks and tells you.
+On Linux, see the [glibc 2.39 floor](#platforms) above — it applies here too, since building from source downloads the same prebuilt TDLib the release tarball ships.
 
 Building needs [mise](https://mise.jdx.dev) and nothing else. TDLib arrives through `tdlib-rs`'s `download-tdlib` feature during the build: no Homebrew, no system TDLib, no cmake and gperf and a C++ toolchain. The first build fetches it and takes a while; later builds don't.
 

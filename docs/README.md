@@ -51,7 +51,7 @@ config:
 
 ## Pre-1.0, and macOS is the platform that's actually been used
 
-Release tarballs are built for macOS and Linux, on both Apple Silicon/Intel and x86_64/aarch64 — `brew install spechtlabs/tap/tgt`, the [install script](/getting-started/installation), or a tarball off the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) all work on either. Windows compiles and passes the test suite in CI but ships no artifact at all — its loader has no equivalent of the relocatable layout the other two rely on — and nobody has run the client on Linux or Windows day to day, so treat both as experimental outside of macOS and please [report what breaks](https://github.com/SpechtLabs/telegram-tui/issues/new/choose).
+Release tarballs are built for macOS and Linux, on both Apple Silicon/Intel and x86_64/aarch64 — `brew install spechtlabs/tap/tgt`, the [install script](/getting-started/installation), or a tarball off the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) all work on either. Linux needs glibc 2.39 or newer — Ubuntu 24.04+ and Debian 13 clear it, Debian 12 and Ubuntu 22.04 LTS don't, and building from source doesn't route around it, since TDLib ships only as a prebuilt library with the same requirement either way; see [Installation](/getting-started/installation) for the full list. Windows compiles and passes the test suite in CI but ships no artifact at all — its loader has no equivalent of the relocatable layout the other two rely on — and nobody has run the client on Linux or Windows day to day, so treat both as experimental outside of macOS and please [report what breaks](https://github.com/SpechtLabs/telegram-tui/issues/new/choose).
 
 ## What using it looks like
 
