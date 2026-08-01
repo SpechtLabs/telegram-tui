@@ -14,6 +14,16 @@
 #   README/docs pass — see that work's own notes on this). Whoever wires up
 #   the README/docs embed may move it; this script only produces the file
 #   and does not assume where it ends up.
+#
+# The photo renders as the design-language text card ("🖼 photo · ... · ⏎
+# open"), never as an actual picture — and that is correct, not a gap to
+# close by re-running this from a graphics-capable terminal. The asciinema
+# web player replays a plain byte stream into a browser canvas; it speaks no
+# terminal graphics protocol at all (not Kitty, not iTerm2, not Sixel).
+# Recording on Ghostty would make `tgt` emit Kitty escape sequences the
+# player cannot interpret, which get dropped or render as garbage — a worse
+# artifact than the honest fallback this script already produces. Showing
+# off inline rendering needs a screenshot or a video, not this script.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,6 +33,12 @@ out="${1:-assets/demo.cast}"
 mkdir -p "$(dirname "$out")"
 rm -f "$out"
 
+# 110 is a floor, not a preference: it's the smallest width that clears
+# `[app] layout_breakpoint_cols` (default 100, see config.rs), which is what
+# puts the sidebar and the conversation on screen together. Below it the
+# recording would fall back to the single-pane stack and undersell the
+# layout. 30 rows keeps the whole thing compact enough to read at typical
+# README/docs embed widths without a diagonal-scrolling player.
 cols=110
 rows=30
 session="tgt-demo-record-$$"
