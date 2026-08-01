@@ -210,14 +210,24 @@ description = "Copy scripts/install.sh into the docs site so it is served at /in
 # https://tgt.specht-labs.de/install.sh — the URL the README advertises.
 run = "cp scripts/install.sh docs/.vuepress/public/install.sh"
 
+[tasks.docs-copy-demo-cast]
+description = "Copy assets/demo.cast into the docs site so the \"cast\" container can fetch it"
+# Same reasoning as docs-install-script, one source of truth: assets/demo.cast
+# is canonical, this copies it in, and docs/.vuepress/public/ is gitignored
+# for the copy so nobody edits it in place. AsciinemaCast.vue loads its `src`
+# with a runtime `fetch()`, not a build-time import, so the file has to be
+# reachable as a static asset under the site root — `base` is "/", so it
+# lands at https://tgt.specht-labs.de/demo.cast.
+run = "cp assets/demo.cast docs/.vuepress/public/demo.cast"
+
 [tasks.docs-dev]
 description = "Serve the documentation website locally with hot reload"
-depends = ["docs-install-script"]
+depends = ["docs-install-script", "docs-copy-demo-cast"]
 run = "cd docs && bun install && bun run dev"
 
 [tasks.docs-build]
 description = "Build the documentation website (the docs workflow's second job)"
-depends = ["docs-install-script"]
+depends = ["docs-install-script", "docs-copy-demo-cast"]
 run = "cd docs && bun install --frozen-lockfile && bun run build"
 
 [tasks.update-gha]

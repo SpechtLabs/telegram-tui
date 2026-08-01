@@ -74,11 +74,10 @@ Release tarballs are built for macOS and Linux, on both Apple Silicon/Intel and 
  ↑↓ move   ⏎ open   ctrl+p palette   ? help
 ```
 
-<!--
-  Placeholder: swap for `::: cast src="..." title="..." rows=20 :::` (see
-  .vuepress/config.ts's "cast" container) once --demo mode exists to record
-  against. Leave the static mockup above until then.
--->
+::: cast src="/demo.cast" title="tgt — folders, a reply, a reaction, and revealing a spoiler" rows=30
+:::
+
+Recorded with `tgt --demo`, which runs the real client against a scripted, offline chat history instead of a Telegram account — no real conversation was recorded or risked to make this. What you're watching: the chat list with real folder tabs and unread badges, opening a chat with a reply quote and a reaction already on screen, then selection mode walking up to a spoiler and revealing it with `v`. The photo shows as its text card rather than an inline image on purpose — this player speaks no terminal graphics protocol, so that card is what a plain terminal actually shows.
 
 Press `↑` on an empty composer and the newest message highlights; the hint bar turns into a chip row for whatever that message supports. Below 100 columns the two panes collapse into a single-pane stack drawn by the same components, so nothing new has to be learned at a narrow width.
 

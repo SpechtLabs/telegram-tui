@@ -27,11 +27,7 @@ Built on TDLib and [ratatui](https://ratatui.rs), the binary is called `tgt`. Th
  ↑↓ move   ⏎ open   ctrl+p palette   ? help
 ```
 
-<!--
-  Placeholder: this static mockup gets a real asciinema recording alongside
-  it (or in its place) once --demo mode exists to record against without
-  exposing a real account. Leave the mockup until then.
--->
+**[▶ Watch it running](https://tgt.specht-labs.de/#what-using-it-looks-like)** — a short recording of the chat list, a reply, a reaction, and revealing a spoiler, made with `tgt --demo` against mock data rather than a real account. GitHub can't play it inline, so it lives on the docs site.
 
 Press `↑` on an empty composer and you're in selection mode: the newest message highlights and the hint bar becomes a chip row like `‹ [R Reply] [F Forward] [E React] [C Copy] [D Delete] ›`. Which chips appear comes from TDLib's per-message capability flags, so an action that would fail is never offered. Below 100 columns the two panes collapse into a single-pane stack rendered by the same components.
 
@@ -68,13 +64,6 @@ Second, the credential store needs a running Secret Service provider, such as
 gnome-keyring.
 
 ## Install
-
-<!--
-  Placeholder: an asciinema recording of the install → first login → send a
-  message flow goes here once the --demo mode exists to record it against.
-  Embed with `::: cast src="..." title="..." rows=20 :::` — see
-  docs/.vuepress/config.ts's "cast" container and AsciinemaCast.vue.
--->
 
 Three ways in, all equally supported.
 
