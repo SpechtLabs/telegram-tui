@@ -14,7 +14,8 @@
 //! to config") and `[consent]` (acknowledged, written on first-run consent).
 //! Unknown keys anywhere in the document produce a local `tracing::warn!`
 //! rather than a hard failure (spec §12), so a config written by a newer
-//! binary doesn't brick an older one.
+//! binary doesn't brick an older one. `reject_retired_keys` is the single
+//! deliberate exception — see its doc comment and architecture §4.4.3.
 //!
 //! # Unknown-key detection
 //!
@@ -467,6 +468,12 @@ pub fn load() -> eyre::Result<Config> {
     let mut cfg = if path.exists() {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
+        // Before `parse`, and deliberately not inside it: `?` here hands the
+        // `human_errors::Error` to eyre unwrapped, which is what lets
+        // `main::report_to_user` recognise it and print its advice. The
+        // `with_context` below would bury it — eyre's `downcast_ref` only
+        // sees the outermost error.
+        reject_retired_keys(&text, &path)?;
         parse(&text).with_context(|| format!("failed to parse {}", path.display()))?
     } else {
         // Same failure as `save()`, same message: not being able to write
@@ -496,14 +503,12 @@ fn known_keys(section: &str) -> &'static [&'static str] {
             "auto_download_photos",
         ],
         "keys" => &["palette"],
-        // `mode` is retired but still listed: it is handled explicitly in
-        // `parse` with a deprecation warning that says what replaced it,
-        // which is more use to someone with an old config than a generic
-        // "unknown key; ignoring".
+        // `mode` is deliberately absent. It is not an unknown key to be
+        // warned about and skipped — `reject_retired_keys` refuses the load
+        // outright, before this list is ever consulted.
         "telemetry" => &[
             "enabled",
             "crash_reports",
-            "mode",
             "endpoint",
             "protocol",
             "headers",
@@ -547,6 +552,63 @@ fn warn_unknown_keys(root: &toml::Table) {
             }
         }
     }
+}
+
+/// Refuses to load a config that still carries a key which was removed
+/// rather than renamed.
+///
+/// Unknown keys are warned about in the local log and skipped. That is the
+/// right default — it is what lets a config survive a downgrade — and it is
+/// exactly wrong for `[telemetry] mode`. `mode = "off"` was an opt-out.
+/// Ignoring it would start sending telemetry for someone who had explicitly
+/// turned it off, and the only record would be a line in a log file they
+/// have no reason to read. Of the ways this key could be retired, silence is
+/// the single one with no defence.
+///
+/// The refusal does not depend on the value, though only `off` carries that
+/// hazard. Two reasons: a diagnostic that appears for some values and not
+/// others cannot be predicted or documented, and `mode = "of"` — a typo in
+/// an opt-out — would otherwise be read as consent. The cost is one edit,
+/// once, by anyone still carrying the key.
+fn reject_retired_keys(text: &str, path: &std::path::Path) -> Result<(), human_errors::Error> {
+    // A syntax error belongs to `parse`, which reports it with its own
+    // message; saying nothing here leaves that path untouched.
+    let Ok(root) = toml::from_str::<toml::Table>(text) else {
+        return Ok(());
+    };
+    let Some(found) = root
+        .get("telemetry")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("mode"))
+    else {
+        return Ok(());
+    };
+
+    let meaning = match found.as_str().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if s == "off" => {
+            "Yours means telemetry is off — write `enabled = false` to keep it off."
+        }
+        Some(s) if s == "vendor" || s == "custom" => {
+            "Yours meant telemetry is on — write `enabled = true`, or `enabled = false` to turn it off."
+        }
+        _ => "Write `enabled = false` to keep telemetry off, or `enabled = true` to turn it on.",
+    };
+
+    Err(human_errors::user(
+        format!(
+            "Your configuration still sets `[telemetry] mode`, which no longer exists.\n\n  \
+             file:  {}\n  found: mode = {found}\n\n\
+             It was replaced by `enabled` (the master switch), `crash_reports` and \
+             `endpoint`. {meaning}",
+            path.display()
+        ),
+        // Reversed; `human-errors` renders advice back to front. See the note
+        // on `unwritable` below.
+        &[
+            "It is refused rather than ignored so that an opt-out cannot be lost silently.",
+            "Edit that file: replace the `mode` line under [telemetry] with `enabled`.",
+        ],
+    ))
 }
 
 /// Parses `text` into a `Config`, warning on unknown keys and erroring
@@ -598,34 +660,9 @@ fn parse(text: &str) -> eyre::Result<Config> {
     }
 
     if let Some(tel) = root.get("telemetry").and_then(toml::Value::as_table) {
-        // Read before `enabled` so the new key wins when both are present.
-        // The only value worth carrying across is `off`: it is an opt-out,
-        // and silently turning telemetry back on for someone who wrote it is
-        // the one migration outcome that would be indefensible. `vendor` and
-        // `custom` both meant "on" and both map to `enabled = true`, with the
-        // difference between them now expressed by whether `endpoint` is set.
-        if let Some(v) = tel.get("mode") {
-            let s = v
-                .as_str()
-                .ok_or_else(|| eyre::eyre!("[telemetry].mode must be a string"))?;
-            match parse_telemetry_switch(s) {
-                Some(mode) => {
-                    cfg.telemetry_mode = mode;
-                    tracing::warn!(
-                        mode = %s,
-                        "[telemetry].mode is no longer used; it has been replaced by \
-                         `enabled` (master switch), `crash_reports` (crash reporting) and \
-                         `endpoint` (your own OTLP collector). Your setting was carried over; \
-                         the key will be dropped from the file on the next save."
-                    );
-                }
-                None => tracing::warn!(
-                    mode = %s,
-                    "unrecognized retired [telemetry].mode; ignoring it. Use `enabled` and \
-                     `crash_reports` instead."
-                ),
-            }
-        }
+        // No `mode` here: a file still carrying it never reaches this point,
+        // because `reject_retired_keys` refused the load. See its doc comment
+        // for why that is an error rather than a migration.
         if let Some(v) = tel.get("enabled") {
             let on = v
                 .as_bool()
@@ -1005,7 +1042,7 @@ mod tests {
                 some_new_field = "ignored"
 
                 [telemetry]
-                mode = "off"
+                enabled = false
             "#,
         )
         .unwrap();
@@ -1174,11 +1211,77 @@ mod tests {
         clear_related_env();
     }
 
-    /// A config written by an older binary must keep working, and — the part
-    /// that matters — an old `mode = "off"` must not be quietly upgraded
-    /// into telemetry being back on.
+    /// The retired key is refused, not ignored.
+    ///
+    /// The assertion that matters is the negative one: `load()` must not
+    /// return a `Config`. If this key were left to the unknown-key path it
+    /// would warn into the local log and return `TelemetryMode::On` — an
+    /// opt-out silently converted into consent, with nothing on screen. Every
+    /// value is refused, including the two that meant "on", because a
+    /// diagnostic that depends on the value is one nobody can predict.
     #[test]
-    fn a_retired_mode_key_still_loads_and_keeps_an_opt_out() {
+    fn a_retired_mode_key_is_refused_rather_than_silently_dropped() {
+        let _lock = lock_env();
+        clear_related_env();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by the env lock held above.
+        unsafe {
+            set_config_dir(tmp.path());
+        }
+
+        let dir = tmp.path().join("telegram-tui");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for mode in ["off", "vendor", "custom", "of"] {
+            std::fs::write(
+                dir.join("config.toml"),
+                format!("[app]\ntheme = \"midnight\"\n\n[telemetry]\nmode = \"{mode}\"\n"),
+            )
+            .unwrap();
+            let err = load().expect_err("a config still carrying `mode` must not load");
+            let human = err
+                .downcast_ref::<human_errors::Error>()
+                .unwrap_or_else(|| panic!("mode = {mode:?} must abort through the human-errors path, or main::report_to_user cannot print its advice"));
+
+            let message = human.message();
+            assert!(message.contains("mode"), "must name the key: {message}");
+            assert!(
+                message.contains("enabled"),
+                "must name the replacement: {message}"
+            );
+            assert!(
+                message.contains("config.toml"),
+                "must name the file to edit: {message}"
+            );
+            assert!(
+                human
+                    .advice()
+                    .iter()
+                    .any(|a| a.contains("replace the `mode`")),
+                "the first advice line must say what to do: {:?}",
+                human.advice()
+            );
+        }
+
+        // Both keys present is still the retired key present.
+        std::fs::write(
+            dir.join("config.toml"),
+            "[telemetry]\nmode = \"vendor\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(
+            load().is_err(),
+            "a half-migrated file must be finished rather than half-honoured"
+        );
+
+        clear_related_env();
+    }
+
+    /// Almost everybody: a config that never mentioned `mode`. Nothing about
+    /// this may change, including the unknown-key path for a key that really
+    /// is unknown — that one still warns and loads.
+    #[test]
+    fn a_config_without_the_retired_key_is_untouched() {
         let _lock = lock_env();
         clear_related_env();
         let tmp = tempfile::tempdir().unwrap();
@@ -1192,35 +1295,37 @@ mod tests {
 
         std::fs::write(
             dir.join("config.toml"),
-            "[app]\ntheme = \"midnight\"\n\n[telemetry]\nmode = \"off\"\n",
+            "[app]\ntheme = \"midnight\"\n\n[telemetry]\nenabled = false\n",
         )
         .unwrap();
-        let cfg = load().expect("an old config must still load");
-        assert_eq!(cfg.theme, "midnight", "the rest of the file still applies");
+        let cfg = load().expect("a config without `mode` must load");
+        assert_eq!(cfg.theme, "midnight");
         assert_eq!(cfg.telemetry_mode, TelemetryMode::Off);
-        assert!(!cfg.crash_reports_enabled());
 
-        // `vendor` and `custom` both meant "on" and both become `On`; what
-        // used to be the difference between them is now whether `endpoint`
-        // is set.
-        for mode in ["vendor", "custom"] {
-            std::fs::write(
-                dir.join("config.toml"),
-                format!("[telemetry]\nmode = \"{mode}\"\n"),
-            )
-            .unwrap();
-            let cfg = load().expect("an old config must still load");
-            assert_eq!(cfg.telemetry_mode, TelemetryMode::On, "mode = {mode:?}");
-        }
+        // An empty telemetry section, and no telemetry section at all.
+        std::fs::write(dir.join("config.toml"), "[telemetry]\n").unwrap();
+        assert_eq!(
+            load().expect("an empty section must load").telemetry_mode,
+            TelemetryMode::On
+        );
+        std::fs::write(dir.join("config.toml"), "[app]\ntheme = \"midnight\"\n").unwrap();
+        assert_eq!(
+            load()
+                .expect("no telemetry section must load")
+                .telemetry_mode,
+            TelemetryMode::On
+        );
 
-        // The new key wins when a half-migrated file carries both.
+        // A genuinely unknown key keeps the old, lenient treatment.
         std::fs::write(
             dir.join("config.toml"),
-            "[telemetry]\nmode = \"vendor\"\nenabled = false\n",
+            "[telemetry]\nenabled = false\nsomething_else = 1\n",
         )
         .unwrap();
         assert_eq!(
-            load().expect("load should succeed").telemetry_mode,
+            load()
+                .expect("an unknown key must still be warned about and skipped")
+                .telemetry_mode,
             TelemetryMode::Off
         );
 

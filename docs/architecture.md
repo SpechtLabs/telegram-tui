@@ -114,7 +114,7 @@ is a candidate for editing.
 |---|---|
 | `main.rs` | Entry: CLI parse, config load, panic hook, consent gating, terminal setup/teardown |
 | `cli.rs` | `clap` definitions: `tgt`, `--no-telemetry`, `tgt telemetry show|reset-id` |
-| `config.rs` | TOML config load/generate (`etcetera` paths), unknown-key warnings, `ConfigPatch` application, the fatal-write error |
+| `config.rs` | TOML config load/generate (`etcetera` paths), unknown-key warnings, the retired-key refusal (§4.4.3), `ConfigPatch` application, the fatal-write error |
 | `keychain.rs` | 32-byte DB encryption key via `keyring` (macOS Keychain); generate-on-first-run |
 | `runtime_loop.rs` | The `tokio::select!` main loop: action channel, terminal events, tick, coalesced draw, fatal-error return |
 | `dispatch.rs` | `Effect` → async execution; completion re-enters as `Action::TdResult`/`Action::Io` |
@@ -746,6 +746,31 @@ it is complete on its own. A signed-in client that closes needs `AppState`
 cleared first, which needs a core action that does not exist yet (task #64).
 Restarting without it would render a signed-out user's chat list against a
 fresh unauthenticated client.
+
+### 4.4.3 A retired config key is refused, not ignored (0.2.0)
+
+Unknown keys in `config.toml` produce a local `tracing::warn!` and are skipped,
+so a file written by a newer binary does not brick an older one (spec §12).
+`config::reject_retired_keys` is the one deliberate exception, and it runs in
+`load()` *before* `parse` — a load carrying `[telemetry] mode` fails with a
+`human_errors::Error` naming the file, the value found, and the key to write
+instead.
+
+The exception exists because the lenient rule inverts a user's answer here
+rather than merely losing a preference. `mode = "off"` was an opt-out; treating
+it as unknown yields `TelemetryMode::On` — measured, not assumed, by removing
+the check and asserting on the result — so telemetry would start for someone
+who had explicitly turned it off, recorded only in a log file they have no
+reason to read. Every value is refused, not just `off`, because a diagnostic
+that depends on the value cannot be predicted or documented, and `mode = "of"`
+would otherwise read as consent.
+
+Two placement details are load-bearing. The check sits in `load()` rather than
+`parse` because `load` wraps `parse` in `with_context`, and eyre's
+`downcast_ref` only inspects the outermost error — wrapped, the error would
+reach `main::report_to_user` unrecognised and print as a generic report without
+its advice. And `load()` is called before raw mode is entered, so this reuses
+§4.4.1's abort path rather than introducing a second one.
 
 ### 4.5 Focus — `core/src/state/focus.rs`
 
