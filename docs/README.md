@@ -5,7 +5,7 @@ externalLinkIcon: false
 config:
   - type: doc-hero
     hero:
-      name: Telegram YUI
+      name: Telegram TUI
       text: A keyboard-driven Telegram client for the terminal
       tagline: Two modifier chords in the whole application. Every action a message supports is a labelled chip on screen, not a shortcut you had to read about first.
       image: /images/SpechtLabsLogo.svg
