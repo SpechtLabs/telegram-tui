@@ -87,8 +87,49 @@ tmux send-keys -t "$session" v
 wait_for "hunter2, don't tell anyone"
 sleep 1.6
 
+# Back down to the newest message before leaving selection mode. Escape
+# does NOT reset scroll to `Scroll::Bottom` on its own — only landing
+# selection on the newest loaded message does (state::conversation's
+# module docs: "Selecting the newest loaded message re-pins to
+# Scroll::Bottom"), and the spoiler is two messages up from it. Skip this
+# and the conversation stays anchored where the spoiler was: the two sends
+# below still work (`FakeTd` answers them regardless of what's on screen),
+# but the newly sent messages render off the anchored viewport, which is
+# just as invisible in the recording as no send happening at all — this bit
+# the first version of this script, verified live before it did.
+tmux send-keys -t "$session" Down
+sleep 0.3
+tmux send-keys -t "$session" Down
+sleep 0.3
+
 tmux send-keys -t "$session" Escape
-sleep 0.6
+# Waits for the composer's own hint bar rather than a blind sleep: proof
+# focus is back on it (and not, say, still mid-redraw from the reveal)
+# before typing — `asciinema record`'s extra pty hop is slower than driving
+# the binary directly, and a typed string that lands before the composer is
+# ready is silently dropped rather than queued.
+wait_for "alt+⏎ newline"
+sleep 0.5
+
+# Two live sends, so the composer's real Sending -> Sent transition plays
+# out. The gap between them is what makes the "⋯" -> "✓" flip on message #1
+# visible at all — see demo/script.rs's module docs ("Showing Sending ->
+# Sent without racing FakeTd's own timing") for why it has to be two
+# messages rather than one message plus a timed confirmation.
+tmux send-keys -t "$session" -l "Recording this for the docs — thanks for reviewing! 🎬"
+wait_for "Recording this for the docs" 25
+sleep 0.4
+tmux send-keys -t "$session" Enter
+wait_for "🎬 ⋯"
+sleep 1.3
+
+tmux send-keys -t "$session" -l "Back in a bit 👋"
+wait_for "Back in a bit" 25
+sleep 0.4
+tmux send-keys -t "$session" Enter
+wait_for "🎬 ✓"
+sleep 1.2
+
 tmux send-keys -t "$session" C-c
 
 # `tgt --demo` exits, which ends `asciinema record`'s wrapped command and
