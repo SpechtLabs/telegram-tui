@@ -15,7 +15,7 @@ $ brew install spechtlabs/tap/tgt
 
 :::
 
-Works on macOS and Linux. The formula lives at [SpechtLabs/homebrew-tap](https://github.com/SpechtLabs/homebrew-tap) and lays the tree out under `libexec` the same way the install script does — `bin/` + `lib/` as siblings, the binary loading TDLib through a runpath relative to itself.
+Works on macOS and Linux. The formula lives at [SpechtLabs/homebrew-tap](https://github.com/SpechtLabs/homebrew-tap) and lays the tree out under `libexec` the same way the install script does: `bin/` + `lib/` as siblings, the binary loading TDLib through a runpath relative to itself.
 
 Updates go through `brew upgrade tgt`, not `tgt update`: brew tracks its own files in a manifest, and `tgt update` checks for exactly this and refuses rather than overwriting something it would desynchronise.
 
@@ -42,21 +42,21 @@ installed tgt 0.1.5
 
 :::
 
-It detects your OS and architecture, refuses clearly on anything without a published build, and keeps your previous install until the new binary has proved it can start — a failed upgrade puts the working one back rather than leaving you with neither.
+It detects your OS and architecture, refuses clearly on anything without a published build, and keeps your previous install until the new binary has proved it can start. A failed upgrade puts the working one back rather than leaving you with neither.
 
 `TGT_INSTALL_ROOT` and `TGT_BIN_DIR` override where the tree and the symlink go.
 
 ::: warning What the script verifies, and what that is worth
-It checks the tarball against `SHA256SUMS` when the release published one, and says so when it didn't — v0.1.4 shipped without it. Take that check for what it is: the sums file comes from the same host over the same connection as the tarball, so it catches a corrupted download and nothing more. Anyone able to serve you a modified tarball can serve you a matching sums file.
+It checks the tarball against `SHA256SUMS` when the release published one, and says so when it didn't. v0.1.4 shipped without it. Take that check for what it is: the sums file comes from the same host over the same connection as the tarball, so it catches a corrupted download and nothing more. Anyone able to serve you a modified tarball can serve you a matching sums file.
 
 The signature that means more is the cosign bundle beside every release. The script doesn't verify it, because almost nobody has cosign installed and a check that usually can't run is not a check. If you want that guarantee, verify by hand before installing, or use `tgt update --require-signature` once you're on 0.1.5 or later.
 :::
 
-Piping a script into a shell is worth being uneasy about. [Read it first](https://tgt.specht-labs.de/install.sh) — it's the same file the repo ships at `scripts/install.sh`, copied into the site at build time so the two cannot drift.
+Piping a script into a shell is worth being uneasy about. [Read it first](https://tgt.specht-labs.de/install.sh): it's the same file the repo ships at `scripts/install.sh`, copied into the site at build time so the two cannot drift.
 
 ## From a release tarball
 
-Releases are on the [releases page](https://github.com/SpechtLabs/telegram-tui/releases), one tarball per target — `tgt-<version>-aarch64-apple-darwin.tar.gz`, `tgt-<version>-x86_64-apple-darwin.tar.gz`, `tgt-<version>-x86_64-unknown-linux-gnu.tar.gz`, `tgt-<version>-aarch64-unknown-linux-gnu.tar.gz` — with a `SHA256SUMS` file and a keyless cosign bundle (`.cosign.bundle`) alongside each.
+Releases are on the [releases page](https://github.com/SpechtLabs/telegram-tui/releases), one tarball per target: `tgt-<version>-aarch64-apple-darwin.tar.gz`, `tgt-<version>-x86_64-apple-darwin.tar.gz`, `tgt-<version>-x86_64-unknown-linux-gnu.tar.gz`, `tgt-<version>-aarch64-unknown-linux-gnu.tar.gz`. Each comes with a `SHA256SUMS` file and a keyless cosign bundle (`.cosign.bundle`).
 
 ::: terminal Install from a tarball (macOS)
 
@@ -90,11 +90,11 @@ $ tgt --version
 
 :::
 
-The `bin/` + `lib/` split is load-bearing on both platforms. The binary carries a runpath relative to itself — `@executable_path/../lib` on macOS, `$ORIGIN/../lib` on Linux — and loads TDLib from a shared library next to it, so the two have to stay in that relative arrangement. Moving `bin/tgt` somewhere on its own gets you a dynamic-linker error at startup, not a useful one.
+The `bin/` + `lib/` split is load-bearing on both platforms. The binary carries a runpath relative to itself (`@executable_path/../lib` on macOS, `$ORIGIN/../lib` on Linux) and loads TDLib from a shared library next to it, so the two have to stay in that relative arrangement. Moving `bin/tgt` somewhere on its own gets you a dynamic-linker error at startup, not a useful one.
 
-Both the versioned library (what the binary's load command actually names) and the unversioned alias ship in the tarball. Copy both. The Linux tarball additionally bundles TDLib's own C++ runtime (`libc++.so.1`, `libc++abi.so.1`, `libunwind.so.1`) beside it, patched to the same `$ORIGIN`-relative runpath as `libtdjson.so` itself — `scripts/package.sh` proves the moved tree resolves all four from inside itself before a release ships. Confirmed on real hardware with zero system libc++ installed: no need to apt-install `libc++1`/`libc++abi1` separately, on this route or any other.
+Both the versioned library (what the binary's load command actually names) and the unversioned alias ship in the tarball. Copy both. The Linux tarball additionally bundles TDLib's own C++ runtime (`libc++.so.1`, `libc++abi.so.1`, `libunwind.so.1`) beside it, patched to the same `$ORIGIN`-relative runpath as `libtdjson.so` itself. `scripts/package.sh` proves the moved tree resolves all four from inside itself before a release ships. Confirmed on real hardware with zero system libc++ installed: no need to apt-install `libc++1`/`libc++abi1` separately, on this route or any other.
 
-What a Linux machine does need, confirmed the same way, on a real machine that didn't have it: **glibc 2.39 or newer**. TDLib ships only as a prebuilt library — every install route here links against it rather than compiling TDLib, source builds included — and that binary carries its own glibc requirement no build configuration on this project's end can change. Ubuntu 24.04+, Ubuntu 24.10, and Debian 13 (trixie) clear it; Debian 12 bookworm (the current Debian stable), Ubuntu 22.04 LTS, and RHEL/Rocky 9 don't, and there is currently no way to run `tgt` on those without a newer OS — building from source downloads the identical prebuilt TDLib, so it doesn't route around the floor. Below it, the binary fails to start outright: `version 'GLIBC_2.39' not found`.
+Linux also needs **glibc 2.39 or newer**, confirmed the same way, on a machine that didn't have it. TDLib ships only as a prebuilt library. Every install route here links against it rather than compiling TDLib, source builds included, so that binary's own glibc requirement is fixed: no build configuration on this project's end can change it. Ubuntu 24.04+, Ubuntu 24.10, and Debian 13 (trixie) clear it. Debian 12 bookworm (the current Debian stable), Ubuntu 22.04 LTS, and RHEL/Rocky 9 don't, and there is currently no way to run `tgt` there without a newer OS: building from source downloads the identical prebuilt TDLib, so it doesn't route around the floor. Below it, the binary fails to start outright: `version 'GLIBC_2.39' not found`.
 
 ## From source
 
@@ -121,10 +121,16 @@ Earlier versions scattered the binary and the dylib into `$TGT_PREFIX/{bin,lib}`
 
 The first build downloads TDLib and takes a while. Later builds don't.
 
-To run without installing, `mise run run` builds and starts the client from source. `mise run uninstall` removes the current private tree from `$TGT_INSTALL_ROOT`/`$TGT_BIN_DIR`, and separately cleans up the legacy `$TGT_PREFIX/{bin,lib}` layout if it finds one — so an upgrade from an old install leaves nothing behind either way.
+To run without installing, `mise run run` builds and starts the client from source. `mise run uninstall` removes the current private tree from `$TGT_INSTALL_ROOT`/`$TGT_BIN_DIR`, and separately cleans up the legacy `$TGT_PREFIX/{bin,lib}` layout if it finds one, so an upgrade from an old install leaves nothing behind either way.
 
 ::: warning Linux is untested day to day; Windows ships nothing at all
-CI builds and tests the workspace on macOS, Linux and Windows, and Linux gets real release tarballs from the same build matrix macOS does — `scripts/package.sh` handles both, bundling the C++ runtime and setting `$ORIGIN` runpaths on Linux the same way it sets `@executable_path` ones on macOS. What hasn't happened is a human actually running the client day to day on Linux, or running `mise run install` there specifically (as opposed to the plain `mise run package`/`mise run test` every release and every CI run already exercises) — so treat the Linux *artifact* as real and tested, and the Linux *experience* as unverified. That artifact still needs glibc 2.39 or newer, see above — on an older distro this is that gap, not a build problem. Windows is the platform with a genuine gap: it compiles and passes CI, but ships no artifact at all — its loader has no rpath equivalent for the relocatable `bin/` + `lib/` layout above, so there's nothing to publish, and you'd be building and wiring it up entirely yourself. Bug reports are genuinely wanted either way.
+CI builds and tests the workspace on macOS, Linux, and Windows. Linux gets real release tarballs from the same build matrix macOS does: `scripts/package.sh` handles both, bundling the C++ runtime and setting `$ORIGIN` runpaths on Linux the same way it sets `@executable_path` ones on macOS.
+
+What hasn't happened is a human actually running the client day to day on Linux, or running `mise run install` there specifically, as opposed to the `mise run package`/`mise run test` every release and every CI run already exercises. Treat the Linux *artifact* as real and tested, and the Linux *experience* as unverified. That artifact still needs glibc 2.39 or newer (see above); on an older distro, that's the gap, not a build problem.
+
+Windows is the platform with a genuine gap: it compiles and passes CI but ships no artifact at all, because its loader has no rpath equivalent for the relocatable `bin/` + `lib/` layout above. There's nothing to publish, and you'd be building and wiring it up entirely yourself.
+
+Bug reports are genuinely wanted either way.
 :::
 
 ## Where it puts things

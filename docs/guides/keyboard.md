@@ -51,7 +51,7 @@ Scrolling near the top of the loaded window triggers a history page automaticall
 
 Type `/send <path>` in the composer and press <kbd>Enter</kbd>. A confirmation modal appears; <kbd>Enter</kbd> sends, <kbd>Esc</kbd> cancels. The path is expanded and checked outside the state machine, so a `~/` prefix works and a path that doesn't exist gets rejected there rather than at Telegram.
 
-Pasting or dropping a bare path does the same thing without the `/send` prefix — bracketed paste is on, so a paste that looks like a single-line path is held as the same kind of pending offer instead of landing in the input as text. [Sending files](media.md#sending-files) has the details.
+Pasting or dropping a bare path does the same thing without the `/send` prefix. Bracketed paste is on, so a paste that looks like a single-line path is held as the same kind of pending offer instead of landing in the input as text. [Sending files](media.md#sending-files) has the details.
 
 There's no file browser. The **Send file** palette command exists but is a deliberate no-op; `/send` (or pasting a path) is the only route in v1.
 
@@ -59,7 +59,7 @@ There's no file browser. The **Send file** palette command exists but is a delib
 
 Both are armed from selection mode rather than being their own modes. Pressing <kbd>r</kbd> on a message sets the composer's reply target and drops you straight back into the composer with the reply banner showing; <kbd>d</kbd> loads the message text into the composer with the caret at the end and the edit banner showing. In both cases the next <kbd>Enter</kbd> does the right thing.
 
-[Selection mode and chips](selection-mode.md) covers the rest of that surface, including Reveal (`v`, for a message with an unrevealed spoiler) and Cancel upload (`k`, for a file still uploading) — the two chips that aren't derived from a TDLib capability flag.
+[Selection mode and chips](selection-mode.md) covers the rest of that surface, including Reveal (`v`, for a message with an unrevealed spoiler) and Cancel upload (`k`, for a file still uploading), the two chips that aren't derived from a TDLib capability flag.
 
 ## What doesn't exist
 

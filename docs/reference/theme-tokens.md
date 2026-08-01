@@ -25,7 +25,7 @@ Theme files are flat TOML with no sections. Every key is optional; anything miss
 | `border` | The vertical rule between panes, the horizontal rule under the chat header, the unfocused composer box, overlay panel borders, chat-list separators |
 
 ::: tip rail_other was removed
-Older versions had a `rail_other` token that nothing read — incoming message rails take their colour from `sender_palette` instead. It's gone as of this version. A custom theme that still sets it keeps loading: unknown keys warn in the log and are ignored, so there's nothing to change unless you want the warning to stop.
+Older versions had a `rail_other` token that nothing read. Incoming message rails take their colour from `sender_palette` instead. It's gone as of this version. A custom theme that still sets it keeps loading: unknown keys warn in the log and are ignored, so there's nothing to change unless you want the warning to stop.
 :::
 
 ## `sender_palette`

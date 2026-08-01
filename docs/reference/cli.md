@@ -118,18 +118,18 @@ tgt update --require-signature
 tgt update --force
 ```
 
-`--force` installs the latest release even when it is the version already running. It is the repair for a tree that is intact enough to start but broken otherwise — a partial extraction, a missing library — which otherwise has no fix short of reinstalling by hand. It changes only the decision to proceed: the download, both verification steps, the swap, the probe and the rollback are the ones the ordinary path runs, so it is also how that sequence gets exercised without waiting for a newer release to exist.
+`--force` installs the latest release even when it is the version already running. It is the repair for a tree that is intact enough to start but broken otherwise (a partial extraction, a missing library), which otherwise has no fix short of reinstalling by hand. It changes only the decision to proceed: the download, both verification steps, the swap, the probe and the rollback are the ones the ordinary path runs, so it is also how that sequence gets exercised without waiting for a newer release to exist.
 
 If the latest published release is *older* than the version you are running, an ordinary `tgt update` refuses and says so rather than silently going backwards. `--force` installs it anyway and names it as a downgrade while it does.
 
-It refuses rather than guessing. A Homebrew install (see [Installation](../getting-started/installation.md#homebrew)) is left to `brew upgrade tgt`, because brew tracks its files in a manifest an in-place overwrite would desynchronise. Anything that isn't a private `bin/` + `lib/` tree it can identify — a legacy shared-prefix install, or a `cargo` target directory — is refused with the reinstall command, since replacing a directory it cannot identify would mean renaming and deleting whatever is there.
+It refuses rather than guessing. A Homebrew install (see [Installation](../getting-started/installation.md#homebrew)) is left to `brew upgrade tgt`, because brew tracks its files in a manifest an in-place overwrite would desynchronise. Anything that isn't a private `bin/` + `lib/` tree it can identify (a legacy shared-prefix install, or a `cargo` target directory) is refused with the reinstall command, since replacing a directory it cannot identify would mean renaming and deleting whatever is there.
 
 The swap itself is the installer's, shipped inside the tarball and run from the newly extracted copy: stage, rename, run the new `bin/tgt --version` while the old tree still exists, and put the old one back if it can't start. There is one implementation of that procedure and both the installer and the updater use it.
 
-It updates the tree the running binary lives in, and only that. If `~/.local/bin/tgt` is this tree's own symlink it is refreshed; if it points at some other install, it is left alone and the update says so. Installing takes that name over — that is what you asked for — but updating one install must not silently change which `tgt` your PATH finds.
+It updates the tree the running binary lives in, and only that. If `~/.local/bin/tgt` is this tree's own symlink it is refreshed; if it points at some other install, it is left alone and the update says so. Installing takes that name over, since that's what you asked for, but updating one install must not silently change which `tgt` your PATH finds.
 
 ::: warning What "verified" means here
-The output states exactly which checks ran. A `SHA256SUMS` match is corruption detection only — the sums file comes from the same host over the same connection as the tarball, so anyone able to serve you a modified tarball can serve you a matching digest.
+The output states exactly which checks ran. A `SHA256SUMS` match is corruption detection only. The sums file comes from the same host over the same connection as the tarball, so anyone able to serve you a modified tarball can serve you a matching digest.
 
 The cosign signature is the check that means something, and only with the signing identity pinned: given just a bundle, cosign confirms *somebody* signed the blob, not who. It runs when `cosign` is on your PATH; `--require-signature` makes its absence an error instead of a note. There is no unpinned fallback reported as verified, and a release that published neither check is reported as unverified rather than quietly installed.
 :::

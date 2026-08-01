@@ -22,7 +22,7 @@ Toolchain comes from mise: Rust 1.97.1 and cargo-insta 1.48.0, both pinned exact
 
 ## Your build sends no crash reports
 
-The Sentry DSN is read with `option_env!("TGT_SENTRY_DSN")` at compile time, and only the release workflow sets it. So anything you build — `cargo build`, `mise run install`, a fork's CI — never calls `sentry::init` at all: no panic hook, no uploader, no network attempt. Forks don't report into this project's Sentry, which is the point, and the first-run consent screen says so instead of offering to enable something the binary can't do.
+The Sentry DSN is read with `option_env!("TGT_SENTRY_DSN")` at compile time, and only the release workflow sets it. So anything you build (`cargo build`, `mise run install`, a fork's CI) never calls `sentry::init` at all: no panic hook, no uploader, no network attempt. Forks don't report into this project's Sentry, which is the point, and the first-run consent screen says so instead of offering to enable something the binary can't do.
 
 The catch is that it applies to maintainers too. If you daily-drive a binary you built yourself and want its crashes to reach the project, export the DSN before building:
 

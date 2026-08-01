@@ -94,6 +94,6 @@ There's no file picker. The **Send file** palette command is a placeholder that 
 
 ## Uploading
 
-An outgoing file shows the same kind of progress line downloads do, from the moment you confirm the send until TDLib finishes the transfer — the message card reads bytes-sent-so-far the same way the download bar reads bytes-received, both moving as real `updateFile` pushes arrive rather than jumping straight to "sent" partway through.
+An outgoing file shows the same kind of progress line downloads do, from the moment you confirm the send until TDLib finishes the transfer. The message card reads bytes-sent-so-far the same way the download bar reads bytes-received, both moving as real `updateFile` pushes arrive rather than jumping straight to "sent" partway through.
 
-If you need to abandon one mid-flight, `↑` on the composer to enter [selection mode](selection-mode.md), select the message, and its chip row offers **Cancel upload** (`k`) for as long as the transfer is still in progress — including one that's already failed to send, where the chip stays available so you can clear it out.
+If you need to abandon one mid-flight, `↑` on the composer to enter [selection mode](selection-mode.md), select the message, and its chip row offers **Cancel upload** (`k`) for as long as the transfer is still in progress, including one that's already failed to send, where the chip stays available so you can clear it out.

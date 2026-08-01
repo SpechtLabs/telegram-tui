@@ -19,7 +19,7 @@ Mouse support is on by default and can be turned off with `[app] mouse = false`.
 | Wheel | The chat list | Moves the chat-list selection, one row per step |
 | Wheel | The conversation | Scrolls one message per step |
 
-Left-clicking ordinary message *text* does nothing — that's still explicit, not an oversight: a left click has no obvious meaning there when right click already means "act on this one". The two exceptions are narrower than the message row itself: a masked spoiler run and a reply-quote line are their own smaller click targets layered on top of it, and a click that lands on one of them resolves to it rather than to the message underneath. Everywhere else on the row, left click still does nothing.
+Left-clicking ordinary message *text* does nothing. That's still explicit, not an oversight: a left click has no obvious meaning there when right click already means "act on this one". The two exceptions are narrower than the message row itself: a masked spoiler run and a reply-quote line are their own smaller click targets layered on top of it, and a click that lands on one of them resolves to it rather than to the message underneath. Everywhere else on the row, left click still does nothing.
 
 ## What doesn't respond
 

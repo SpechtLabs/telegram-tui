@@ -7,7 +7,7 @@ Most privacy promises are policies: a rule in a contributing guide saying don't 
 
 For its OpenTelemetry export, `tgt` makes the same promise a property of the type system, the macro system, and a CI gate. A leak isn't something to be careful about; it's something that doesn't compile, or gets dropped at the layer boundary, or turns CI red.
 
-For the practical controls, see [Telemetry controls](../guides/telemetry.md). This page is about why the guarantee holds — and, at the end, about the one path where it doesn't.
+For the practical controls, see [Telemetry controls](../guides/telemetry.md). This page is about why the guarantee holds. At the end, it covers the one path where it doesn't, too.
 
 ## The claim
 
@@ -113,7 +113,7 @@ let crash_reporter = acknowledged.then(|| crash::init(session_config.crash_repor
 let otel_guard = if acknowledged { install_exporter(&export_handle, &session_config, &identity) } else { None };
 ```
 
-Since the value is read from disk before the consent screen can run, your answer takes effect on the *next* start. This run sends nothing regardless of what you pick, because there's nothing to send through — no exporter, and no Sentry client, which also means no panic hook.
+Since the value is read from disk before the consent screen can run, your answer takes effect on the *next* start. This run sends nothing regardless of what you pick, because there's nothing to send through: no exporter, and no Sentry client, which also means no panic hook.
 
 The consent screen swallows every key except quit rather than passing unrecognised ones through, and the code says why: "letting an unrecognized key fall through would be the one crack that leaks a keystroke to whatever screen comes after this one."
 
@@ -127,7 +127,7 @@ A crash report gets assembled at the moment something fails, out of that failure
 
 What holds instead is weaker and worth stating precisely. Sentry is configured with `send_default_pii: false`, so no IP address or username rides along, and a `before_send` hook nulls `server_name`, which would otherwise be your machine's hostname. Breadcrumbs are built by `crash::record_action` from the same `TelemetryEvent` the OTLP path exports, so the action trail attached to a crash is allowlist-shaped even though the crash isn't. `install.id` is deliberately left off, so a crash can't be joined to a usage session. Nothing in this client formats a chat title or a message body into an error, so the strings that actually reach one are TDLib error codes and file paths.
 
-That last sentence is an observation about the current code, not a property enforced by anything. It's the difference between "cannot" and "doesn't", and the two are not interchangeable — which is why crash reporting is disclosed on the first-run screen with its own caveat, and why every switch that turns telemetry off turns it off too.
+That last sentence is an observation about the current code, not a property enforced by anything. It's the difference between "cannot" and "doesn't", and the two are not interchangeable. That's why crash reporting is disclosed on the first-run screen with its own caveat, and why every switch that turns telemetry off turns it off too.
 
 Layer 3 still holds on this path, incidentally, but for a duller reason than a filter: nothing bridges `tracing` events into the Sentry hub at all, so a stray `info!` has no route there to be dropped from.
 

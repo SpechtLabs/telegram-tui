@@ -21,13 +21,13 @@ Both are switched off together by the controls below. The project runs no OTLP d
 
 A report gets built when the app panics, or when it exits with an error. It carries a stack trace, the app and OS version and architecture, the panic or error message with its cause chain, and the last few actions as breadcrumbs.
 
-Your IP address and username aren't attached (`send_default_pii` is off), and neither is your computer's name — a `before_send` hook nulls the hostname field Sentry would otherwise fill, since on a laptop that's usually a person's name. The pseudonymous `install.id` the OTLP path uses isn't attached either, deliberately: giving both egresses a shared key would let a crash be joined to a usage session, and keeping them unlinkable is worth more.
+Your IP address and username aren't attached (`send_default_pii` is off), and neither is your computer's name. A `before_send` hook nulls the hostname field Sentry would otherwise fill, since on a laptop that's usually a person's name. The pseudonymous `install.id` the OTLP path uses isn't attached either, deliberately: giving both egresses a shared key would let a crash be joined to a usage session, and keeping them unlinkable is worth more.
 
 The breadcrumbs are the same allowlisted events described below, so they carry nothing the OTLP path wouldn't.
 
-That leaves the error message, which is the honest caveat. It's written by whatever code failed rather than chosen from a list, so it can carry limited content — a file path you tried to send, a TDLib error string. Nothing in this client formats a chat title or a message body into an error, so in practice that's what you get. But "in practice" is a weaker claim than the allowlist's, and this page won't pretend otherwise.
+That leaves the error message, which is the honest caveat. It's written by whatever code failed rather than chosen from a list, so it can carry limited content: a file path you tried to send, a TDLib error string. Nothing in this client formats a chat title or a message body into an error, so in practice that's what you get. But "in practice" is a weaker claim than the allowlist's, and this page won't pretend otherwise.
 
-If you built from source, none of this applies to your binary: the Sentry DSN is baked in at compile time from `TGT_SENTRY_DSN`, and without it the client never initialises Sentry at all. No panic hook, no uploader, nothing to send to. The first-run screen changes its wording to match, rather than offering to turn on something that isn't there, and `tgt telemetry show` says the same. If you maintain a build like that and want its crashes to reach the project, export the variable before building — see [contributing](../understanding/contributing.md).
+If you built from source, none of this applies to your binary: the Sentry DSN is baked in at compile time from `TGT_SENTRY_DSN`, and without it the client never initialises Sentry at all. No panic hook, no uploader, nothing to send to. The first-run screen changes its wording to match, rather than offering to turn on something that isn't there, and `tgt telemetry show` says the same. If you maintain a build like that and want its crashes to reach the project, export the variable before building. See [contributing](../understanding/contributing.md).
 
 ## What the OTLP path sends
 
@@ -67,7 +67,7 @@ Any one of these switches off **both** paths:
 
 `DO_NOT_TRACK` counts as set for any value other than empty or `0`, honouring the [consensus](https://consoledonottrack.com/) convention.
 
-To keep one and drop the other, `[telemetry] crash_reports = false` silences Sentry while leaving a configured collector running, and simply not setting `endpoint` — the default — means no OTLP export while crash reports continue.
+To keep one and drop the other, `[telemetry] crash_reports = false` silences Sentry while leaving a configured collector running. Simply not setting `endpoint` (the default) means no OTLP export while crash reports continue.
 
 With telemetry off, nothing is constructed: `sentry::init` is never called, so there's no panic hook and no uploader, and no OTLP exporter is built either. The events still fire internally and land in the local rolling log; there's just nothing on the other end of them.
 
@@ -88,9 +88,9 @@ x-scope-orgid = "my-tenant"
 If you set `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_PROTOCOL` (or their `_LOGS_` variants), the client withholds its own programmatic values so the SDK resolves them, and your environment wins. That withholding is not implemented for headers, so `[telemetry.headers]` is applied even when `OTEL_EXPORTER_OTLP_HEADERS` is set. That's an inconsistency rather than a design.
 
 ::: warning Upgrading from an older config
-The old `mode = "vendor" | "custom" | "off"` key is gone, and a config that still sets it refuses to load rather than being carried across automatically. The error names the file, the value it found, and the line to write instead — `enabled = false` for `mode = "off"`, `enabled = true` for `mode = "vendor"` or `mode = "custom"`.
+The old `mode = "vendor" | "custom" | "off"` key is gone, and a config that still sets it refuses to load rather than being carried across automatically. The error names the file, the value it found, and the line to write instead: `enabled = false` for `mode = "off"`, `enabled = true` for `mode = "vendor"` or `mode = "custom"`.
 
-That refusal exists because the quieter alternative was tried and measured, not assumed to be fine: with the compatibility shim removed and nothing else in its place, `mode = "off"` loaded as `enabled = true` — an explicit opt-out silently becoming consent, with the only record of it a line in a log file nobody has reason to read. Every value under `mode` is refused, not only `off`, since a diagnostic that only sometimes appears can't be documented or predicted, and a typo like `mode = "of"` in an opt-out would otherwise read as consent too. If you never set `mode`, which is almost everyone, this changes nothing.
+That refusal exists because the quieter alternative was tried and measured, not assumed to be fine. With the compatibility shim removed and nothing else in its place, `mode = "off"` loaded as `enabled = true`: an explicit opt-out silently becoming consent, with the only record of it a line in a log file nobody has reason to read. Every value under `mode` is refused, not only `off`, since a diagnostic that only sometimes appears can't be documented or predicted, and a typo like `mode = "of"` in an opt-out would otherwise read as consent too. If you never set `mode`, which is almost everyone, this changes nothing.
 :::
 
 ## The pseudonymous install id
