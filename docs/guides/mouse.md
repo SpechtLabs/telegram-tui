@@ -13,11 +13,13 @@ Mouse support is on by default and can be turned off with `[app] mouse = false`.
 | Left click | The "Archived N" row | Enters the archive |
 | Left click | A folder tab | Switches to that folder and moves the selection to its first row |
 | Left click | The composer | Moves focus to the composer (only when a chat is open) |
+| Left click | A spoiler run inside a message | Reveals it |
+| Left click | A reply-quote line inside a message | Jumps to the quoted message |
 | Right click | A message | Enters selection mode on that message |
 | Wheel | The chat list | Moves the chat-list selection, one row per step |
 | Wheel | The conversation | Scrolls one message per step |
 
-Left-clicking a *message* does nothing. That's explicit in v1, not an oversight: a left click has no obvious meaning on a message when right click already means "act on this one".
+Left-clicking ordinary message *text* does nothing — that's still explicit, not an oversight: a left click has no obvious meaning there when right click already means "act on this one". The two exceptions are narrower than the message row itself: a masked spoiler run and a reply-quote line are their own smaller click targets layered on top of it, and a click that lands on one of them resolves to it rather than to the message underneath. Everywhere else on the row, left click still does nothing.
 
 ## What doesn't respond
 

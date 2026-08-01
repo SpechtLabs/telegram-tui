@@ -27,11 +27,17 @@ Built on TDLib and [ratatui](https://ratatui.rs), the binary is called `tgt`. Th
  ↑↓ move   ⏎ open   ctrl+p palette   ? help
 ```
 
+<!--
+  Placeholder: this static mockup gets a real asciinema recording alongside
+  it (or in its place) once --demo mode exists to record against without
+  exposing a real account. Leave the mockup until then.
+-->
+
 Press `↑` on an empty composer and you're in selection mode: the newest message highlights and the hint bar becomes a chip row like `‹ [R Reply] [F Forward] [E React] [C Copy] [D Delete] ›`. Which chips appear comes from TDLib's per-message capability flags, so an action that would fail is never offered. Below 100 columns the two panes collapse into a single-pane stack rendered by the same components.
 
 ## Status
 
-Usable for daily text conversations: login, chat list, history, sending, replies, edits, deletes, reactions, media download, search. Pre-1.0, so expect rough edges and occasional breaking changes.
+Usable for daily text conversations: login, chat list, history, sending, replies, edits, deletes, reactions, media upload and download, search. Pre-1.0, so expect rough edges and occasional breaking changes.
 
 Not in v1: multiple accounts, voice and video calls, secret chats.
 
@@ -39,32 +45,52 @@ Not in v1: multiple accounts, voice and video calls, secret chats.
 
 | Platform | Status |
 |---|---|
-| macOS (Apple Silicon) | Supported. The only platform with a release build. |
-| Linux | **Experimental, untested.** Compiles and passes the test suite in CI, nobody has run it. Build from source. |
-| Windows | **Experimental, untested.** Same, with the caveats below. |
+| macOS (Apple Silicon, Intel) | Supported. Release builds for both architectures. |
+| Linux (x86_64, aarch64) | Supported. Release builds for both architectures. |
+| Windows | **Experimental, untested.** Built and tested in CI; ships no release artifact and nobody has run the client there. |
 
-Linux and Windows exist because the code turned out to be portable, not because
-anyone has used the client there. If you try either, please open an issue about
-what broke — that feedback is the only way they stop being experimental.
+Windows exists because the code turned out to be portable, not because anyone
+has used the client there — its loader has no equivalent of the relocatable
+`bin/` + `lib/` layout the other two rely on, so there is nothing to publish.
+If you try it anyway, please open an issue about what broke.
 
-Two things to know before you do. On Linux the prebuilt TDLib is linked against
-LLVM's libc++, so you need `libc++1` (and `libc++abi1`) installed or the binary
-will not start, and the credential store needs a running Secret Service provider
-such as gnome-keyring. On Windows the `0700` lockdown that protects the TDLib
-database directory and the telemetry salt is unix-only; those inherit ACLs
-instead, and hardening them properly is unfinished work.
+Two things to know on Linux. The prebuilt TDLib is linked against LLVM's
+libc++, so you need `libc++1` (and `libc++abi1`) installed or the binary will
+not start — the install script checks and tells you. The credential store also
+needs a running Secret Service provider, such as gnome-keyring.
 
 ## Install
+
+<!--
+  Placeholder: an asciinema recording of the install → first login → send a
+  message flow goes here once the --demo mode exists to record it against.
+  Embed with `::: cast src="..." title="..." rows=20 :::` — see
+  docs/.vuepress/config.ts's "cast" container and AsciinemaCast.vue.
+-->
+
+Three ways in, all equally supported.
+
+**Homebrew**, on macOS or Linux:
+
+```shell
+brew install spechtlabs/tap/tgt
+```
+
+Updates from then on go through `brew upgrade tgt` — `tgt update` refuses on a
+Homebrew install and tells you so, since brew already tracks the files in its
+own manifest and an in-place overwrite would desynchronise it.
+
+**The install script**, macOS and Linux, no Homebrew required:
 
 ```shell
 curl -sSL https://tgt.specht-labs.de/install.sh | sh
 ```
 
-macOS and Linux, on Apple Silicon and x86_64. It downloads the release for your platform, installs the tree to `~/.local/share/tgt`, and symlinks `~/.local/bin/tgt`. It says what it verified — releases carry a cosign bundle and, from 0.1.5 on, a `SHA256SUMS` — and it keeps your previous install until the new one has proved it starts.
+It downloads the release for your platform, installs the tree to `~/.local/share/tgt`, and symlinks `~/.local/bin/tgt`. It says what it verified — releases carry a cosign bundle and, from 0.1.5 on, a `SHA256SUMS` — and it keeps your previous install until the new one has proved it starts.
 
 If piping a script into a shell makes you uncomfortable, that's a reasonable instinct: read it first at [tgt.specht-labs.de/install.sh](https://tgt.specht-labs.de/install.sh), or take a tarball from the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) and unpack it yourself.
 
-Or build from source:
+**From source:**
 
 ```shell
 git clone https://github.com/SpechtLabs/telegram-tui.git
@@ -72,9 +98,9 @@ cd telegram-tui
 mise run install          # builds, then installs to ~/.local/bin/tgt
 ```
 
-Both routes lay the tree out the same way: a private `bin/` + `lib/` pair with the binary symlinked onto your PATH. The binary loads TDLib from a dylib beside it, so those two have to stay siblings — which is why they go somewhere of their own rather than into a shared prefix. `TGT_INSTALL_ROOT` and `TGT_BIN_DIR` override either half.
+The install script and building from source lay the tree out the same way: a private `bin/` + `lib/` pair with the binary symlinked onto your PATH. The binary loads TDLib from a dylib (macOS) or shared object (Linux) beside it, so those two have to stay siblings — which is why they go somewhere of their own rather than into a shared prefix. `TGT_INSTALL_ROOT` and `TGT_BIN_DIR` override either half. The Homebrew formula uses the identical layout under its own `libexec`.
 
-Once installed, `tgt update` replaces it with the latest release: it refuses if the install isn't a private tree it owns (Homebrew, or a legacy shared prefix), keeps the old one until the new binary has proved it starts, and reports exactly what it verified. `tgt update --require-signature` refuses unless the release's cosign signature verifies against this project's release workflow — that needs `cosign` installed, which is why it's opt-in rather than the default.
+Once installed via the script or from source, `tgt update` replaces it with the latest release: it refuses if the install isn't a private tree it owns (Homebrew, or a legacy shared prefix), keeps the old one until the new binary has proved it starts, and reports exactly what it verified. `tgt update --require-signature` refuses unless the release's cosign signature verifies against this project's release workflow — that needs `cosign` installed, which is why it's opt-in rather than the default.
 
 On Linux you also need libc++ at runtime (`libc++1` and `libc++abi1` on Debian/Ubuntu); the installer checks and tells you.
 
@@ -90,9 +116,9 @@ You also need your own Telegram `api_id` and `api_hash` from [my.telegram.org](h
 | Panes | `←` `→` move focus · `tab` / `shift+tab` cycle |
 | Chat list | `↑` `↓` move · `⏎` open · `/` filter · `a` archive · `[` `]` folders |
 | Composer | type · `⏎` send · `alt+⏎` newline · `↑` on empty enters selection · `/send <path>` |
-| Selection | `↑` `↓` message · `←` `→` chip · `⏎` invoke · `r f e c d x l o s` chips directly · `esc` back |
+| Selection | `↑` `↓` message · `←` `→` chip · `⏎` invoke · `r f e c d x l o s v k` chips directly · `esc` back |
 | Search | `/` in the message list · `n` / `N` step through hits |
-| Mouse | click a chat, folder tab, or the composer · right-click a message for its chips · wheel scrolls both panes |
+| Mouse | click a chat, folder tab, or the composer · right-click a message for its chips · left-click a spoiler to reveal it or a reply quote to jump to it · wheel scrolls both panes |
 
 `Esc` always pops exactly one level and never more. `?` opens the full keymap for whatever context you're in.
 

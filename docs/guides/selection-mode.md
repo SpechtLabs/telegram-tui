@@ -43,6 +43,8 @@ Changing the selected message does a fair amount of work behind the scenes: it f
 | <kbd>l</kbd> | Download | Starts downloading the attachment. |
 | <kbd>o</kbd> | Open | Hands the downloaded file to the system opener. |
 | <kbd>s</kbd> | Resend | Only on a message whose send failed: drops it and sends it again with the original reply target. |
+| <kbd>v</kbd> | Reveal | Only on a message with an unrevealed spoiler: reveals it. |
+| <kbd>k</kbd> | Cancel upload | Only while a file you sent is still uploading: abandons it. |
 
 Note that Edit is <kbd>d</kbd>, not <kbd>e</kbd>. React took <kbd>e</kbd> first.
 
@@ -54,7 +56,9 @@ The row is built from TDLib's per-message capability flags, requested with `GetM
 - Forward appears when the message can be forwarded, Copy when it can be saved, Delete when it can be deleted for you or for everyone.
 - Edit appears only on your own messages that Telegram says are editable, and only on text messages. Caption editing isn't built.
 - Download appears when the message has a file that isn't downloaded yet; Open replaces it once it is.
-- A message whose send failed short-circuits to exactly two chips, Resend and Delete.
+- A message whose send failed short-circuits to Resend and Delete — plus Cancel upload too, if there's still a file upload tracked for it; that's the one chip *not* suppressed by a failed send, since an upload stuck mid-transfer is exactly the thing you'd want to abandon.
+
+Reveal and Cancel upload are the two exceptions to "built from TDLib's capability flags" in the first place: neither is a `MessageCaps` field. Reveal is gated on a local rendering fact (an unrevealed spoiler entity in the message, not yet clicked or chipped past) and never appears on a failed send — there's nothing server-confirmed to reveal. Cancel upload is gated on this client still tracking an upload for the message at all.
 
 Until the capability response comes back, the row shows the pessimistic set. It fills in a moment later.
 

@@ -3,7 +3,21 @@ title: Installation
 createTime: 2026/07/31 10:00:00
 ---
 
-Three ways in: the install script, a release tarball unpacked by hand, or a build from source with [mise](https://mise.jdx.dev). Releases exist for macOS and Linux on both Apple Silicon and x86_64; Windows compiles and is tested in CI but ships no artifact.
+Four ways in: Homebrew, the install script, a release tarball unpacked by hand, or a build from source with [mise](https://mise.jdx.dev). Releases exist for macOS and Linux on both Apple Silicon and x86_64; Windows compiles and is tested in CI but ships no artifact.
+
+## Homebrew
+
+::: terminal Install with Homebrew
+
+```shell
+$ brew install spechtlabs/tap/tgt
+```
+
+:::
+
+Works on macOS and Linux. The formula lives at [SpechtLabs/homebrew-tap](https://github.com/SpechtLabs/homebrew-tap) and lays the tree out under `libexec` the same way the install script does — `bin/` + `lib/` as siblings, the binary loading TDLib through a runpath relative to itself.
+
+Updates go through `brew upgrade tgt`, not `tgt update`: brew tracks its own files in a manifest, and `tgt update` checks for exactly this and refuses rather than overwriting something it would desynchronise.
 
 ## The install script
 
@@ -42,9 +56,9 @@ Piping a script into a shell is worth being uneasy about. [Read it first](https:
 
 ## From a release tarball
 
-Releases are on the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) as `tgt-<version>-aarch64-apple-darwin.tar.gz`, with a `SHA256SUMS` file and a keyless cosign bundle (`.cosign.bundle`) alongside it.
+Releases are on the [releases page](https://github.com/SpechtLabs/telegram-tui/releases), one tarball per target — `tgt-<version>-aarch64-apple-darwin.tar.gz`, `tgt-<version>-x86_64-apple-darwin.tar.gz`, `tgt-<version>-x86_64-unknown-linux-gnu.tar.gz`, `tgt-<version>-aarch64-unknown-linux-gnu.tar.gz` — with a `SHA256SUMS` file and a keyless cosign bundle (`.cosign.bundle`) alongside each.
 
-::: terminal Install from a tarball
+::: terminal Install from a tarball (macOS)
 
 ```shell
 $ tar -xzf tgt-<version>-aarch64-apple-darwin.tar.gz
@@ -60,9 +74,25 @@ $ tgt --version
 
 :::
 
-The `bin/` + `lib/` split is load-bearing. The binary carries an `@executable_path/../lib` rpath and loads TDLib from a dylib next to it, so the two have to stay in that relative arrangement. Moving `bin/tgt` somewhere on its own gets you a dynamic-linker error at startup, not a useful one.
+::: terminal Install from a tarball (Linux)
 
-Both the versioned dylib (which is what the binary's load command actually names) and the unversioned alias ship in the tarball. Copy both.
+```shell
+$ tar -xzf tgt-<version>-x86_64-unknown-linux-gnu.tar.gz
+$ ls tgt
+bin/  lib/
+
+$ install -d ~/.local/bin ~/.local/lib
+$ install -m 755 tgt/bin/tgt ~/.local/bin/tgt
+$ cp tgt/lib/libtdjson.so* tgt/lib/libc++.so.1 tgt/lib/libc++abi.so.1 tgt/lib/libunwind.so.1 ~/.local/lib/
+
+$ tgt --version
+```
+
+:::
+
+The `bin/` + `lib/` split is load-bearing on both platforms. The binary carries a runpath relative to itself — `@executable_path/../lib` on macOS, `$ORIGIN/../lib` on Linux — and loads TDLib from a shared library next to it, so the two have to stay in that relative arrangement. Moving `bin/tgt` somewhere on its own gets you a dynamic-linker error at startup, not a useful one.
+
+Both the versioned library (what the binary's load command actually names) and the unversioned alias ship in the tarball. Copy both. The Linux tarball additionally bundles TDLib's own C++ runtime (`libc++.so.1`, `libc++abi.so.1`, `libunwind.so.1`) beside it, patched to the same `$ORIGIN`-relative runpath as `libtdjson.so` itself — `scripts/package.sh` proves the moved tree resolves all four from inside itself before a release ships. Install `libc++1`/`libc++abi1` anyway if this section's advice and the rest of this page's disagree: that instruction predates the bundling and hasn't been confirmed unnecessary on a machine with no system copy at all.
 
 ## From source
 
@@ -89,10 +119,10 @@ Earlier versions scattered the binary and the dylib into `$TGT_PREFIX/{bin,lib}`
 
 The first build downloads TDLib and takes a while. Later builds don't.
 
-To run without installing, `mise run run` builds and starts the client from source. `mise run uninstall` removes the binary and its dylib from `$TGT_PREFIX`.
+To run without installing, `mise run run` builds and starts the client from source. `mise run uninstall` removes the current private tree from `$TGT_INSTALL_ROOT`/`$TGT_BIN_DIR`, and separately cleans up the legacy `$TGT_PREFIX/{bin,lib}` layout if it finds one — so an upgrade from an old install leaves nothing behind either way.
 
-::: warning Linux and Windows are experimental
-CI builds and tests the workspace on macOS, Linux and Windows, so the code compiles and the test suite passes on all three. Nobody has actually run the client on Linux or Windows. There is no release artifact for either, `mise run install` has only been exercised on macOS (it copies `*.dylib`), and you should expect to sort out the build yourself. Bug reports are genuinely wanted; assume nothing works until you've seen it work.
+::: warning Linux is untested day to day; Windows ships nothing at all
+CI builds and tests the workspace on macOS, Linux and Windows, and Linux gets real release tarballs from the same build matrix macOS does — `scripts/package.sh` handles both, bundling the C++ runtime and setting `$ORIGIN` runpaths on Linux the same way it sets `@executable_path` ones on macOS. What hasn't happened is a human actually running the client day to day on Linux, or running `mise run install` there specifically (as opposed to the plain `mise run package`/`mise run test` every release and every CI run already exercises) — so treat the Linux *artifact* as real and tested, and the Linux *experience* as unverified. Windows is the platform with a genuine gap: it compiles and passes CI, but ships no artifact at all — its loader has no rpath equivalent for the relocatable `bin/` + `lib/` layout above, so there's nothing to publish, and you'd be building and wiring it up entirely yourself. Bug reports are genuinely wanted either way.
 :::
 
 ## Where it puts things

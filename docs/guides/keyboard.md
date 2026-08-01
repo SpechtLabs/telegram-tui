@@ -51,13 +51,15 @@ Scrolling near the top of the loaded window triggers a history page automaticall
 
 Type `/send <path>` in the composer and press <kbd>Enter</kbd>. A confirmation modal appears; <kbd>Enter</kbd> sends, <kbd>Esc</kbd> cancels. The path is expanded and checked outside the state machine, so a `~/` prefix works and a path that doesn't exist gets rejected there rather than at Telegram.
 
-There's no file browser. The **Send file** palette command exists but is a deliberate no-op; `/send` is the only route in v1.
+Pasting or dropping a bare path does the same thing without the `/send` prefix — bracketed paste is on, so a paste that looks like a single-line path is held as the same kind of pending offer instead of landing in the input as text. [Sending files](media.md#sending-files) has the details.
+
+There's no file browser. The **Send file** palette command exists but is a deliberate no-op; `/send` (or pasting a path) is the only route in v1.
 
 ## Editing and replying
 
 Both are armed from selection mode rather than being their own modes. Pressing <kbd>r</kbd> on a message sets the composer's reply target and drops you straight back into the composer with the reply banner showing; <kbd>d</kbd> loads the message text into the composer with the caret at the end and the edit banner showing. In both cases the next <kbd>Enter</kbd> does the right thing.
 
-[Selection mode and chips](selection-mode.md) covers the rest of that surface.
+[Selection mode and chips](selection-mode.md) covers the rest of that surface, including Reveal (`v`, for a message with an unrevealed spoiler) and Cancel upload (`k`, for a file still uploading) — the two chips that aren't derived from a TDLib capability flag.
 
 ## What doesn't exist
 
@@ -65,7 +67,5 @@ Worth stating plainly, so you don't hunt for them:
 
 - No <kbd>Alt</kbd> chords other than <kbd>Alt</kbd>+<kbd>Enter</kbd>. Any other <kbd>Alt</kbd>+key arrives as the bare key.
 - No function keys. `F1`–`F12`, `Insert`, and media keys are dropped at the input layer.
-- No spoiler-reveal key. The renderer knows how to draw revealed spoilers, and the state field exists, but nothing sets it yet.
 - No row-level scrolling. The conversation moves a message at a time, not a line at a time.
-- Bracketed paste is never enabled, so a multi-character paste arrives as individual key events rather than as one paste. The "paste a path, get an offer to send it as a file" flow is written but unreachable because of this.
 - <kbd>?</kbd> and <kbd>ctrl</kbd>+<kbd>c</kbd> aren't configurable, despite living next to the palette binding in the code. Only `keys.palette` can be changed.

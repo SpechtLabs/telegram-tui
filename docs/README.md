@@ -51,7 +51,7 @@ config:
 
 ## Pre-1.0, and macOS is the platform that's actually been used
 
-Release tarballs are built for `aarch64-apple-darwin` only. Linux and Windows compile and pass the test suite in CI, but nobody has run the client on either, so treat them as experimental: build from source, and please [report what breaks](https://github.com/SpechtLabs/telegram-tui/issues/new/choose).
+Release tarballs are built for macOS and Linux, on both Apple Silicon/Intel and x86_64/aarch64 — `brew install spechtlabs/tap/tgt`, the [install script](/getting-started/installation), or a tarball off the [releases page](https://github.com/SpechtLabs/telegram-tui/releases) all work on either. Windows compiles and passes the test suite in CI but ships no artifact at all — its loader has no equivalent of the relocatable layout the other two rely on — and nobody has run the client on Linux or Windows day to day, so treat both as experimental outside of macOS and please [report what breaks](https://github.com/SpechtLabs/telegram-tui/issues/new/choose).
 
 ## What using it looks like
 
@@ -74,10 +74,16 @@ Release tarballs are built for `aarch64-apple-darwin` only. Linux and Windows co
  ↑↓ move   ⏎ open   ctrl+p palette   ? help
 ```
 
+<!--
+  Placeholder: swap for `::: cast src="..." title="..." rows=20 :::` (see
+  .vuepress/config.ts's "cast" container) once --demo mode exists to record
+  against. Leave the static mockup above until then.
+-->
+
 Press `↑` on an empty composer and the newest message highlights; the hint bar turns into a chip row for whatever that message supports. Below 100 columns the two panes collapse into a single-pane stack drawn by the same components, so nothing new has to be learned at a narrow width.
 
 ## In v1, and not in v1
 
-Working today: login by phone code or QR, 2FA passwords, chat list with folders and archive, history with paging, sending, replies, edits, deletes, reactions, media download with progress, inline images, search, and a command palette.
+Working today: login by phone code or QR, 2FA passwords, chat list with real folder names and an archive, history with paging, sending, replies, edits, deletes, reactions, media upload and download with progress, inline images, search, and a command palette.
 
 Deliberately out of scope for v1: multiple accounts, voice and video calls, secret chats.

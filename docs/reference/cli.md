@@ -103,8 +103,8 @@ Building from a checkout, these are the tasks rather than raw cargo invocations.
 | `mise run run` | Build and start the client from source |
 | `mise run build` | Release build |
 | `mise run package` | Build `dist/` with the relocatable binary, its dylib, and a tarball |
-| `mise run install` | Install into `$TGT_PREFIX` (default `~/.local`) |
-| `mise run uninstall` | Remove the binary and dylib from `$TGT_PREFIX` |
+| `mise run install` | Install the private tree into `$TGT_INSTALL_ROOT` (default `$XDG_DATA_HOME/tgt`), symlinked from `$TGT_BIN_DIR` (default `~/.local/bin`) |
+| `mise run uninstall` | Remove that tree and symlink, and clean up the legacy `$TGT_PREFIX/{bin,lib}` layout if one is found |
 | `mise run check` | The merge gate: fmt, clippy, tests, crate boundaries |
 | `mise tasks` | The full list |
 
@@ -122,7 +122,7 @@ tgt update --force
 
 If the latest published release is *older* than the version you are running, an ordinary `tgt update` refuses and says so rather than silently going backwards. `--force` installs it anyway and names it as a downgrade while it does.
 
-It refuses rather than guessing. A Homebrew install is left to `brew upgrade`, because brew tracks its files in a manifest an in-place overwrite would desynchronise. Anything that isn't a private `bin/` + `lib/` tree it can identify — a legacy shared-prefix install, or a `cargo` target directory — is refused with the reinstall command, since replacing a directory it cannot identify would mean renaming and deleting whatever is there.
+It refuses rather than guessing. A Homebrew install (see [Installation](../getting-started/installation.md#homebrew)) is left to `brew upgrade tgt`, because brew tracks its files in a manifest an in-place overwrite would desynchronise. Anything that isn't a private `bin/` + `lib/` tree it can identify — a legacy shared-prefix install, or a `cargo` target directory — is refused with the reinstall command, since replacing a directory it cannot identify would mean renaming and deleting whatever is there.
 
 The swap itself is the installer's, shipped inside the tarball and run from the newly extracted copy: stage, rename, run the new `bin/tgt --version` while the old tree still exists, and put the old one back if it can't start. There is one implementation of that procedure and both the installer and the updater use it.
 

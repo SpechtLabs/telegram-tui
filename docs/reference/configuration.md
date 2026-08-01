@@ -158,7 +158,9 @@ The `[telemetry]` block there is a deliberate mix rather than the default: crash
 | `HOME` | Tilde expansion for `/send ~/...` paths. |
 | `TGT_OPENER` | Command used to open a downloaded file. Default `open`. |
 | `RUST_LOG` | Filters the local log file only. Default `info`. It deliberately cannot silence telemetry. |
-| `TGT_PREFIX` | Used by `mise run install` / `uninstall` only. Default `~/.local`. Not read by the binary. |
+| `TGT_INSTALL_ROOT` | Where the install script and `mise run install` put the private `bin/` + `lib/` tree. Default `$XDG_DATA_HOME/tgt` (`~/.local/share/tgt`). `tgt update` doesn't read this — it replaces whatever tree the running binary already lives in, found via its own path, not this variable. Install-time only. |
+| `TGT_BIN_DIR` | Where the symlink to that tree's `bin/tgt` goes. Default `~/.local/bin`. Install-time only, same as above. |
+| `TGT_PREFIX` | Legacy. Earlier versions scattered the binary and its dylib into `$TGT_PREFIX/{bin,lib}` (default `~/.local`) instead of the private tree above. `mise run uninstall` still reads it to clean up that old layout; nothing else does. Not read by the binary. |
 | `TGT_SENTRY_DSN` | Build-time only. Bakes in the Sentry DSN for crash reports. Without it the binary never initialises Sentry, so it has no panic hook and no uploader, which is the case for every from-source and CI build. |
 
 ## Files on disk

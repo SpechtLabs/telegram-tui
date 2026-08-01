@@ -86,6 +86,14 @@ Scrolling invalidates placed images so protocol cells can't ghost into rows that
 
 `/send <path>` in the composer, then <kbd>Enter</kbd>, then <kbd>Enter</kbd> again on the confirmation modal. A leading `~/` is expanded against `$HOME`, and the file's existence is checked before anything is sent.
 
+Dropping a file onto the terminal, or pasting a path directly, does the same thing without typing `/send`: most terminals paste a dropped file as its plain-text path, and if what arrives starts with `/`, `~/`, or `./` and looks like a single-line path, the composer holds it as a pending offer instead of inserting it as text. `Enter` confirms it through the same modal as `/send`; `Esc` discards the offer and the composer stays empty.
+
 The file type is worked out at the boundary from the path, so a `.jpg` goes as a photo rather than as a generic document. The state machine only ever says "document"; the dispatcher upgrades it.
 
 There's no file picker. The **Send file** palette command is a placeholder that does nothing.
+
+## Uploading
+
+An outgoing file shows the same kind of progress line downloads do, from the moment you confirm the send until TDLib finishes the transfer — the message card reads bytes-sent-so-far the same way the download bar reads bytes-received, both moving as real `updateFile` pushes arrive rather than jumping straight to "sent" partway through.
+
+If you need to abandon one mid-flight, `↑` on the composer to enter [selection mode](selection-mode.md), select the message, and its chip row offers **Cancel upload** (`k`) for as long as the transfer is still in progress — including one that's already failed to send, where the chip stays available so you can clear it out.

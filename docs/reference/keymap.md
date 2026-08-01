@@ -82,7 +82,7 @@ No caret movement. <kbd>←</kbd>, <kbd>→</kbd>, <kbd>Home</kbd>, <kbd>End</kb
 | <kbd>Backspace</kbd> / <kbd>Delete</kbd> | Delete before / after the caret |
 | <kbd>↓</kbd>, <kbd>PageUp</kbd>, <kbd>PageDown</kbd> | Not claimed: scroll the conversation |
 
-`/send <path>` followed by <kbd>Enter</kbd> raises the send-file confirmation.
+`/send <path>` followed by <kbd>Enter</kbd> raises the send-file confirmation. Pasting or dropping a bare path does the same without typing `/send`: bracketed paste is on, and text that looks like a single-line path is held as a pending offer instead of inserted — <kbd>Enter</kbd> confirms it the same way, <kbd>Esc</kbd> discards it and returns to an empty composer. Anything else pasted arrives as ordinary text at the caret.
 
 ## Conversation scrolling
 
@@ -118,7 +118,9 @@ Scrolling near the top of the loaded window triggers a history page. There is no
 | <kbd>x</kbd> | Delete | Deletable for you or for everyone |
 | <kbd>l</kbd> | Download | Has a file that isn't downloaded |
 | <kbd>o</kbd> | Open | Has a file that is downloaded |
-| <kbd>s</kbd> | Resend | The send failed. Failed messages show only Resend and Delete. |
+| <kbd>s</kbd> | Resend | The send failed. Failed messages show only Resend, Delete, and Cancel upload (if a file upload is still tracked for it). |
+| <kbd>v</kbd> | Reveal | The message has an unrevealed spoiler. Never shown on a failed send — nothing server-confirmed to reveal. |
+| <kbd>k</kbd> | Cancel upload | A file you sent from this message is still uploading. Shown even after a failed send, unlike Reveal, since an upload stuck mid-transfer is exactly what you'd want to abandon. |
 
 A letter with no matching chip in the current row isn't swallowed; it falls through to the global layer, which is how <kbd>?</kbd> and <kbd>/</kbd> still work here.
 
@@ -215,11 +217,13 @@ Requires `[app] mouse = true` (the default).
 | Left click | Archive row | Enter the archive |
 | Left click | Folder tab | Switch folder, select its first row |
 | Left click | Composer | Focus the composer (needs an open chat) |
+| Left click | Spoiler run in a message | Reveal it |
+| Left click | Reply-quote line in a message | Jump to the quoted message |
 | Right click | Message | Enter selection mode on it |
 | Wheel | Chat list | Move the selection one row per step |
 | Wheel | Conversation | Scroll one message per step |
 
-Left-clicking a message is an explicit no-op. Hover, drag, release, the middle button and horizontal scroll are all discarded. Nothing is clickable while a modal, the palette or help is up, or on the consent and login screens.
+Left-clicking ordinary message text is still a no-op — only a masked spoiler run or a reply-quote line responds, and both are narrower hit targets than the message's full row. Hover, drag, release, the middle button and horizontal scroll are all discarded. Nothing is clickable while a modal, the palette or help is up, or on the consent and login screens.
 
 ## Not bound to anything
 
@@ -227,7 +231,4 @@ Left-clicking a message is an explicit no-op. Hover, drag, release, the middle b
 | --- | --- |
 | Function keys, <kbd>Insert</kbd>, media keys | Dropped at the input layer |
 | <kbd>Alt</kbd>+ anything except <kbd>Enter</kbd> | Arrives as the bare key; there is no Alt modifier in the model |
-| Reveal spoiler | The renderer supports it; nothing sets the flag |
-| Discard a pending paste-path offer | No key does this. The relevant handler is unreachable through the router. |
-| Paste | Bracketed paste is never enabled, so pastes arrive as individual key events |
 | Rebinding <kbd>?</kbd> or <kbd>ctrl</kbd>+<kbd>c</kbd> | Not configurable |

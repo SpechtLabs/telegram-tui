@@ -21,7 +21,7 @@ The whole application has exactly two modifier chords: <kbd>ctrl</kbd>+<kbd>p</k
 
 ## What it does today
 
-Login by phone code or QR, with 2FA password support. A chat list with folders, archive, unread and mention badges. Message history that pages backwards as you scroll. Sending, replying, editing, deleting, reacting. File and photo download with a progress bar, sending files by path, and inline image rendering on terminals that support it. Full-text search within a chat, and a command palette for everything that isn't a key.
+Login by phone code or QR, with 2FA password support. A chat list with real folder names, archive, unread and mention badges. Message history that pages backwards as you scroll. Sending, replying, editing, deleting, reacting. Sending files by path with an upload progress bar, downloading them with a matching download bar, and inline image rendering on terminals that support it. Full-text search within a chat, and a command palette for everything that isn't a key.
 
 Not in v1, on purpose: multiple accounts, voice and video calls, secret chats. None of these are blocked by the architecture; they're scope decisions.
 
@@ -29,9 +29,9 @@ Not in v1, on purpose: multiple accounts, voice and video calls, secret chats. N
 
 | Platform | Status |
 | --- | --- |
-| macOS (Apple Silicon) | Supported. The release tarball targets `aarch64-apple-darwin`. |
-| Linux | Experimental. Builds and passes the test suite in CI; nobody has run the client on it. Build from source. |
-| Windows | Experimental. Same as Linux, plus one known gap: the `0700` lockdown on the TDLib database directory and the telemetry salt is Unix-only, so on Windows those files inherit directory ACLs instead. That hardening is unfinished. |
+| macOS (Apple Silicon, Intel) | Supported. Release tarballs target both `aarch64-apple-darwin` and `x86_64-apple-darwin`. |
+| Linux (x86_64, aarch64) | Supported. Release tarballs target both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Nobody has run the client here day to day, but the artifact is the same one CI builds and tests. |
+| Windows | Experimental, and the only platform with no release artifact at all — its loader has no equivalent of the relocatable `bin/` + `lib/` layout the other two use. Built and tested in CI. One known gap besides: the `0700` lockdown on the TDLib database directory and the telemetry salt is Unix-only, so on Windows those files inherit directory ACLs instead. That hardening is unfinished. |
 
 The credential store differs by platform too, because `tgt` puts the TDLib database encryption key in the OS keychain rather than on disk. macOS uses the Keychain, Windows uses Credential Manager, and Linux needs a running Secret Service provider (gnome-keyring, KWallet, or equivalent) or the key can't be stored.
 
