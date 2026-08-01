@@ -42,6 +42,8 @@ config:
         icon: mdi:test-tube
         details: update() does no I/O and reads no clock, so the whole client replays from recorded TDLib sessions with no network and no account. Rendering is pinned by insta snapshots.
 
+  - type: custom
+
   - type: VPReleases
     repo: SpechtLabs/telegram-tui
 
