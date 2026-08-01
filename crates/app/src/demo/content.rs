@@ -1,14 +1,48 @@
-//! Mock chats, messages and folders for `tgt --demo` (see the parent module
-//! docs). Everything here is invented: no real names, no plausible phone
-//! numbers, nothing that could be mistaken for an actual person's
-//! conversation.
+//! Mock chats, messages and folders for the `tgt --demo` recording (see the
+//! parent module docs). Everything here is invented: no real names, no
+//! plausible phone numbers, nothing that could be mistaken for an actual
+//! person's conversation.
 //!
-//! Chat 1 ("Nova") is the one built to show the product off in a single
-//! recording pass: a reply, a reaction, an edited message, a spoiler and the
-//! demo's one photo all live there. The rest exist to show unread badges,
-//! folders and the different chat kinds (group/channel/supergroup).
-
-use std::collections::HashMap;
+//! Chat 1 ("Nova") is the one the recording opens: a reply, a reaction, an
+//! edited message, a spoiler and the demo's one photo all live there, as the
+//! *last* nine messages — so they're the ones on screen the instant the chat
+//! opens (the conversation pane starts scrolled to the bottom, like a real
+//! one). The other four chats exist to show unread badges, folders and the
+//! different chat kinds (group/channel/supergroup) in the sidebar; the
+//! recording never opens them, so they carry only a `last_message` preview,
+//! not a full history.
+//!
+//! # Why Nova's history is padded to a full 50-message page
+//!
+//! `state::conversation::apply_history_page`'s "cold open" case: a chat
+//! opened for the first time answers `getChatHistory(only_local: true)` with
+//! whatever few messages TDLib's *local* database already has (often just
+//! the one chat-list preview), which is short. A short opening page fires
+//! *two* more requests **in the same effect batch**, per that function's own
+//! docs ("A cold open does put both in flight at once"): T59's remote
+//! reconcile (`from_message_id: 0`) and T67's viewport-fill (`from` the
+//! oldest loaded message, walking further back) — plus, separately, media's
+//! auto-download `DownloadFile` for any photo now in view. All three are
+//! spawned via `tokio::spawn` from one `effects.drain()` loop
+//! (`runtime_loop::Core::step_until`), and tokio's scheduler gives no
+//! ordering guarantee across independently spawned tasks — so which one a
+//! strict, single-cursor `FakeTd` script would see *first* is not something
+//! this fixture can predict or pin down.
+//!
+//! `crates/app/tests/read_only.rs`'s own `read_only_script` sidesteps
+//! exactly this by always seeding a full `PAGE_SIZE` (50) opening page —
+//! see its doc comment ("A full page, so T67's viewport fill has nothing to
+//! do"). This module does the same: [`nova_history`] returns exactly 50
+//! messages, so `apply_history_page` never calls `fill_viewport` at all, and
+//! the only request left to script beyond the opening page is T59's
+//! reconcile — one predictable `Await`, matching `read_only_script` step for
+//! step. The photo's `DownloadFile` race is avoided the same way `runtime.rs`
+//! (this module's now-removed sibling, from before the brief narrowed to a
+//! single scripted recording — see `crate::demo`'s module docs) used to
+//! avoid it structurally: [`demo::script`](super::script) emits the photo's
+//! `FileSnapshot` as already complete *before* the chat is ever opened, so
+//! `media::should_auto_request` sees it already downloaded and never issues
+//! `DownloadFile` in the first place.
 
 use tgt_core::model::chat::{
     ChatKind, ChatListId, ChatPositionEntry, ChatView, FolderInfo, MessagePreview,
@@ -24,15 +58,17 @@ pub const YOU: UserId = UserId(1);
 /// The demo's one media file: the placeholder (or `TGT_DEMO_PHOTO`-supplied)
 /// cat photo in chat 1.
 pub const PHOTO_FILE_ID: FileId = FileId(1);
+/// The chat the recording opens. `Await` steps in `demo::script` are scripted
+/// against this id specifically (not just `GetChatHistory`'s request kind),
+/// so a stray request for a different chat can't be mistaken for it.
+pub const CHAT_NOVA: ChatId = ChatId(1);
 
 const NOVA: UserId = UserId(2);
-const ADA: UserId = UserId(3);
-const SAM: UserId = UserId(4);
-const PRIYA: UserId = UserId(5);
-const LIN: UserId = UserId(6);
-const KAI: UserId = UserId(7);
+// Ada/Sam/Priya/Lin/Kai never appear as a live `Sender` — the other four
+// chats are never opened by the recording, so they carry only a cosmetic
+// `MessagePreview` (a plain display string) rather than a full message
+// history with a `UserId`-backed sender.
 
-const CHAT_NOVA: ChatId = ChatId(1);
 const CHAT_ADA: ChatId = ChatId(2);
 const CHAT_HIKING: ChatId = ChatId(3);
 const CHAT_RELEASE_NOTES: ChatId = ChatId(4);
@@ -42,27 +78,33 @@ const FOLDER_WORK: i32 = 1;
 const FOLDER_FRIENDS: i32 = 2;
 
 /// A plausible-looking base timestamp (2024-11-19, arbitrary); messages
-/// within a chat are spaced a few minutes apart from there.
+/// within a chat are spaced roughly a minute apart from there.
 const BASE_DATE: i64 = 1_732_000_000;
+
+/// `getChatHistory`'s opening page size (`state::history::PAGE_SIZE`), and
+/// the length [`nova_history`] pads to. See the module docs for why.
+const OPENING_PAGE_SIZE: usize = 50;
+/// How many of Nova's 50 messages are the ones actually built to demonstrate
+/// something (reply/reaction/edit/spoiler/photo) — always the newest, so
+/// they're what's on screen when the chat opens scrolled to the bottom.
+const FEATURED_MESSAGES: usize = 9;
 
 pub struct DemoContent {
     pub folders: Vec<FolderInfo>,
     pub chats: Vec<ChatView>,
-    pub messages: HashMap<ChatId, Vec<MessageView>>,
+    /// The one chat the recording opens. Always [`OPENING_PAGE_SIZE`] long —
+    /// see the module docs.
+    pub nova_history: Vec<MessageView>,
 }
 
 /// Builds the complete mock dataset. `photo_dims` comes from
 /// `photo::resolve` — the message content only needs the file id
-/// ([`PHOTO_FILE_ID`]) and declared dimensions; `DemoTd` (in `runtime.rs`) is
-/// what joins the id to an actual path on disk, via a `FileSnapshot`.
+/// ([`PHOTO_FILE_ID`]) and declared dimensions; `demo::script` is what joins
+/// the id to an actual path on disk, via a `FileSnapshot`.
 pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
     let (photo_width, photo_height) = photo_dims;
-
-    let nova_messages = nova_messages(photo_width, photo_height);
-    let ada_messages = ada_messages();
-    let hiking_messages = hiking_messages();
-    let release_notes_messages = release_notes_messages();
-    let design_sync_messages = design_sync_messages();
+    let nova_history = nova_history(photo_width, photo_height);
+    let nova_preview = preview_of(nova_history.last().expect("nova_history is never empty"));
 
     let chats = vec![
         chat(
@@ -72,7 +114,7 @@ pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
             500,
             &[],
             0,
-            nova_messages.last(),
+            Some(nova_preview),
         ),
         chat(
             CHAT_ADA,
@@ -81,7 +123,12 @@ pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
             480,
             &[],
             3,
-            ada_messages.last(),
+            Some(MessagePreview {
+                sender_name: "Ada Lovelace (Demo)".to_string(),
+                text: "Ping me when you're ready.".to_string(),
+                date: BASE_DATE + 10_180,
+                is_outgoing: false,
+            }),
         ),
         chat(
             CHAT_HIKING,
@@ -90,7 +137,12 @@ pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
             460,
             &[FOLDER_FRIENDS],
             0,
-            hiking_messages.last(),
+            Some(MessagePreview {
+                sender_name: "Sam".to_string(),
+                text: "Perfect.".to_string(),
+                date: BASE_DATE + 20_090,
+                is_outgoing: false,
+            }),
         ),
         chat(
             CHAT_RELEASE_NOTES,
@@ -99,7 +151,12 @@ pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
             440,
             &[FOLDER_WORK],
             1,
-            release_notes_messages.last(),
+            Some(MessagePreview {
+                sender_name: "tgt Release Notes".to_string(),
+                text: "v0.2.0-demo: inline images, folders and reactions are here 🎉".to_string(),
+                date: BASE_DATE + 30_000,
+                is_outgoing: false,
+            }),
         ),
         chat(
             CHAT_DESIGN_SYNC,
@@ -108,17 +165,14 @@ pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
             420,
             &[FOLDER_WORK],
             0,
-            design_sync_messages.last(),
+            Some(MessagePreview {
+                sender_name: "Kai".to_string(),
+                text: "Looks great!".to_string(),
+                date: BASE_DATE + 40_060,
+                is_outgoing: false,
+            }),
         ),
     ];
-
-    let messages = HashMap::from([
-        (CHAT_NOVA, nova_messages),
-        (CHAT_ADA, ada_messages),
-        (CHAT_HIKING, hiking_messages),
-        (CHAT_RELEASE_NOTES, release_notes_messages),
-        (CHAT_DESIGN_SYNC, design_sync_messages),
-    ]);
 
     DemoContent {
         folders: vec![
@@ -132,7 +186,7 @@ pub fn seed(photo_dims: (u32, u32)) -> DemoContent {
             },
         ],
         chats,
-        messages,
+        nova_history,
     }
 }
 
@@ -144,7 +198,7 @@ fn chat(
     order: i64,
     folders: &[i32],
     unread_count: u32,
-    last_message: Option<&MessageView>,
+    last_message: Option<MessagePreview>,
 ) -> ChatView {
     let mut positions = vec![ChatPositionEntry {
         list: ChatListId::Main,
@@ -166,12 +220,7 @@ fn chat(
         positions,
         unread_count,
         unread_mention_count: 0,
-        last_message: last_message.map(|m| MessagePreview {
-            sender_name: m.sender_name.clone(),
-            text: excerpt(&m.content),
-            date: m.date,
-            is_outgoing: m.is_outgoing,
-        }),
+        last_message,
         is_muted: false,
     }
 }
@@ -202,8 +251,8 @@ fn spoiler(body: &str, needle: &str) -> FormattedText {
     }
 }
 
-fn excerpt(content: &MessageContent) -> String {
-    let text = match content {
+fn plain_text_of(content: &MessageContent) -> &str {
+    match content {
         MessageContent::Text(t) => t.text.as_str(),
         MessageContent::Photo { caption, .. }
         | MessageContent::Video { caption, .. }
@@ -211,12 +260,22 @@ fn excerpt(content: &MessageContent) -> String {
         MessageContent::Audio { file_name, .. } => file_name.as_str(),
         MessageContent::Sticker { emoji } => emoji.as_str(),
         MessageContent::Unsupported { description } => description.as_str(),
-    };
+    }
+}
+
+fn preview_of(m: &MessageView) -> MessagePreview {
     const MAX: usize = 80;
-    if text.chars().count() <= MAX {
+    let text = plain_text_of(&m.content);
+    let text = if text.chars().count() <= MAX {
         text.to_string()
     } else {
         text.chars().take(MAX).collect::<String>() + "…"
+    };
+    MessagePreview {
+        sender_name: m.sender_name.clone(),
+        text,
+        date: m.date,
+        is_outgoing: m.is_outgoing,
     }
 }
 
@@ -281,21 +340,81 @@ fn outgoing(id: i64, chat_id: ChatId, date: i64, content: MessageContent) -> Mes
     }
 }
 
-/// Chat 1: the one built to show off a reply, a reaction, an edited message,
-/// a spoiler and the demo's photo in a single open-chat pass.
-fn nova_messages(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
-    let t = BASE_DATE;
+/// Short, generic exchanges that pad Nova's history out to a full opening
+/// page (module docs). Cycled rather than hand-written 40-odd times; nothing
+/// here is meant to be read — the recording opens Nova already scrolled to
+/// the bottom, where the featured messages are, and never scrolls up into
+/// this filler.
+const FILLER_LINES: &[&str] = &[
+    "Sounds good.",
+    "On it.",
+    "👍",
+    "Let me check.",
+    "Almost done.",
+    "One sec.",
+    "Ready when you are.",
+    "Just saw this, thanks!",
+    "Will do.",
+    "Makes sense.",
+    "👌",
+    "Sent!",
+    "Good catch.",
+    "Yep, agreed.",
+];
+
+/// Chat 1's full opening page: [`OPENING_PAGE_SIZE`] messages, the newest
+/// [`FEATURED_MESSAGES`] of which demonstrate a reply, a reaction, an edited
+/// message, a spoiler and the demo's photo. See the module docs for why the
+/// page is padded to a full 50 rather than just the featured nine.
+fn nova_history(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
+    let filler_count = OPENING_PAGE_SIZE - FEATURED_MESSAGES;
+    let mut messages: Vec<MessageView> = (1..=filler_count as i64)
+        .map(|id| {
+            let line = FILLER_LINES[(id as usize - 1) % FILLER_LINES.len()];
+            let date = BASE_DATE + id * 45;
+            if id % 2 == 1 {
+                incoming(
+                    id,
+                    CHAT_NOVA,
+                    NOVA,
+                    "Nova",
+                    date,
+                    MessageContent::Text(text(line)),
+                )
+            } else {
+                outgoing(id, CHAT_NOVA, date, MessageContent::Text(text(line)))
+            }
+        })
+        .collect();
+
+    let base = filler_count as i64;
+    let t = BASE_DATE + base * 45;
 
     let reply_source_text = "Yes! I'll bring the laptop.";
+    let reply_source_id = base + 2;
     let reply_source = outgoing(
-        2,
+        reply_source_id,
         CHAT_NOVA,
         t + 60,
         MessageContent::Text(text(reply_source_text)),
     );
 
+    let mut reply = incoming(
+        base + 3,
+        CHAT_NOVA,
+        NOVA,
+        "Nova",
+        t + 130,
+        MessageContent::Text(text("Perfect, see you at 10.")),
+    );
+    reply.reply_to = Some(ReplyPreview {
+        message_id: MessageId(reply_source_id),
+        sender_name: "You".to_string(),
+        excerpt: reply_source_text.to_string(),
+    });
+
     let mut photo = incoming(
-        5,
+        base + 5,
         CHAT_NOVA,
         NOVA,
         "Nova",
@@ -314,30 +433,16 @@ fn nova_messages(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
     }];
 
     let mut edited = outgoing(
-        6,
+        base + 6,
         CHAT_NOVA,
         t + 360,
         MessageContent::Text(text("Let's meet at 10:30 instead, running a bit late.")),
     );
     edited.is_edited = true;
 
-    let mut reply = incoming(
-        3,
-        CHAT_NOVA,
-        NOVA,
-        "Nova",
-        t + 130,
-        MessageContent::Text(text("Perfect, see you at 10.")),
-    );
-    reply.reply_to = Some(ReplyPreview {
-        message_id: MessageId(2),
-        sender_name: "You".to_string(),
-        excerpt: reply_source_text.to_string(),
-    });
-
-    vec![
+    messages.extend([
         incoming(
-            1,
+            base + 1,
             CHAT_NOVA,
             NOVA,
             "Nova",
@@ -347,7 +452,7 @@ fn nova_messages(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
         reply_source,
         reply,
         outgoing(
-            4,
+            base + 4,
             CHAT_NOVA,
             t + 250,
             MessageContent::Text(text("Also, meet the newest team member.")),
@@ -355,7 +460,7 @@ fn nova_messages(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
         photo,
         edited,
         incoming(
-            7,
+            base + 7,
             CHAT_NOVA,
             NOVA,
             "Nova",
@@ -366,7 +471,7 @@ fn nova_messages(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
             )),
         ),
         incoming(
-            8,
+            base + 8,
             CHAT_NOVA,
             NOVA,
             "Nova",
@@ -374,125 +479,15 @@ fn nova_messages(photo_width: u32, photo_height: u32) -> Vec<MessageView> {
             MessageContent::Text(text("🎉 Sounds good, see you then!")),
         ),
         outgoing(
-            9,
+            base + 9,
             CHAT_NOVA,
             t + 540,
             MessageContent::Text(text("See you soon 👋")),
         ),
-    ]
-}
+    ]);
 
-/// Chat 2: three unread messages, to show the sidebar badge.
-fn ada_messages() -> Vec<MessageView> {
-    let t = BASE_DATE + 10_000;
-    vec![
-        incoming(
-            1,
-            CHAT_ADA,
-            ADA,
-            "Ada Lovelace (Demo)",
-            t,
-            MessageContent::Text(text("Don't forget the demo starts at 3pm.")),
-        ),
-        incoming(
-            2,
-            CHAT_ADA,
-            ADA,
-            "Ada Lovelace (Demo)",
-            t + 90,
-            MessageContent::Text(text("Also I pushed the slides.")),
-        ),
-        incoming(
-            3,
-            CHAT_ADA,
-            ADA,
-            "Ada Lovelace (Demo)",
-            t + 180,
-            MessageContent::Text(text("Ping me when you're ready.")),
-        ),
-    ]
-}
-
-/// Chat 3: a group, two different senders — shows per-sender header colors.
-fn hiking_messages() -> Vec<MessageView> {
-    let t = BASE_DATE + 20_000;
-    vec![
-        incoming(
-            1,
-            CHAT_HIKING,
-            SAM,
-            "Sam",
-            t,
-            MessageContent::Text(text("Trailhead at 8am, don't be late!")),
-        ),
-        incoming(
-            2,
-            CHAT_HIKING,
-            PRIYA,
-            "Priya",
-            t + 45,
-            MessageContent::Text(text("I'll bring snacks 🥨")),
-        ),
-        incoming(
-            3,
-            CHAT_HIKING,
-            SAM,
-            "Sam",
-            t + 90,
-            MessageContent::Text(text("Perfect.")),
-        ),
-    ]
-}
-
-/// Chat 4: a channel post, sent as the channel itself rather than a user.
-fn release_notes_messages() -> Vec<MessageView> {
-    let t = BASE_DATE + 30_000;
-    vec![MessageView {
-        id: MessageId(1),
-        chat_id: CHAT_RELEASE_NOTES,
-        sender: Sender::Chat(CHAT_RELEASE_NOTES),
-        sender_name: "tgt Release Notes".to_string(),
-        is_outgoing: false,
-        date: t,
-        content: MessageContent::Text(text(
-            "v0.2.0-demo: inline images, folders and reactions are here 🎉",
-        )),
-        reply_to: None,
-        send_state: SendState::Sent,
-        reactions: Vec::new(),
-        caps: incoming_caps(),
-        is_edited: false,
-    }]
-}
-
-/// Chat 5: a supergroup, two senders.
-fn design_sync_messages() -> Vec<MessageView> {
-    let t = BASE_DATE + 40_000;
-    vec![
-        incoming(
-            1,
-            CHAT_DESIGN_SYNC,
-            LIN,
-            "Lin",
-            t,
-            MessageContent::Text(text("Updated the mockups, check the shared link.")),
-        ),
-        incoming(
-            2,
-            CHAT_DESIGN_SYNC,
-            KAI,
-            "Kai",
-            t + 60,
-            MessageContent::Text(text("Looks great!")),
-        ),
-    ]
-}
-
-/// The plain text a message's content carries, for search matching and reply
-/// excerpts built outside `seed()` (e.g. against a message the user just
-/// sent in the live session — see `runtime::DemoTd`).
-pub fn plain_text(content: &MessageContent) -> String {
-    excerpt(content)
+    debug_assert_eq!(messages.len(), OPENING_PAGE_SIZE);
+    messages
 }
 
 #[cfg(test)]
@@ -500,26 +495,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_chat_has_at_least_one_message() {
+    fn nova_history_is_a_full_opening_page() {
         let content = seed((320, 320));
-        for chat in &content.chats {
-            let messages = content
-                .messages
-                .get(&chat.id)
-                .unwrap_or_else(|| panic!("chat {:?} has no seeded messages", chat.id));
-            assert!(
-                !messages.is_empty(),
-                "chat {:?} ({}) must not open empty",
-                chat.id,
-                chat.title
-            );
+        assert_eq!(
+            content.nova_history.len(),
+            OPENING_PAGE_SIZE,
+            "a short opening page would race T67's viewport-fill against T59's \
+             reconcile — see the module docs"
+        );
+        // Ascending, contiguous ids: every other seed builder and `FakeTd`
+        // fixture in this codebase assumes this window invariant.
+        for (idx, m) in content.nova_history.iter().enumerate() {
+            assert_eq!(m.id, MessageId(idx as i64 + 1));
         }
     }
 
     #[test]
     fn nova_chat_demonstrates_every_feature() {
         let content = seed((320, 320));
-        let nova = &content.messages[&CHAT_NOVA];
+        let nova = &content.nova_history;
 
         assert!(
             nova.iter().any(|m| m.reply_to.is_some()),
@@ -584,5 +578,18 @@ mod tests {
             .find(|c| c.id == CHAT_ADA)
             .expect("ada chat");
         assert_eq!(ada.unread_count, 3);
+    }
+
+    #[test]
+    fn nova_preview_matches_its_newest_message() {
+        let content = seed((320, 320));
+        let nova = content
+            .chats
+            .iter()
+            .find(|c| c.id == CHAT_NOVA)
+            .expect("nova chat");
+        let preview = nova.last_message.as_ref().expect("nova has a preview");
+        assert_eq!(preview.text, "See you soon 👋");
+        assert!(preview.is_outgoing);
     }
 }

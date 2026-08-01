@@ -19,6 +19,11 @@ pinact = "4.1.0"
 bun = "1.3.14"
 markdownlint-cli2 = "0.23.2"
 
+# Records the `tgt --demo` asciinema cast committed alongside the demo driver
+# script (see `crates/app/src/demo/`'s module docs and `scripts/record-demo.sh`).
+# Not part of the build; a dev-time tool the same way pinact/cargo-insta are.
+"aqua:asciinema/asciinema" = "3.2.1"
+
 [env]
 # Sentry crash reporting is compiled in from this variable (`option_env!`), so a
 # build without it is inert. Committed rather than kept in a secret because a
