@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.0](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.7...v0.2.0) (2026-08-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* the `[telemetry] mode` config key has been removed. A configuration file that still sets it will refuse to start, naming the file and the replacement. Replace `mode = "off"` with `enabled = false`, and `mode = "vendor"` or `mode = "custom"` with `enabled = true`. Crash reporting and a user's own OTLP collector are controlled separately by `crash_reports` and `endpoint`.
+
+### Features
+
+* **app:** add tgt --demo, an offline in-memory demo backend for recordings ([9462afa](https://github.com/SpechtLabs/telegram-tui/commit/9462afae27e9774487b3e866095d73a407e5c3ee))
+* **app:** show the composer's Sending -&gt; Sent transition in the recording ([8af78ee](https://github.com/SpechtLabs/telegram-tui/commit/8af78eed883e9f62209c6390856872f6c50d97ed))
+* **app:** switch tgt --demo to a scripted FakeTd fixture, add the recording ([2cef314](https://github.com/SpechtLabs/telegram-tui/commit/2cef314deda366e694b2e195489e98f8399753cb))
+* remove the retired [telemetry] mode config key ([f49c0fa](https://github.com/SpechtLabs/telegram-tui/commit/f49c0fa7c9e17791a44fe6a642a6edc416d12682))
+
+
+### Bug Fixes
+
+* **docs:** make the deploy build actually run mise run docs-build ([c843336](https://github.com/SpechtLabs/telegram-tui/commit/c8433366904c6b49967090601801b6849996c0c1))
+* **install:** replace the wrong libc++ warning with the real glibc floor ([d8a4646](https://github.com/SpechtLabs/telegram-tui/commit/d8a4646d8e0bb94f0017e14a02fa7cc92225a4a1))
+* **release:** pass the release PR JSON as data, not as shell syntax ([88f28ae](https://github.com/SpechtLabs/telegram-tui/commit/88f28ae829ef6be9b5016dcaca545f079e7da1c9))
+
 ## [0.1.7](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.6...v0.1.7) (2026-08-01)
 
 
