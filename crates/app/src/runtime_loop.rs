@@ -26,6 +26,7 @@ use tgt_core::action::Action;
 use tgt_core::app::App;
 use tgt_core::effect::Effect;
 use tgt_core::model::hit::ClickButton;
+use tgt_core::model::ids::MessageId;
 use tgt_core::model::time::Millis;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, TdUpdate};
@@ -123,6 +124,10 @@ pub struct Core {
     /// is up, so a click that arrives before or under either resolves to
     /// nothing rather than to a stale frame's geometry.
     last_hits: HitMap,
+    /// The last viewport range handed to `update()`. Kept so the report is
+    /// sent only when it changes: a frame that draws the same messages as
+    /// the one before it produces no action at all.
+    last_viewport: Option<(MessageId, MessageId)>,
     /// Builds a replacement TDLib client. `None` — the default, and what
     /// every test that is not about restarting gets — means a client that
     /// reaches `Closed` stays closed, exactly as before this existed.
@@ -187,6 +192,7 @@ impl Core {
             effects: Vec::new(),
             render: RenderState::new(graphics),
             last_hits: HitMap::new(),
+            last_viewport: None,
             cell_size_stale: true,
         }
     }
@@ -423,6 +429,24 @@ fn translate_mouse(hits: &HitMap, ev: MouseEvent) -> Option<Action> {
             .map(|area| Action::Scroll { area, up: false }),
         _ => None,
     }
+}
+
+/// What viewport report a freshly drawn frame owes `update()`, given the
+/// range last reported. `None` means nothing to send: either the frame drew
+/// no messages, or it drew the same ones as the frame before it.
+///
+/// Shaped like [`translate_mouse`] and for the same reason — the frame's
+/// geometry is resolved here so that `update()` receives message ids and
+/// never a `Rect` (architecture §7.5).
+fn viewport_report(hits: &HitMap, last: Option<(MessageId, MessageId)>) -> Option<Action> {
+    let range = hits.visible_messages()?;
+    if Some(range) == last {
+        return None;
+    }
+    Some(Action::ViewportChanged {
+        first: range.0,
+        last: range.1,
+    })
 }
 
 /// Expands a pasted `~/…` path against `$HOME` when the file it names is
@@ -688,6 +712,19 @@ fn draw_if_due(
             terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, render))?;
         }
         gate.mark_drawn(Instant::now());
+
+        // The frame now on screen is the only frame a keystroke can mean
+        // anything against, so the report goes out here, before the loop
+        // goes back to awaiting input. Sharing the one action channel with
+        // keys is what orders them: `update()` always holds the range from
+        // the frame the user was looking at when they pressed a key.
+        //
+        // `Action::ViewportChanged` sets no dirty flag, so this cannot
+        // drive the loop round again.
+        if let Some(action) = viewport_report(&core.last_hits, core.last_viewport) {
+            core.last_viewport = core.last_hits.visible_messages();
+            core.apply(action);
+        }
     }
     Ok(())
 }
@@ -918,5 +955,35 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_frame_reports_its_message_range_once_per_change() {
+        let hits = hit_map();
+
+        // First frame: nothing reported yet, so the range is news.
+        assert!(matches!(
+            viewport_report(&hits, None),
+            Some(Action::ViewportChanged {
+                first: MessageId(3),
+                last: MessageId(3),
+            })
+        ));
+
+        // Same range as last time: no action at all. Without this, every
+        // frame would push an action and the loop would never go quiet.
+        assert!(viewport_report(&hits, Some((MessageId(3), MessageId(3)))).is_none());
+
+        // A different range is news again.
+        assert!(matches!(
+            viewport_report(&hits, Some((MessageId(1), MessageId(2)))),
+            Some(Action::ViewportChanged { .. })
+        ));
+
+        // A frame with no message on it (an overlay, an empty chat) reports
+        // nothing rather than reporting an empty range.
+        let mut chrome_only = HitMap::new();
+        chrome_only.push_area(Rect::new(0, 0, 30, 20), ScrollArea::ChatList);
+        assert!(viewport_report(&chrome_only, None).is_none());
     }
 }
