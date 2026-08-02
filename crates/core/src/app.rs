@@ -685,10 +685,26 @@ impl App {
             return Some(effects);
         }
 
-        // 6. Pane movement.
-        if self.move_pane_focus(key) {
+        // 6. Pane movement. `Ctrl+→` from the chat list opens the selected
+        //    chat — the same path `⏎` and a left-click take (`click_chat_row`)
+        //    — before falling into the swap/pop table below.
+        if key == Key::CtrlRight
+            && self.state.focus.depth() == 1
+            && *self.state.focus.current() == Focus::ChatList
+            && let Some(chat_id) = self.state.chat_list.selected
+        {
             self.dirty = true;
-            return Some(Vec::new());
+            return Some(self.click_chat_row(chat_id));
+        }
+
+        let was_visible = conversation_pane_visible(&self.state);
+        if self.move_pane_focus(key) {
+            // Nothing else fed into `effects` at this call site before —
+            // `move_pane_focus` returns only a bool — so the close check is
+            // the entire payload.
+            let effects = conversation::close_if_now_hidden(&self.state, was_visible);
+            self.dirty = true;
+            return Some(effects);
         }
 
         // 7. Global. Reached only by keys no pane above claimed, which is
@@ -1035,16 +1051,27 @@ impl App {
     /// conversation side is therefore `tab` or `esc`, both of which always
     /// work.
     fn move_pane_focus(&mut self, key: Key) -> bool {
-        if self.state.focus.depth() != 1 {
+        // `Ctrl+←` out of selection mode is the one movement allowed above
+        // depth 1: selection sits on the conversation side and "go left"
+        // means the same thing there as it does in the composer. Every
+        // other overlay (filter, search, palette, modal) keeps the depth
+        // gate — swapping the pane under one would leave it on a pane it
+        // does not belong to.
+        let popping_selection =
+            key == Key::CtrlLeft && *self.state.focus.current() == Focus::Selection;
+        if self.state.focus.depth() != 1 && !popping_selection {
             return false;
         }
+        if popping_selection {
+            selection::exit(&mut self.state);
+            self.state.focus.pop();
+        }
+
         let target = match (self.state.focus.current(), key) {
             (Focus::ChatList, Key::Right | Key::Tab | Key::BackTab) => Focus::Composer,
-            (Focus::Composer, Key::Tab | Key::BackTab) => Focus::ChatList,
-            _ => return false,
+            (Focus::Composer, Key::Tab | Key::BackTab | Key::CtrlLeft) => Focus::ChatList,
+            _ => return popping_selection,
         };
-        // Focusing the conversation side with no chat open would strand the
-        // cursor on a pane where nothing claims a key.
         if target == Focus::Composer && self.state.open_chat.is_none() {
             return false;
         }
@@ -2619,6 +2646,66 @@ mod routing {
         assert_eq!(*app.state().focus.current(), Focus::ChatFilter);
         assert!(app.dispatch_key(Key::Tab).is_none());
         assert_eq!(*app.state().focus.current(), Focus::ChatFilter);
+    }
+
+    #[test]
+    fn ctrl_left_moves_from_composer_to_the_chat_list() {
+        let mut app = chat_open();
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+
+        app.update(Action::Key(Key::CtrlLeft));
+
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert_eq!(app.state().focus.depth(), 1);
+    }
+
+    #[test]
+    fn ctrl_left_pops_selection_mode_on_its_way_to_the_chat_list() {
+        let mut app = chat_open();
+        // `↑` on the empty composer is how selection mode is entered (T25).
+        app.update(Action::Key(Key::Up));
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+
+        app.update(Action::Key(Key::CtrlLeft));
+
+        // One keystroke, not two: the pushed level is unwound AND the base
+        // swapped, and the selection itself is dropped rather than left
+        // dangling under a pane it does not belong to.
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert_eq!(app.state().focus.depth(), 1);
+        assert!(app.state().conversations[&CHAT].selection.is_none());
+    }
+
+    #[test]
+    fn ctrl_left_leaves_overlays_alone() {
+        for overlay in [Focus::Palette, Focus::Help, Focus::ChatFilter] {
+            let mut app = chat_open();
+            app.state.focus.push(overlay.clone());
+
+            app.update(Action::Key(Key::CtrlLeft));
+
+            assert_eq!(
+                *app.state().focus.current(),
+                overlay,
+                "ctrl+left must not swap the pane under an overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_right_opens_the_selected_chat_from_the_chat_list() {
+        // `logged_in()` plus one chat, deliberately NOT opened — `chat_open()`
+        // has already taken the open path this test is about.
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        assert!(app.state().open_chat.is_none());
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+
+        app.update(Action::Key(Key::CtrlRight));
+
+        assert_eq!(app.state().open_chat, Some(CHAT));
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
     }
 
     /// `ctrl+p` from every pane, because no pane above the global layer

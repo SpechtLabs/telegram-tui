@@ -95,6 +95,10 @@ const GROUPS: &[Group] = &[
                 key: "tab / shift+tab",
                 desc: "cycle panes",
             },
+            Row {
+                key: "ctrl+← / ctrl+→",
+                desc: "move pane focus (ctrl+→ opens the selected chat)",
+            },
         ],
     },
     Group {
@@ -165,6 +169,10 @@ const GROUPS: &[Group] = &[
             Row {
                 key: "r f e c d x l o s",
                 desc: "chip shortcuts: reply forward react copy edit delete download open resend",
+            },
+            Row {
+                key: "ctrl+←",
+                desc: "back to the chat list",
             },
             Row {
                 key: "esc",

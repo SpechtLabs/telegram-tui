@@ -923,6 +923,16 @@ actions route by payload (e.g. `TdUpdate::ChatPosition` → `chat_list`,
 `HistoryLoaded` → `history`/`conversation`). Every sub-state module exposes
 plain functions; the canonical handler shapes are:
 
+`move_pane_focus` (`app.rs`) runs the pane-movement row of that table:
+`Key::CtrlLeft`/`Key::CtrlRight` move between `Focus::ChatList` and
+`Focus::Composer` at depth 1, same as `Tab`/`BackTab`. `Focus::Selection` gets
+the one exception above depth 1 — `Ctrl+←` there pops it and swaps the base to
+`Focus::ChatList` in the same keystroke, since selection sits on the
+conversation side and "go left" means the same thing there as in the
+composer. Every other overlay (filter, search, palette, modal) keeps the
+depth-1 gate. `Ctrl+→` from `Focus::ChatList` additionally opens the selected
+chat, reusing `click_chat_row`'s bracket rather than a second open path.
+
 ```rust
 // state/<name>.rs — handlers own their sub-struct, may read AppState context
 pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>>; // None = unclaimed
