@@ -436,6 +436,82 @@ async fn open_chat_loads_history_and_renders() {
     );
 }
 
+/// The viewport feature's one wire into `update()`, end to end.
+///
+/// `HitMap::visible_messages` and `viewport_report` are each unit-tested
+/// against hand-built maps, and `view::conversation` holds a rendered frame
+/// against the range its own hit map reports. None of that touches the wire:
+/// deleting `draw_if_due`'s `viewport_report` block left the entire
+/// workspace green, so the feature could have been inert and nothing would
+/// have said so. `Harness::render` cannot catch it either — it calls
+/// `tgt_ui::view` into a scratch `HitMap` and throws it away, which is the
+/// whole path under test.
+///
+/// So this drives the real `draw_if_due` (via [`Core::draw_once`]) against a
+/// `TestBackend` and asserts `update()` was told what the frame drew. It
+/// matters more than its size suggests: nothing on this branch has been run
+/// against a live app, and this is the only thing distinguishing "the
+/// viewport feature works" from "the viewport feature is inert".
+#[tokio::test]
+async fn a_drawn_frame_reports_its_viewport_into_update() {
+    let mut app = Harness::new(&read_fixture("read_only.jsonl"));
+    app.open_top_chat().await;
+    app.advance_until("the first page to land", |core, _| {
+        core.app()
+            .state()
+            .conversations
+            .get(&ChatId(1))
+            .is_some_and(|c| !c.messages.is_empty())
+    })
+    .await;
+
+    assert_eq!(
+        app.state().visible_messages,
+        None,
+        "nothing has been drawn through the loop yet"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test backend");
+    app.core.draw_once(&mut terminal).expect("draw");
+
+    let (first, last) = app
+        .state()
+        .visible_messages
+        .expect("a drawn frame owes `update()` the range it drew");
+    assert!(first <= last);
+
+    // The reported ids must be messages the window actually holds, and the
+    // range must be a viewport rather than the whole loaded window — 50
+    // messages do not fit in 40 rows.
+    let window = &app.state().conversations[&ChatId(1)];
+    for id in [first, last] {
+        assert!(
+            window.messages.iter().any(|m| m.id == id),
+            "{id:?} is not a loaded message; window is {:?}..={:?}",
+            window.messages.front().map(|m| m.id),
+            window.messages.back().map(|m| m.id),
+        );
+    }
+    assert_eq!(
+        window.messages.back().map(|m| m.id),
+        Some(last),
+        "the chat opens pinned to the bottom, so the newest loaded message \
+         is the last one drawn"
+    );
+    assert!(
+        first > window.messages.front().unwrap().id,
+        "a 40-row frame cannot be showing all {} loaded messages; the \
+         reported range is the viewport, not the window",
+        window.messages.len()
+    );
+
+    // Redrawing the same frame reports nothing new, which is what keeps the
+    // loop from driving itself round for ever.
+    let before = app.state().visible_messages;
+    app.core.draw_once(&mut terminal).expect("redraw");
+    assert_eq!(app.state().visible_messages, before);
+}
+
 /// The spec §5.2 trap, end to end: `getChatHistory` answers a scroll-triggered
 /// page with zero messages even though older history exists. An empty response
 /// is never proof of end-of-history — the client re-issues the request (up to

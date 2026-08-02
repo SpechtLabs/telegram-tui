@@ -9,7 +9,6 @@
 //! (`crates/app/tests/`) drive the same `Core` against `FakeTd`, so what they
 //! exercise is the real machinery rather than a re-implementation of it.
 
-use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -203,6 +202,42 @@ impl Core {
     #[allow(dead_code)]
     pub fn app(&self) -> &App {
         &self.app
+    }
+
+    /// One frame through the real [`draw_if_due`], for tests that care about
+    /// the wiring a frame performs rather than the pixels it produces.
+    /// [`viewport_report`] is why this exists: it is the only thing carrying
+    /// what was drawn back into `update()`, and drawing `tgt_ui::view` into
+    /// a scratch `HitMap` — which is what every test harness here did —
+    /// exercises none of it. Deleting that block used to leave the whole
+    /// workspace green.
+    ///
+    /// Not the call [`run`] makes: `run` owns a [`LiveTheme`] and a
+    /// [`DrawGate`] across frames and threads them in. Both are
+    /// module-private, so this builds a one-shot pair and forces the gate
+    /// open — the loop's 16 ms frame pacing has its own unit tests and is
+    /// not what a caller of this is asking about.
+    // Dead in the bin target itself, like `app()` above: consumed by the
+    // integration tests, which `#[path]`-include this module.
+    #[allow(dead_code)]
+    pub fn draw_once<B: Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let mut live_theme = LiveTheme {
+            theme: Theme::default_dark(),
+            generation: self.app.state().theme_generation,
+        };
+        let mut gate = DrawGate::default();
+        gate.note_dirty(true);
+        draw_if_due(
+            self,
+            &mut live_theme,
+            |_| Theme::default_dark(),
+            || None,
+            terminal,
+            &mut gate,
+        )
     }
 
     /// True once per render-worthy change; cleared on read.
@@ -633,14 +668,14 @@ impl DrawGate {
     }
 }
 
-fn draw_if_due(
+fn draw_if_due<B: Backend>(
     core: &mut Core,
     live_theme: &mut LiveTheme,
     resolve_theme: ThemeResolver,
     measure_cell: CellMeasure,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
     gate: &mut DrawGate,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     // `take_dirty` ALWAYS clears the flag, so it has to be accumulated
     // rather than tested alongside the gate: `take_dirty() && gate_ready`
     // silently discards the change whenever the gate is shut. Human input
@@ -749,7 +784,7 @@ fn draw_if_due(
 /// graphics layer untouched, which is the bug. `swap_buffers` resets the
 /// inactive buffer and flips, so calling it once out of band leaves both
 /// buffers blank — matching the screen that was just cleared.
-fn repaint(terminal: &mut DefaultTerminal) -> io::Result<()> {
+fn repaint<B: Backend>(terminal: &mut ratatui::Terminal<B>) -> Result<(), B::Error> {
     terminal.backend_mut().clear()?;
     terminal.swap_buffers();
     Ok(())
