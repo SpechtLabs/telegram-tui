@@ -180,8 +180,12 @@ pub enum Scroll {
     /// flip the target from the top of the screen to the bottom, which is a
     /// worse defect than the one this variant exists to fix and one no
     /// assertion on `convo.scroll` taken right after the jump can see.
-    /// Everything that writes an anchor from a message id goes through
-    /// [`anchored`] so the two flavours cannot drift apart.
+    /// Every mover that carries a flavour forward builds the variant through
+    /// [`anchored`], so the two cannot drift apart on the paths where
+    /// preserving one is the point. That is narrower than "everything writes
+    /// anchors through `anchored`", which is not true and should not be
+    /// relied on: [`jump_to_message`] and `state::search`'s hit stepping each
+    /// write a variant directly, on purpose (architecture §7.5.4).
     ///
     /// Core treats this identically to `At` everywhere else: both name the
     /// same message index, and only the view cares which edge is pinned.

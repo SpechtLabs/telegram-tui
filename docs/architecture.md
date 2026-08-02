@@ -2724,7 +2724,21 @@ just jumped to from the top of the screen to the bottom on their very next
 keypress — a worse defect than the one this fixes, and one that a unit test
 reading `convo.scroll` immediately after the jump cannot see. `anchor_to` and
 `anchor_to_top` are therefore two thin wrappers over one flavoured helper,
-and every anchor mover goes through it.
+`anchor_to_flavoured`, which builds the variant through `anchored(id, top)`.
+
+**`anchored` is not a choke point, and nothing should be written as though it
+were.** Three sites build a `Scroll` from a message id without it, each
+deliberately: `jump_to_message` writes `Scroll::AtTop` directly to keep its
+"sets the anchor and nothing else" contract (its own doc comment says why —
+the target is routinely not loaded, and the paging that fetches it is §7.5.1's
+ambient trigger rather than a request from there), and `state::search`'s two
+hit-stepping sites write `Scroll::At` directly because search stepping stays
+bottom-anchored by decision, not by omission. What `anchored` actually
+guarantees is narrower and still worth having: every mover that *carries a
+flavour forward* — `anchor_to_flavoured`, `move_anchor`,
+`scroll_conversation_move`, `reanchor_after_deletion` — builds the variant in
+one place, so the two flavours cannot drift in the paths where preserving one
+is the whole point.
 
 **The bottom-fill fallback is part of the contract, not an edge case.** When
 too few newer messages exist to fill the pane, the target *cannot* be
@@ -2737,14 +2751,24 @@ message is deliberate: each message's block is then built once per frame, so
 `RenderState::images` is never asked to plan the same photo twice and its
 end-of-frame sweep cannot see a message as touched that was never drawn.
 
-**Core treats `AtTop` exactly like `At` everywhere except the fill
-direction.** Both resolve to the same message index, so the seven core match
-sites (`scroll_conversation_move`, `media`'s auto-download anchor, the
-deletion re-anchor, `step_anchor`, `evict_excess`, `move_anchor`,
-`trigger_paging_if_near_top`) take a shared arm. The one that deliberately
-does *not* is `mark_visible_read`, which gates on `Scroll::Bottom`: a user
-who jumped backward is not looking at the newest messages, so not marking
-them read is correct.
+**Core treats `AtTop` exactly like `At` wherever only the anchored *message*
+matters.** Both resolve to the same index, so four of the seven core match
+sites take a shared `Scroll::At { message_id, .. } | Scroll::AtTop
+{ message_id }` arm and never ask which: `media`'s auto-download anchor,
+`evict_excess` (whose own comment says the pinned edge is irrelevant to a
+distance-from-each-end question), `trigger_paging_if_near_top`, and
+`move_anchor`/`scroll_conversation_move`, which match jointly and then read
+the flavour back out with a separate `matches!` in order to carry it forward.
+
+The two that split into per-flavour arms do so because they need the bit, not
+by accident: `step_anchor` and the deletion re-anchor in
+`remove_deleted_messages` both map the current variant to a `top: bool` they
+hand to `anchored`. That is the same "movement preserves the flavour" rule
+above, so a shared arm is exactly what they cannot use.
+
+`mark_visible_read` is the site that treats neither like the other: it gates
+on `Scroll::Bottom`, because a user who jumped backward is not looking at the
+newest messages and not marking them read is correct.
 
 **Scope.** The three quote-jump paths use it — `Chip::JumpToQuoted`
 (`AnchorPolicy::JumpToTop`), `advance_hunt`'s landing, and
