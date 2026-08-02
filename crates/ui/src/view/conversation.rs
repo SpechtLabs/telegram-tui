@@ -23,10 +23,11 @@
 //!
 //! ## Bottom-up fill algorithm
 //!
-//! 1. Resolve the scroll anchor to a `(message index, line_offset)` pair
-//!    ([`resolve_anchor`]): `Scroll::Bottom` is the newest loaded message;
-//!    `Scroll::At` looks its message up in the window and falls back to the
-//!    newest loaded message if it is not there (evicted or never loaded).
+//! 1. Resolve the scroll anchor to a `(message index, line_offset,
+//!    direction)` triple ([`resolve_anchor`]): `Scroll::Bottom` is the newest
+//!    loaded message; `Scroll::At` looks its message up in the window and
+//!    falls back to the newest loaded message if it is not there (evicted or
+//!    never loaded).
 //! 2. Walk `convo.messages` backward (newest → oldest) from that index,
 //!    pulling each message's lines from the cache and prepending them to a
 //!    growing row buffer, so the buffer is always in correct top-to-bottom
@@ -50,6 +51,27 @@
 //!    fell short (a short conversation), pad the front with blank rows so
 //!    the real content still sits at the bottom of the pane instead of the
 //!    top.
+//!
+//! ## The other direction: `Scroll::AtTop` (architecture §7.5.4)
+//!
+//! A jump to a quoted message wants its target on the *first* row, not the
+//! last, so `Scroll::AtTop` walks the same steps forward: append blocks to
+//! the back until the pane is full, then clip from the back, leaving the
+//! anchor pinned at row 0 and the bottom-most block cut mid-render. The
+//! anchor's own block-boundary separator is left off — it belongs above the
+//! viewport rather than on its first row.
+//!
+//! When too few newer messages exist to fill the pane the target *cannot* be
+//! top-most: putting it there would leave blank rows below real content. The
+//! fill then keeps going backward from the same anchor, which produces
+//! exactly the bottom-anchored frame. Continuing rather than restarting is
+//! what keeps every block built once per frame — a rebuild would ask
+//! [`RenderState`]'s image store to plan the same photo twice and leave its
+//! end-of-frame sweep holding a message that was never drawn.
+//!
+//! [`build_block`] is the whole per-message body, shared by both directions.
+//! Nothing in it is direction-dependent, and a second copy would drift
+//! exactly where only the snapshots would catch it.
 //!
 //! ## The per-frame half of a block (T62)
 //!
@@ -539,10 +561,157 @@ struct ImageTag {
     fallback: Line<'static>,
 }
 
-/// The bottom-up walk described in the module docs. Always returns exactly
-/// `height` rows (padded with blanks at the front if the loaded window is
-/// shorter than the pane) unless `width`, `height`, or the window itself is
-/// empty, in which case it returns nothing.
+/// Everything [`build_block`] needs that is the same for every message in a
+/// frame. Bundled so both fill directions call it with identical inputs
+/// instead of threading a dozen parameters through twice.
+struct BlockCtx<'a> {
+    convo: &'a ConversationState,
+    media: &'a MediaState,
+    chat_search: Option<&'a ChatSearchState>,
+    theme: &'a Theme,
+    theme_generation: u64,
+    width: u16,
+    /// An image never gets more rows than the pane itself has, whatever
+    /// `MAX_IMAGE_ROWS` would otherwise allow: a photo that fills the entire
+    /// viewport leaves no room for the conversation it is part of.
+    image_rows_budget: u16,
+}
+
+/// Whether a block-boundary blank row belongs directly above message `idx`
+/// (spec §7.1's mock: one blank between blocks, none inside a group). The
+/// same boolean also decides whether `idx` gets its own header, which is why
+/// [`build_block`] derives both from one `groups_with` call.
+fn separates_from_previous(convo: &ConversationState, idx: usize) -> bool {
+    idx > 0 && !groups_with(&convo.messages[idx - 1], &convo.messages[idx])
+}
+
+/// Lays message `idx` out as the rows it occupies, top to bottom: its
+/// block-boundary separator, its cached lines, and the per-frame
+/// attachment / reaction / receipt rows the layout cache must never hold
+/// (module docs' "The per-frame half of a block").
+///
+/// Direction-independent on purpose. The two fills below differ only in
+/// which end of the row buffer they attach the result to, so everything that
+/// is *not* about direction — image row reservation, the `RowHits` scan that
+/// feeds the hit map's spoiler and reply-quote targets, grouping, selection
+/// and search highlighting — lives here once. A second copy would drift, and
+/// what drifts first is exactly what only the snapshots catch.
+///
+/// `leading_separator` is the caller answering "is there anything above this
+/// block still on screen?". The backward fill always says yes; the forward
+/// fill says no for its very first block, whose separator belongs above the
+/// viewport's first row rather than on it.
+///
+/// `trim_tail` drops that many lines off the end of the cached rendering —
+/// `Scroll::At`'s `line_offset`, i.e. how much of the anchor has scrolled
+/// past the bottom edge. Only ever non-zero for the backward fill's anchor.
+fn build_block(
+    ctx: &BlockCtx<'_>,
+    rs: &mut RenderState,
+    idx: usize,
+    leading_separator: bool,
+    trim_tail: u16,
+) -> Vec<WindowRow> {
+    let convo = ctx.convo;
+    let msg = &convo.messages[idx];
+    let separates = separates_from_previous(convo, idx);
+    // See the module docs: this one boolean decides both whether `msg` gets
+    // its own header and whether a separator belongs above it.
+    let grouped = idx > 0 && !separates;
+    let revealed = convo.revealed_spoilers.contains(&msg.id);
+    let mut msg_lines = rendered_lines(
+        msg,
+        grouped,
+        revealed,
+        ctx.width,
+        ctx.theme_generation,
+        ctx.theme,
+        &mut rs.cache,
+    );
+
+    if trim_tail > 0 {
+        let keep = msg_lines.len().saturating_sub(trim_tail as usize);
+        msg_lines.truncate(keep);
+    }
+
+    // Scanned from the cached lines only, before the per-frame ones below
+    // are appended — a spoiler block or a reply-quote line only ever comes
+    // from `rendered_lines`, never from the attachment, reaction or receipt
+    // lines (module docs on `RowHits`).
+    let reply_target = msg.reply_to.as_ref().map(|r| r.message_id);
+    let row_hits: Vec<RowHits> = msg_lines
+        .iter()
+        .map(|line| scan_row_hits(line, reply_target))
+        .collect();
+
+    // The attachment line, reactions, and the receipt are drawn here, per
+    // frame, on top of what the cache handed back — never folded into the
+    // cached lines themselves. All three change (a download progresses, a
+    // reaction is toggled, `last_read_outbox` advances) without `message_id`
+    // or `width` changing, which are the only things that invalidate a
+    // `LayoutKey` entry; caching them would leave stale percentages, counts,
+    // and checkmarks on screen. See the module docs' "The per-frame half of
+    // a block".
+    let reserved = append_attachment(
+        &mut msg_lines,
+        msg,
+        grouped,
+        ctx.media,
+        ctx.width,
+        ctx.image_rows_budget,
+        ctx.theme,
+        rs,
+    );
+    append_reactions(&mut msg_lines, msg, ctx.width, ctx.theme);
+    if msg.is_outgoing {
+        append_receipt(
+            &mut msg_lines,
+            msg,
+            convo.last_read_outbox,
+            ctx.width,
+            ctx.theme,
+        );
+    }
+
+    let selected = convo
+        .selection
+        .as_ref()
+        .is_some_and(|s| s.message_id == msg.id);
+    let hit_kind = search_hit_kind(convo, ctx.chat_search, msg.id);
+    let mut block: Vec<WindowRow> = Vec::with_capacity(msg_lines.len() + 1);
+    if leading_separator && separates {
+        block.push(WindowRow::blank());
+    }
+    block.extend(msg_lines.into_iter().enumerate().map(|(i, line)| {
+        // `row_hits` only has entries for the cached lines scanned above;
+        // the attachment/reaction/receipt rows appended after that scan fall
+        // through to the `unwrap_or_default()` (neither ever renders a
+        // spoiler block or a reply-quote line).
+        let hits = row_hits.get(i).cloned().unwrap_or_default();
+        WindowRow {
+            message_id: Some(msg.id),
+            image: reserved
+                .as_ref()
+                .filter(|r| r.covers(i))
+                .map(|r| Rc::clone(&r.tag)),
+            spoiler_cols: hits.spoiler_cols,
+            reply_quote: hits.reply_quote,
+            line: apply_search_highlight(
+                apply_selection_highlight(line, selected, ctx.width, ctx.theme),
+                hit_kind,
+                i == 0,
+                ctx.theme,
+            ),
+        }
+    }));
+    block
+}
+
+/// The walk described in the module docs, in whichever direction
+/// [`resolve_anchor`] asked for. Always returns exactly `height` rows
+/// (padded with blanks at the front if the loaded window is shorter than the
+/// pane) unless `width`, `height`, or the window itself is empty, in which
+/// case it returns nothing.
 #[allow(clippy::too_many_arguments)]
 fn build_window(
     convo: &ConversationState,
@@ -558,111 +727,81 @@ fn build_window(
     if width == 0 || height == 0 || convo.messages.is_empty() {
         return rows;
     }
-    // An image never gets more rows than the pane itself has, whatever
-    // `MAX_IMAGE_ROWS` would otherwise allow: a photo that fills the entire
-    // viewport leaves no room for the conversation it is part of.
-    let image_rows_budget = height;
+    let ctx = BlockCtx {
+        convo,
+        media,
+        chat_search,
+        theme,
+        theme_generation,
+        width,
+        image_rows_budget: height,
+    };
     let height = height as usize;
 
-    let (anchor_idx, line_offset) = resolve_anchor(convo);
-    let mut idx = anchor_idx;
+    let (anchor_idx, line_offset, fill) = resolve_anchor(convo);
+    let last = convo.messages.len() - 1;
 
-    loop {
-        let msg = &convo.messages[idx];
-        // See the module docs: this one boolean decides both whether `msg`
-        // gets its own header and whether a separator belongs above it.
-        let grouped = idx > 0 && groups_with(&convo.messages[idx - 1], msg);
-        let revealed = convo.revealed_spoilers.contains(&msg.id);
-        let mut msg_lines = rendered_lines(
-            msg,
-            grouped,
-            revealed,
-            width,
-            theme_generation,
-            theme,
-            &mut rs.cache,
-        );
-
-        if idx == anchor_idx && line_offset > 0 {
-            let keep = msg_lines.len().saturating_sub(line_offset as usize);
-            msg_lines.truncate(keep);
-        }
-
-        // Scanned from the cached lines only, before the per-frame ones
-        // below are appended — a spoiler block or a reply-quote line only
-        // ever comes from `rendered_lines`, never from the attachment,
-        // reaction or receipt lines (module docs on `RowHits`).
-        let reply_target = msg.reply_to.as_ref().map(|r| r.message_id);
-        let row_hits: Vec<RowHits> = msg_lines
-            .iter()
-            .map(|line| scan_row_hits(line, reply_target))
-            .collect();
-
-        // The attachment line, reactions, and the receipt are drawn here,
-        // per frame, on top of what the cache handed back — never folded
-        // into the cached lines themselves. All three change (a download
-        // progresses, a reaction is toggled, `last_read_outbox` advances)
-        // without `message_id` or `width` changing, which are the only
-        // things that invalidate a `LayoutKey` entry; caching them would
-        // leave stale percentages, counts, and checkmarks on screen. See
-        // the module docs' "The per-frame half of a block".
-        let reserved = append_attachment(
-            &mut msg_lines,
-            msg,
-            grouped,
-            media,
-            width,
-            image_rows_budget,
-            theme,
-            rs,
-        );
-        append_reactions(&mut msg_lines, msg, width, theme);
-        if msg.is_outgoing {
-            append_receipt(&mut msg_lines, msg, convo.last_read_outbox, width, theme);
-        }
-
-        let selected = convo
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.message_id == msg.id);
-        let hit_kind = search_hit_kind(convo, chat_search, msg.id);
-        let mut block: Vec<WindowRow> = Vec::with_capacity(msg_lines.len() + 1);
-        if idx > 0 && !grouped {
-            block.push(WindowRow::blank());
-        }
-        block.extend(msg_lines.into_iter().enumerate().map(|(i, line)| {
-            // `row_hits` only has entries for the cached lines scanned
-            // above; the attachment/reaction/receipt rows appended after
-            // that scan fall through to the `unwrap_or_default()` (neither
-            // ever renders a spoiler block or a reply-quote line).
-            let hits = row_hits.get(i).cloned().unwrap_or_default();
-            WindowRow {
-                message_id: Some(msg.id),
-                image: reserved
-                    .as_ref()
-                    .filter(|r| r.covers(i))
-                    .map(|r| Rc::clone(&r.tag)),
-                spoiler_cols: hits.spoiler_cols,
-                reply_quote: hits.reply_quote,
-                line: apply_search_highlight(
-                    apply_selection_highlight(line, selected, width, theme),
-                    hit_kind,
-                    i == 0,
-                    theme,
-                ),
+    // Forward fill: the anchor's first line is row 0 and the pane grows
+    // downward from it. Its own separator is left off — it belongs above the
+    // viewport, not on its first row.
+    if fill == Fill::Forward {
+        let mut idx = anchor_idx;
+        loop {
+            rows.extend(build_block(&ctx, rs, idx, idx != anchor_idx, 0));
+            if rows.len() >= height || idx == last {
+                break;
             }
-        }));
-
-        // `block` is in top-to-bottom order already; pushing it to the
-        // front in reverse keeps that order at the front of `rows`.
-        for row in block.into_iter().rev() {
-            rows.push_front(row);
+            idx += 1;
         }
-
-        if rows.len() >= height || idx == 0 {
-            break;
+        if rows.len() >= height {
+            // Clip from the BACK, so the anchor stays pinned at row 0 and
+            // the bottom-most block is the one cut mid-render.
+            while rows.len() > height {
+                rows.pop_back();
+            }
+            return rows;
         }
-        idx -= 1;
+        // Short fill: too few newer messages exist for the anchor to be
+        // top-most, and rendering it there would leave blank rows below real
+        // content. Keep walking, backward from the same anchor — that lands
+        // on exactly the bottom-anchored frame without rebuilding a single
+        // block, which matters because a rebuilt block would ask
+        // `RenderState::images` to plan the same photo twice and leave the
+        // end-of-frame sweep holding messages that were never drawn.
+        // Architecture §7.5.4.
+        if anchor_idx > 0 {
+            if separates_from_previous(convo, anchor_idx) {
+                rows.push_front(WindowRow::blank());
+            }
+            let mut idx = anchor_idx - 1;
+            loop {
+                for row in build_block(&ctx, rs, idx, true, 0).into_iter().rev() {
+                    rows.push_front(row);
+                }
+                if rows.len() >= height || idx == 0 {
+                    break;
+                }
+                idx -= 1;
+            }
+        }
+    } else {
+        let mut idx = anchor_idx;
+        loop {
+            let trim_tail = if idx == anchor_idx { line_offset } else { 0 };
+            // `build_block` returns top-to-bottom order already; pushing it
+            // to the front in reverse keeps that order at the front of
+            // `rows`.
+            for row in build_block(&ctx, rs, idx, true, trim_tail)
+                .into_iter()
+                .rev()
+            {
+                rows.push_front(row);
+            }
+            if rows.len() >= height || idx == 0 {
+                break;
+            }
+            idx -= 1;
+        }
     }
 
     while rows.len() > height {
@@ -772,22 +911,39 @@ fn tint_search_hit(span: Span<'static>, emphasize: bool, theme: &Theme) -> Span<
     Span::styled(span.content, style)
 }
 
-/// Resolves `convo.scroll` to a concrete `(index, line_offset)` into
-/// `convo.messages` (ascending by id, so index 0 is the oldest loaded
-/// message). `Scroll::At` naming a message id that fell out of the loaded
-/// window (evicted, or never loaded) falls back to the newest message with
-/// a zero offset — the same recovery `state/conversation.rs` itself takes
-/// when an anchor disappears out from under it.
-fn resolve_anchor(convo: &ConversationState) -> (usize, u16) {
+/// Which way [`build_window`] walks out from the anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Newest → oldest, prepending: the anchor's bottom edge is the pane's
+    /// last row. Every anchor but `Scroll::AtTop` resolves to this.
+    Backward,
+    /// Oldest → newest, appending: the anchor's first line is row 0. Falls
+    /// back to a backward continuation when too few newer messages exist to
+    /// fill the pane (architecture §7.5.4).
+    Forward,
+}
+
+/// Resolves `convo.scroll` to a concrete `(index, line_offset, direction)`
+/// into `convo.messages` (ascending by id, so index 0 is the oldest loaded
+/// message). An anchored variant naming a message id that fell out of the
+/// loaded window (evicted, or never loaded) falls back to the newest message
+/// with a zero offset, walking backward — the same recovery
+/// `state/conversation.rs` itself takes when an anchor disappears out from
+/// under it, and the only case where `Scroll::AtTop` does not fill forward.
+fn resolve_anchor(convo: &ConversationState) -> (usize, u16, Fill) {
     let last = convo.messages.len() - 1;
     match convo.scroll {
-        Scroll::Bottom => (last, 0),
+        Scroll::Bottom => (last, 0, Fill::Backward),
         Scroll::At {
             message_id,
             line_offset,
         } => match index_of(convo, message_id) {
-            Some(idx) => (idx, line_offset),
-            None => (last, 0),
+            Some(idx) => (idx, line_offset, Fill::Backward),
+            None => (last, 0, Fill::Backward),
+        },
+        Scroll::AtTop { message_id } => match index_of(convo, message_id) {
+            Some(idx) => (idx, 0, Fill::Forward),
+            None => (last, 0, Fill::Backward),
         },
     }
 }
@@ -1172,6 +1328,7 @@ mod tests {
 
     use super::*;
     use crate::render::image::{Capability, MAX_IMAGE_ROWS};
+    use crate::render::message_layout::GROUP_WINDOW_SECS;
 
     const CHAT: ChatId = ChatId(1);
     const BASE_DATE: i64 = 1_700_000_000;
@@ -1394,6 +1551,105 @@ mod tests {
             "newest message must not be visible"
         );
         insta::assert_snapshot!(rendered);
+    }
+
+    /// `count` one-line incoming messages, "msg 1" .. "msg N", each spaced
+    /// past `GROUP_WINDOW_SECS` from the last so none of them group. Every
+    /// block is therefore the same shape — separator, header, body — which
+    /// is what makes the row arithmetic in the top-anchor tests readable.
+    fn numbered_history(count: i64) -> Vec<MessageView> {
+        let alice = Sender::User(UserId(1));
+        (1..=count)
+            .map(|id| {
+                text_msg(
+                    id,
+                    alice,
+                    "Alice",
+                    false,
+                    id * (GROUP_WINDOW_SECS + 60),
+                    &format!("msg {id}"),
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn at_top_puts_its_message_on_the_first_row_and_clips_the_bottom() {
+        // Thirty messages newer than the target, so a screen's worth sits
+        // BELOW it and top-anchoring is actually achievable.
+        let state = fixture_state(Some(conversation(
+            numbered_history(40),
+            Scroll::AtTop {
+                message_id: MessageId(10),
+            },
+        )));
+        let rendered = render_to_string(80, 12, &state);
+        let rows: Vec<&str> = rendered.lines().collect();
+
+        // Row 0 is the target's own header and row 1 its text: a block is
+        // header-then-body, and the separator that would sit above the
+        // header belongs off the top of the pane, not on row 0.
+        assert!(
+            rows[0].contains("Alice"),
+            "row 0 must be the jump target's own header, got: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("msg 10"),
+            "the jump target's text must be the second row, directly under \
+             its header, got: {:?}",
+            rows[1]
+        );
+        assert!(
+            !rendered.contains("msg 9"),
+            "nothing older than the target may be on screen when it is \
+             top-anchored:\n{rendered}"
+        );
+        // The walk kept going until the pane was full rather than stopping
+        // at the target: msg 13 is the fourth block down, which is as far as
+        // twelve rows reach.
+        assert!(
+            rendered.contains("msg 13"),
+            "forward fill must keep appending newer messages until the pane \
+             is full, got:\n{rendered}"
+        );
+        // And what fills it is real content, not padded blanks: four
+        // two-line blocks with one-row separators between them put eight
+        // rows of text on a twelve-row pane.
+        assert!(
+            rows.iter().filter(|r| !r.trim().is_empty()).count() >= 8,
+            "forward fill must fill the pane, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn at_top_near_the_end_of_history_falls_back_to_the_bottom() {
+        // Only one message newer than the target: it CANNOT be top-most
+        // without leaving blank rows under real content.
+        let state = fixture_state(Some(conversation(
+            numbered_history(12),
+            Scroll::AtTop {
+                message_id: MessageId(11),
+            },
+        )));
+        let rendered = render_to_string(80, 12, &state);
+        let rows: Vec<&str> = rendered.lines().collect();
+
+        assert!(
+            rows.last().unwrap().contains("msg 12"),
+            "short fill must fall back to bottom-anchored, newest last, \
+             got:\n{rendered}"
+        );
+        // The fallback is a real backward fill, not the forward rows shoved
+        // downward: `msg 10` is older than the anchor, so the forward walk
+        // never visited it and only a backward continuation can put it on
+        // screen.
+        assert!(
+            rendered.contains("msg 10"),
+            "the fallback must fill upward from the target with older \
+             messages, got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -2367,7 +2623,23 @@ mod tests {
                 line_offset: 3,
             },
         );
-        assert_eq!(resolve_anchor(&convo), (0, 0));
+        assert_eq!(resolve_anchor(&convo), (0, 0, Fill::Backward));
+    }
+
+    /// The same fallback for the top-anchored flavour, and the one case
+    /// where it does NOT fill forward: with nothing to anchor on there is no
+    /// "top" to put a message at, so the recovery is the ordinary
+    /// bottom-anchored frame rather than a forward walk from an arbitrary
+    /// index.
+    #[test]
+    fn resolve_anchor_falls_back_to_a_backward_fill_when_a_top_anchor_is_missing() {
+        let convo = conversation(
+            numbered_history(3),
+            Scroll::AtTop {
+                message_id: MessageId(999),
+            },
+        );
+        assert_eq!(resolve_anchor(&convo), (2, 0, Fill::Backward));
     }
 
     // --- reactions and receipts (T35) --------------------------------

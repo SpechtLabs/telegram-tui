@@ -239,9 +239,19 @@ enum AnchorPolicy {
     /// `↑`/`↓`: hold the viewport still while the target is on screen, and
     /// scroll by exactly one message when the cursor walks off an edge.
     KeepVisible,
-    /// A deliberate jump (entering selection, the reply-quote chip): bring
-    /// the target into view unconditionally.
+    /// A deliberate jump (entering selection on a specific message): bring
+    /// the target into view unconditionally, bottom-anchored.
     Jump,
+    /// The reply-quote chip: bring the target into view unconditionally AND
+    /// put it on the first visible row (architecture §7.5.4).
+    ///
+    /// Separate from [`AnchorPolicy::Jump`] rather than folded into it
+    /// because `Jump`'s other caller is [`enter_at`], the mouse right-click
+    /// that opens selection on the message under the cursor. That message is
+    /// by definition already on screen, and hoisting it to the top would be a
+    /// scroll the user never asked for — the same defect
+    /// [`AnchorPolicy::KeepVisible`] exists to prevent for `↑`/`↓`.
+    JumpToTop,
 }
 
 /// Points the selection at `message_id`: fills in a missing reply excerpt,
@@ -305,6 +315,11 @@ fn select(
         // jump: the anchor follows the target, exactly as before.
         (AnchorPolicy::KeepVisible, None) | (AnchorPolicy::Jump, _) => {
             conversation::anchor_to(convo, chat_id, message_id, now)
+        }
+        // The quote jump, and the only caller that wants the target on the
+        // FIRST row rather than the last (architecture §7.5.4).
+        (AnchorPolicy::JumpToTop, _) => {
+            conversation::anchor_to_top(convo, chat_id, message_id, now)
         }
     });
     effects.extend(media::auto_download_photos(app, chat_id));
@@ -539,8 +554,9 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
                 .is_some_and(|convo| conversation::index_of(&convo.messages, quoted).is_some());
             if loaded {
                 // A deliberate jump: the view follows unconditionally,
-                // unlike an `↑`/`↓` step (see `AnchorPolicy`).
-                select(app, chat_id, quoted, AnchorPolicy::Jump)
+                // unlike an `↑`/`↓` step (see `AnchorPolicy`), and lands the
+                // quote on the first row rather than the last.
+                select(app, chat_id, quoted, AnchorPolicy::JumpToTop)
             } else {
                 conversation::start_hunt(app, chat_id, quoted)
             }
@@ -1681,11 +1697,12 @@ mod tests {
         handle_key(&mut app, Key::Char('j'));
 
         assert_eq!(selection(&app).message_id, MessageId(3));
+        // Top-anchored, not `Scroll::At`: `AnchorPolicy::JumpToTop` puts the
+        // quote on the first visible row (architecture §7.5.4).
         assert_eq!(
             app.conversations[&CHAT].scroll,
-            Scroll::At {
+            Scroll::AtTop {
                 message_id: MessageId(3),
-                line_offset: 0,
             }
         );
     }

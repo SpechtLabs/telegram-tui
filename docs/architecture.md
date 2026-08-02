@@ -1142,7 +1142,16 @@ pub enum Scroll {
     /// Pinned to newest; new messages keep the view at the bottom.
     Bottom,
     /// Anchored at a message (stable across prepends), offset in laid-out lines.
+    /// The message's BOTTOM edge sits at the viewport's last row; the view
+    /// fills backward from it.
     At { message_id: MessageId, line_offset: u16 },
+    /// Anchored with this message's TOP edge at the viewport's first row —
+    /// where a deliberate jump lands (the reply-quote chip, its backward hunt,
+    /// and the mouse click on a quote line). The opposite fill direction to
+    /// `At`.
+    ///
+    /// Carries no `line_offset`: the target's first line IS row 0.
+    AtTop { message_id: MessageId },
 }
 
 #[derive(Debug)]
@@ -2535,8 +2544,8 @@ cache key from a bool to a per-entity set, a §8.2 change out of scope here;
 this amendment reads that existing commitment rather than relitigating it.
 
 **Jump when the quoted message is not loaded.** `conversation::jump_to_message`
-sets `Scroll::At { message_id: quoted, line_offset: 0 }` and nothing else —
-deliberately mirroring `state::search`'s `n`/`N` stepping (`step()`), which
+sets the scroll anchor to the quoted id and nothing else — deliberately
+mirroring `state::search`'s `n`/`N` stepping (`step()`), which
 already jumps to a TDLib-supplied message id with no guarantee it is in the
 loaded window and does not page for it directly. Per that module's own doc
 comment, "conversation.rs's own near-top/near-bottom paging logic... is
@@ -2615,6 +2624,58 @@ as a fallback when that anchor move's own near-top trigger does not (paging
 already in flight). There is one paging state machine and one way to drive
 it toward an id outside the window; the hunt adds a budget and a caller that
 notices when to stop asking, not a competing request path.
+
+### 7.5.4 `Scroll::AtTop`: a jump lands its target at the top of the viewport (2026-08-02)
+
+User feedback after §7.5.1 and §7.5.3 shipped: jumping to a quoted message
+put it on the **last** visible row, with the whole screen above it showing
+context the user had just come from and nothing of what they jumped to read.
+It belongs on the **first** row.
+
+This cannot be fixed by choosing a different anchor message. `Scroll::At`
+means "this message's bottom edge sits at the viewport bottom" and the view
+fills backward from it, so landing message M at the top would mean anchoring
+at whichever message ends up one screen *below* M — which needs laid-out line
+heights, and those live in `tgt-ui` and never come back to core (§4.6, §7.5).
+So `Scroll::AtTop { message_id }` names the intent and the view resolves the
+direction, the same division of labour §7.5 already uses for click
+coordinates.
+
+**Anchor movement preserves the flavour.** `step_anchor` and `move_anchor`
+map `AtTop{M}` to `AtTop{M±1}` and `At{M}` to `At{M±1}`; only reaching the
+newest loaded message re-pins either to `Scroll::Bottom`. Converting `AtTop`
+back to `At` on a scroll or a selection step would flip the message the user
+just jumped to from the top of the screen to the bottom on their very next
+keypress — a worse defect than the one this fixes, and one that a unit test
+reading `convo.scroll` immediately after the jump cannot see. `anchor_to` and
+`anchor_to_top` are therefore two thin wrappers over one flavoured helper,
+and every anchor mover goes through it.
+
+**The bottom-fill fallback is part of the contract, not an edge case.** When
+too few newer messages exist to fill the pane, the target *cannot* be
+top-most: rendering it there would leave blank rows below real content.
+`view::conversation`'s forward fill detects the short result and continues
+backward from the same anchor, which produces exactly the bottom-anchored
+frame. A quoted message a few from the end of history hits this routinely.
+Continuing the existing fill rather than restarting one from the newest
+message is deliberate: each message's block is then built once per frame, so
+`RenderState::images` is never asked to plan the same photo twice and its
+end-of-frame sweep cannot see a message as touched that was never drawn.
+
+**Core treats `AtTop` exactly like `At` everywhere except the fill
+direction.** Both resolve to the same message index, so the seven core match
+sites (`scroll_conversation_move`, `media`'s auto-download anchor, the
+deletion re-anchor, `step_anchor`, `evict_excess`, `move_anchor`,
+`trigger_paging_if_near_top`) take a shared arm. The one that deliberately
+does *not* is `mark_visible_read`, which gates on `Scroll::Bottom`: a user
+who jumped backward is not looking at the newest messages, so not marking
+them read is correct.
+
+**Scope.** The three quote-jump paths use it — `Chip::JumpToQuoted`
+(`AnchorPolicy::JumpToTop`), `advance_hunt`'s landing, and
+`jump_to_message`, which §7.5.1's mouse click calls. `state::search`'s `n`/`N`
+hit stepping stays bottom-anchored: same annoyance, different feature, and
+changing it is a decision about search, not about quotes.
 
 ## 8. Decisions the spec delegated
 

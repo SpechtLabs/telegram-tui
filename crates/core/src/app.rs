@@ -1318,16 +1318,20 @@ impl App {
             return Vec::new();
         }
         let last_idx = (convo.messages.len() - 1) as isize;
-        let current_idx = match convo.scroll {
+        // `top` rides along for the same reason `move_anchor`'s does: a wheel
+        // notch after a jump-to-quote must not flip the target from the first
+        // visible row to the last (`Scroll::AtTop`).
+        let (current_idx, top) = match convo.scroll {
             Scroll::Bottom => {
                 if delta >= 0 {
                     return Vec::new();
                 }
-                last_idx + 1
+                (last_idx + 1, false)
             }
-            Scroll::At { message_id, .. } => {
+            Scroll::At { message_id, .. } | Scroll::AtTop { message_id } => {
+                let top = matches!(convo.scroll, Scroll::AtTop { .. });
                 match conversation::index_of(&convo.messages, message_id) {
-                    Some(idx) => idx as isize,
+                    Some(idx) => (idx as isize, top),
                     // Anchor older than everything loaded: waiting on the page
                     // that contains it, same as `move_anchor`'s own arm for this
                     // case. Stepping it by `delta` is meaningless with nothing
@@ -1353,10 +1357,7 @@ impl App {
         }
         let clamped_idx = target_idx.clamp(0, last_idx) as usize;
         let new_id = convo.messages[clamped_idx].id;
-        convo.scroll = Scroll::At {
-            message_id: new_id,
-            line_offset: 0,
-        };
+        convo.scroll = conversation::anchored(new_id, top);
         conversation::trigger_paging_if_near_top(convo, chat_id, now)
     }
 
@@ -3398,11 +3399,13 @@ mod routing {
             button: ClickButton::Left,
         });
         assert!(effects.is_empty());
+        // Top-anchored: a click on a quote line is a deliberate jump, and
+        // landing the target on the last row would fill the pane with what
+        // the user was already looking at (architecture §7.5.4).
         assert_eq!(
             app.state().conversations[&CHAT].scroll,
-            Scroll::At {
+            Scroll::AtTop {
                 message_id: MessageId(10),
-                line_offset: 0,
             }
         );
         assert_eq!(

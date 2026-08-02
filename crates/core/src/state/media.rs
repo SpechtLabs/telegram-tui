@@ -234,7 +234,11 @@ pub fn auto_download_photos(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> 
     };
     let anchor_idx = match convo.scroll {
         Scroll::Bottom => convo.messages.len().checked_sub(1),
-        Scroll::At { message_id, .. } => conversation::index_of(&convo.messages, message_id),
+        // Which edge the anchor pins does not change which message it names,
+        // and a download radius is measured in messages.
+        Scroll::At { message_id, .. } | Scroll::AtTop { message_id } => {
+            conversation::index_of(&convo.messages, message_id)
+        }
     };
     let Some(anchor_idx) = anchor_idx else {
         return Vec::new();

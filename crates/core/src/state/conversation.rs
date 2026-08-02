@@ -160,11 +160,56 @@ const MAX_VIEW_ATTEMPTS: u8 = 3;
 pub enum Scroll {
     /// Pinned to newest; new messages keep the view at the bottom.
     Bottom,
-    /// Anchored at a message (stable across prepends), offset in laid-out lines.
+    /// Anchored at a message (stable across prepends), offset in laid-out
+    /// lines. The message's BOTTOM edge sits at the viewport's last row and
+    /// the view fills backward from it.
     At {
         message_id: MessageId,
         line_offset: u16,
     },
+    /// Anchored with this message's TOP edge at the viewport's first row —
+    /// where a deliberate jump lands (the reply-quote chip, its backward
+    /// hunt, and the mouse click on a quote line). The opposite fill
+    /// direction to [`Scroll::At`], which pins a message's bottom edge to the
+    /// last row.
+    ///
+    /// Carries no `line_offset`: the target's first line IS row 0.
+    ///
+    /// **Anchor movement preserves this flavour** ([`step_anchor`],
+    /// [`move_anchor`]) — converting back to `At` on the next keypress would
+    /// flip the target from the top of the screen to the bottom, which is a
+    /// worse defect than the one this variant exists to fix and one no
+    /// assertion on `convo.scroll` taken right after the jump can see.
+    /// Everything that writes an anchor from a message id goes through
+    /// [`anchored`] so the two flavours cannot drift apart.
+    ///
+    /// Core treats this identically to `At` everywhere else: both name the
+    /// same message index, and only the view cares which edge is pinned.
+    /// [`mark_visible_read`] is the deliberate exception — it gates on
+    /// [`Scroll::Bottom`], and a user who jumped backward is not looking at
+    /// the newest messages.
+    ///
+    /// The view falls back to a bottom-anchored fill when too few newer
+    /// messages exist to fill the pane; see `view::conversation` and
+    /// architecture §7.5.4.
+    AtTop { message_id: MessageId },
+}
+
+/// Builds an anchor on `message_id` in `top`'s flavour. The one constructor
+/// for both, so a caller that means to preserve the flavour it was handed
+/// cannot half-do it. See [`Scroll::AtTop`].
+///
+/// `pub(crate)` for `app.rs`'s `scroll_conversation_move`, the mouse wheel's
+/// own copy of [`move_anchor`], which has the same flavour to preserve.
+pub(crate) fn anchored(message_id: MessageId, top: bool) -> Scroll {
+    if top {
+        Scroll::AtTop { message_id }
+    } else {
+        Scroll::At {
+            message_id,
+            line_offset: 0,
+        }
+    }
 }
 
 /// A `ViewMessages` request that has gone out but whose effect has not been
@@ -339,7 +384,7 @@ pub fn reveal_spoilers(app: &mut AppState, chat_id: ChatId, message_id: MessageI
 
 /// Jumps the open chat's scroll anchor to `message_id` — the reply-quote
 /// click target (architecture §7.5.1). Deliberately mirrors
-/// `state::search`'s `step()`: sets `Scroll::At` and nothing else, whether
+/// `state::search`'s `step()`: sets the anchor and nothing else, whether
 /// or not `message_id` is currently loaded. A quoted message is always
 /// older than or equal to the message quoting it, so if it is not loaded it
 /// is necessarily *older* than the window — exactly the case
@@ -348,12 +393,17 @@ pub fn reveal_spoilers(app: &mut AppState, chat_id: ChatId, message_id: MessageI
 /// already rely on. No direct "load toward an arbitrary id" request is
 /// issued here; see the architecture doc for why a second path into paging
 /// was rejected.
+///
+/// Top-anchored (architecture §7.5.4): a click on a quote line is a
+/// deliberate jump, and landing the target on the last visible row shows the
+/// user a screenful of what they were already looking at. Set directly
+/// rather than through [`anchor_to_top`] to preserve this function's "sets
+/// the anchor and nothing else" contract — the target is routinely not
+/// loaded, and the paging that fetches it is the ambient near-top trigger
+/// §7.5.1 chose, not a request from here.
 pub fn jump_to_message(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Effect> {
     if let Some(convo) = app.conversations.get_mut(&chat_id) {
-        convo.scroll = Scroll::At {
-            message_id,
-            line_offset: 0,
-        };
+        convo.scroll = Scroll::AtTop { message_id };
     }
     Vec::new()
 }
@@ -411,6 +461,8 @@ pub fn cancel_hunt(convo: &mut ConversationState) {
 ///
 /// Deliberately issues no `GetChatHistory` of its own when continuing:
 /// [`anchor_to`]'s own near-top trigger already asks for the next page
+/// (as does [`anchor_to_top`]'s — they share one body for exactly that
+/// reason)
 /// whenever `convo.paging` is `Idle`, which is exactly the state
 /// `on_history_loaded` leaves it in for any non-empty page — the same
 /// condition this function's own "keep going" branch requires. Adding a
@@ -432,8 +484,12 @@ fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
     };
 
     if index_of(&convo.messages, hunt.target).is_some() {
+        // The landing: top-anchored, like every other quote jump
+        // (architecture §7.5.4). The backward walk above stays bottom-
+        // anchored — that anchor is the hunt's progress indicator, not
+        // somewhere the user asked to be.
         convo.hunt = None;
-        return anchor_to(convo, chat_id, hunt.target, now);
+        return anchor_to_top(convo, chat_id, hunt.target, now);
     }
     if matches!(convo.paging, PagingState::Exhausted) {
         convo.hunt = None;
@@ -717,25 +773,28 @@ fn remove_deleted_messages(app: &mut AppState, chat_id: ChatId, ids: &[MessageId
     convo.messages.retain(|m| !deleted.contains(&m.id));
     drop_selection_if_gone(convo);
 
-    if let Scroll::At { message_id, .. } = convo.scroll
+    let anchor = match convo.scroll {
+        Scroll::Bottom => None,
+        Scroll::At { message_id, .. } => Some((message_id, false)),
+        Scroll::AtTop { message_id } => Some((message_id, true)),
+    };
+    if let Some((message_id, top)) = anchor
         && deleted.contains(&message_id)
     {
-        convo.scroll = reanchor_after_deletion(&convo.messages, message_id);
+        convo.scroll = reanchor_after_deletion(&convo.messages, message_id, top);
     }
 }
 
-fn reanchor_after_deletion(messages: &VecDeque<MessageView>, deleted_id: MessageId) -> Scroll {
+fn reanchor_after_deletion(
+    messages: &VecDeque<MessageView>,
+    deleted_id: MessageId,
+    top: bool,
+) -> Scroll {
     if let Some(newer) = messages.iter().find(|m| m.id > deleted_id) {
-        return Scroll::At {
-            message_id: newer.id,
-            line_offset: 0,
-        };
+        return anchored(newer.id, top);
     }
     if let Some(older) = messages.iter().rev().find(|m| m.id < deleted_id) {
-        return Scroll::At {
-            message_id: older.id,
-            line_offset: 0,
-        };
+        return anchored(older.id, top);
     }
     Scroll::Bottom
 }
@@ -1042,14 +1101,48 @@ pub(crate) fn anchor_to(
     message_id: MessageId,
     now: Millis,
 ) -> Vec<Effect> {
+    anchor_to_flavoured(convo, chat_id, message_id, false, now)
+}
+
+/// Anchors so `message_id` is the FIRST visible row rather than the last —
+/// what a deliberate jump to a quoted message wants (architecture §7.5.4).
+/// [`anchor_to`] stays the default for everything else, selection stepping
+/// and search hits included.
+///
+/// Re-pins to [`Scroll::Bottom`] when the target is the newest loaded
+/// message, where "at the top" has no meaning: there is nothing newer to
+/// fill the pane below it.
+pub(crate) fn anchor_to_top(
+    convo: &mut ConversationState,
+    chat_id: ChatId,
+    message_id: MessageId,
+    now: Millis,
+) -> Vec<Effect> {
+    anchor_to_flavoured(convo, chat_id, message_id, true, now)
+}
+
+/// The one body behind [`anchor_to`] and [`anchor_to_top`], so the two
+/// cannot drift on either of the things they must agree about: the re-pin to
+/// [`Scroll::Bottom`] at the newest loaded message, and the near-top paging
+/// trigger.
+///
+/// That trigger is why neither wrapper pushes a `GetChatHistory` of its own
+/// — `trigger_paging_if_near_top` already issues one whenever the new anchor
+/// needs it, and a second explicit push duplicates the request (see
+/// [`advance_hunt`]'s doc comment, and the regression test pinning it to
+/// exactly one).
+fn anchor_to_flavoured(
+    convo: &mut ConversationState,
+    chat_id: ChatId,
+    message_id: MessageId,
+    top: bool,
+    now: Millis,
+) -> Vec<Effect> {
     let is_newest = convo.messages.back().is_some_and(|m| m.id == message_id);
     convo.scroll = if is_newest {
         Scroll::Bottom
     } else {
-        Scroll::At {
-            message_id,
-            line_offset: 0,
-        }
+        anchored(message_id, top)
     };
     trigger_paging_if_near_top(convo, chat_id, now)
 }
@@ -1070,13 +1163,21 @@ pub(crate) fn step_anchor(
         return Vec::new();
     }
     let last = convo.messages.len() - 1;
-    let current = match convo.scroll {
-        Scroll::Bottom => last,
-        Scroll::At { message_id, .. } => index_of(&convo.messages, message_id).unwrap_or(last),
+    // The flavour rides along: stepping off a top-anchored jump must land
+    // top-anchored, or the message the user jumped to would drop from the
+    // first row to the last on this very keypress ([`Scroll::AtTop`]).
+    let (current, top) = match convo.scroll {
+        Scroll::Bottom => (last, false),
+        Scroll::At { message_id, .. } => {
+            (index_of(&convo.messages, message_id).unwrap_or(last), false)
+        }
+        Scroll::AtTop { message_id } => {
+            (index_of(&convo.messages, message_id).unwrap_or(last), true)
+        }
     };
     let target = (current as isize + delta).clamp(0, last as isize) as usize;
     let id = convo.messages[target].id;
-    anchor_to(convo, chat_id, id, now)
+    anchor_to_flavoured(convo, chat_id, id, top, now)
 }
 
 /// Whether `id` names a message older than every message loaded, which is
@@ -1100,14 +1201,19 @@ fn evict_excess(messages: &mut VecDeque<MessageView>, scroll: &Scroll) {
     while messages.len() > WINDOW_MAX_MESSAGES {
         let evict_back = match scroll {
             Scroll::Bottom => false,
-            Scroll::At { message_id, .. } => match index_of(messages, *message_id) {
-                Some(idx) => {
-                    let dist_front = idx;
-                    let dist_back = messages.len() - 1 - idx;
-                    dist_front <= dist_back
+            // Which edge the anchor pins is irrelevant here: both name the
+            // same message, and eviction only asks how far that message sits
+            // from each end of the window.
+            Scroll::At { message_id, .. } | Scroll::AtTop { message_id } => {
+                match index_of(messages, *message_id) {
+                    Some(idx) => {
+                        let dist_front = idx;
+                        let dist_back = messages.len() - 1 - idx;
+                        dist_front <= dist_back
+                    }
+                    None => false,
                 }
-                None => false,
-            },
+            }
         };
         if evict_back {
             messages.pop_back();
@@ -1173,31 +1279,36 @@ fn move_anchor(
     }
     let last_idx = (convo.messages.len() - 1) as isize;
 
-    let current_idx = match convo.scroll {
+    // As in [`step_anchor`], the flavour rides along: a scroll key pressed
+    // after a jump keeps the target top-anchored ([`Scroll::AtTop`]).
+    let (current_idx, top) = match convo.scroll {
         Scroll::Bottom => {
             if delta >= 0 {
                 return Vec::new();
             }
-            last_idx + 1
+            (last_idx + 1, false)
         }
-        Scroll::At { message_id, .. } => match index_of(&convo.messages, message_id) {
-            Some(idx) => idx as isize,
-            // Anchor older than everything loaded: a deliberate jump past
-            // the top of the window, waiting for the page that contains it
-            // (see [`trigger_paging_if_near_top`]). Moving it by `delta`
-            // is meaningless — there is nothing loaded around it to move
-            // through — so it stays put and the scroll spends itself on
-            // asking for that page instead.
-            None if is_older_than_window(&convo.messages, message_id) => {
-                return trigger_paging_if_near_top(convo, chat_id, now);
+        Scroll::At { message_id, .. } | Scroll::AtTop { message_id } => {
+            let top = matches!(convo.scroll, Scroll::AtTop { .. });
+            match index_of(&convo.messages, message_id) {
+                Some(idx) => (idx as isize, top),
+                // Anchor older than everything loaded: a deliberate jump past
+                // the top of the window, waiting for the page that contains it
+                // (see [`trigger_paging_if_near_top`]). Moving it by `delta`
+                // is meaningless — there is nothing loaded around it to move
+                // through — so it stays put and the scroll spends itself on
+                // asking for that page instead.
+                None if is_older_than_window(&convo.messages, message_id) => {
+                    return trigger_paging_if_near_top(convo, chat_id, now);
+                }
+                None => {
+                    // Evicted at the newest end, or otherwise gone: the safest
+                    // recovery is to re-pin to the newest known state.
+                    convo.scroll = Scroll::Bottom;
+                    return Vec::new();
+                }
             }
-            None => {
-                // Evicted at the newest end, or otherwise gone: the safest
-                // recovery is to re-pin to the newest known state.
-                convo.scroll = Scroll::Bottom;
-                return Vec::new();
-            }
-        },
+        }
     };
 
     let target_idx = current_idx + delta;
@@ -1207,10 +1318,7 @@ fn move_anchor(
     }
     let clamped_idx = target_idx.clamp(0, last_idx) as usize;
     let new_id = convo.messages[clamped_idx].id;
-    convo.scroll = Scroll::At {
-        message_id: new_id,
-        line_offset: 0,
-    };
+    convo.scroll = anchored(new_id, top);
     trigger_paging_if_near_top(convo, chat_id, now)
 }
 
@@ -1230,7 +1338,9 @@ pub(crate) fn trigger_paging_if_near_top(
     chat_id: ChatId,
     now: Millis,
 ) -> Vec<Effect> {
-    let Scroll::At { message_id, .. } = convo.scroll else {
+    // Both anchored flavours name a message and can therefore sit near (or
+    // past) the top of the window; only `Scroll::Bottom` cannot.
+    let (Scroll::At { message_id, .. } | Scroll::AtTop { message_id }) = convo.scroll else {
         return Vec::new();
     };
     let near_top = match index_of(&convo.messages, message_id) {
@@ -1508,14 +1618,17 @@ mod tests {
             .messages
             .push_back(msg(5));
 
-        // Loaded case.
+        // Loaded case. Top-anchored (architecture §7.5.4) — and note the
+        // anchor is set even though msg 5 is the newest loaded message,
+        // because this function deliberately does not go through
+        // `anchor_to_top`'s re-pin: its contract is "set the anchor and
+        // nothing else", for a target that is routinely not loaded at all.
         let effects = jump_to_message(&mut app, CHAT, MessageId(5));
         assert!(effects.is_empty());
         assert_eq!(
             app.conversations[&CHAT].scroll,
-            Scroll::At {
+            Scroll::AtTop {
                 message_id: MessageId(5),
-                line_offset: 0,
             }
         );
 
@@ -1527,9 +1640,8 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(
             app.conversations[&CHAT].scroll,
-            Scroll::At {
+            Scroll::AtTop {
                 message_id: MessageId(1),
-                line_offset: 0,
             }
         );
     }
@@ -2514,6 +2626,81 @@ mod tests {
         );
     }
 
+    /// The trap `Scroll::AtTop` exists to avoid, and the one no assertion
+    /// taken right after a jump can catch: if anchor movement converted the
+    /// flavour back, the message the user jumped to would drop from the
+    /// first visible row to the last on their very next keypress. Both
+    /// movers get their own case — `step_anchor` here, `move_anchor` (the
+    /// scroll keys) below — because either can carry the suite alone.
+    #[test]
+    fn stepping_from_a_top_anchor_stays_top_anchored() {
+        let mut app = fixture_state();
+        fixture_open(&mut app);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 1..=20 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Exhausted;
+        convo.scroll = Scroll::AtTop {
+            message_id: MessageId(10),
+        };
+
+        step_anchor(convo, CHAT, -1, Millis(0));
+
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(9)
+            },
+            "NOT Scroll::At — see this test's doc comment"
+        );
+    }
+
+    #[test]
+    fn scrolling_from_a_top_anchor_stays_top_anchored() {
+        let mut app = fixture_state();
+        fixture_open(&mut app);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 1..=20 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Exhausted;
+        convo.scroll = Scroll::AtTop {
+            message_id: MessageId(10),
+        };
+
+        handle_key(&mut app, Key::Down).expect("conversation claims Down");
+
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(11)
+            },
+            "NOT Scroll::At — see `stepping_from_a_top_anchor_stays_top_anchored`"
+        );
+    }
+
+    /// The one conversion that is correct: "at the top" means nothing for
+    /// the newest loaded message, since there is nothing newer to fill the
+    /// pane below it.
+    #[test]
+    fn stepping_a_top_anchor_onto_the_newest_message_repins_to_bottom() {
+        let mut app = fixture_state();
+        fixture_open(&mut app);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 1..=5 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Exhausted;
+        convo.scroll = Scroll::AtTop {
+            message_id: MessageId(4),
+        };
+
+        step_anchor(convo, CHAT, 1, Millis(0));
+
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+    }
+
     #[test]
     fn down_key_at_bottom_is_claimed_but_a_noop() {
         let mut app = fixture_state();
@@ -3067,11 +3254,13 @@ mod tests {
         apply_history_page(&mut app, CHAT, false, &Ok(page));
 
         assert!(app.conversations[&CHAT].hunt.is_none(), "hunt cleared");
+        // The landing is top-anchored like every other quote jump
+        // (architecture §7.5.4); only the hunt's backward walk, which is a
+        // progress indicator rather than a destination, stays bottom-anchored.
         assert_eq!(
             app.conversations[&CHAT].scroll,
-            Scroll::At {
+            Scroll::AtTop {
                 message_id: MessageId(45),
-                line_offset: 0,
             }
         );
     }
