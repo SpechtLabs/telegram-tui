@@ -457,7 +457,11 @@ pub fn cancel_hunt(convo: &mut ConversationState) {
 /// One step of an in-flight hunt, run from [`apply_history_page`] after a
 /// page has been prepended (or a request failed). Returns the request that
 /// continues it, a toast if it gave up, or nothing when there is no hunt to
-/// advance.
+/// advance — plus, when this page was the one carrying the target, the id it
+/// landed on, for [`HistoryPage::hunt_landed`] to hand to the router.
+///
+/// The landing sets the *anchor* here and reports the id rather than also
+/// moving the selection cursor: see [`HistoryPage`] and architecture §7.5.3.
 ///
 /// Deliberately issues no `GetChatHistory` of its own when continuing:
 /// [`anchor_to`]'s own near-top trigger already asks for the next page
@@ -474,13 +478,13 @@ pub fn cancel_hunt(convo: &mut ConversationState) {
 /// already outstanding regardless). `start_hunt`'s fallback exists because
 /// it runs outside `apply_history_page` with no such directive alongside it;
 /// this function always runs with one.
-fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
+fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> (Vec<Effect>, Option<MessageId>) {
     let now = app.now;
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let Some(hunt) = convo.hunt else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
 
     if index_of(&convo.messages, hunt.target).is_some() {
@@ -489,33 +493,42 @@ fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
         // anchored — that anchor is the hunt's progress indicator, not
         // somewhere the user asked to be.
         convo.hunt = None;
-        return anchor_to_top(convo, chat_id, hunt.target, now);
+        return (
+            anchor_to_top(convo, chat_id, hunt.target, now),
+            Some(hunt.target),
+        );
     }
     if matches!(convo.paging, PagingState::Exhausted) {
         convo.hunt = None;
-        return toasts::on_action_failed(
-            app,
-            chat_id,
-            "the quoted message is no longer available".to_string(),
+        return (
+            toasts::on_action_failed(
+                app,
+                chat_id,
+                "the quoted message is no longer available".to_string(),
+            ),
+            None,
         );
     }
     if hunt.pages_spent >= MAX_HUNT_PAGES {
         convo.hunt = None;
-        return toasts::on_action_failed(
-            app,
-            chat_id,
-            "could not find the quoted message".to_string(),
+        return (
+            toasts::on_action_failed(
+                app,
+                chat_id,
+                "could not find the quoted message".to_string(),
+            ),
+            None,
         );
     }
     let Some(oldest) = convo.messages.front().map(|m| m.id) else {
         convo.hunt = None;
-        return Vec::new();
+        return (Vec::new(), None);
     };
     convo.hunt = Some(JumpHunt {
         target: hunt.target,
         pages_spent: hunt.pages_spent + 1,
     });
-    anchor_to(convo, chat_id, oldest, now)
+    (anchor_to(convo, chat_id, oldest, now), None)
 }
 
 /// Tells TDLib which messages the user has actually seen in `chat_id`, so it
@@ -846,11 +859,12 @@ pub fn apply_history_page(
     chat_id: ChatId,
     only_local: bool,
     outcome: &Result<Vec<MessageView>, TdError>,
-) -> Vec<Effect> {
+) -> HistoryPage {
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
-        return Vec::new();
+        return HistoryPage::default();
     };
 
+    let mut hunt_landed = None;
     let mut effects = match outcome {
         Ok(msgs) => {
             let oldest_loaded = convo.messages.front().map(|m| m.id);
@@ -908,7 +922,9 @@ pub fn apply_history_page(
             // wholesale (the give-up toast does), so it runs after the
             // `convo` borrow above has gone out of use; `fill_viewport`
             // re-borrows fresh rather than reusing that binding.
-            effects.extend(advance_hunt(app, chat_id));
+            let (hunt_effects, landed) = advance_hunt(app, chat_id);
+            effects.extend(hunt_effects);
+            hunt_landed = landed;
             if let Some(convo) = app.conversations.get(&chat_id) {
                 effects.extend(fill_viewport(convo, chat_id, added));
             }
@@ -943,7 +959,25 @@ pub fn apply_history_page(
     // T72: the unread messages arrive *with* this page — on a first open
     // there is nothing to mark read until it lands.
     effects.extend(mark_visible_read(app, chat_id));
-    effects
+    HistoryPage {
+        effects,
+        hunt_landed,
+    }
+}
+
+/// What [`apply_history_page`] owes its caller: the usual effect batch, plus
+/// the one thing this module deliberately declines to act on itself.
+#[derive(Debug, Default)]
+pub struct HistoryPage {
+    pub effects: Vec<Effect>,
+    /// Set when this page is the one that finally carried an in-flight
+    /// jump-to-quote hunt's target (architecture §7.5.3). The anchor has
+    /// already moved onto it; the *selection cursor* has not, and moving it
+    /// is `app.rs`'s job — the chip row and the `getMessageProperties`
+    /// refresh belong to `selection.rs`'s own entry path, and whether to
+    /// move the cursor at all depends on the user still being in selection
+    /// mode, which only the router may ask.
+    pub hunt_landed: Option<MessageId>,
 }
 
 /// Merges `new_msgs` into the front of `existing`, deduped by id (against
@@ -2157,8 +2191,9 @@ mod tests {
             only_local: false,
         };
 
-        let effects =
-            without_view_messages(apply_history_page(&mut app, CHAT, false, &Ok(Vec::new())));
+        let effects = without_view_messages(
+            apply_history_page(&mut app, CHAT, false, &Ok(Vec::new())).effects,
+        );
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(
@@ -2194,7 +2229,8 @@ mod tests {
             CHAT,
             false,
             &Err(TdError::FloodWait { seconds: 5 }),
-        );
+        )
+        .effects;
 
         assert!(effects.is_empty());
         assert_eq!(
@@ -2208,7 +2244,7 @@ mod tests {
     #[test]
     fn apply_history_page_for_unopened_chat_is_a_noop() {
         let mut app = fixture_state();
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(1)]));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(1)])).effects;
         assert!(effects.is_empty());
         assert!(app.conversations.is_empty());
     }
@@ -2232,7 +2268,8 @@ mod tests {
         fixture_opening(&mut app);
 
         let page: Vec<MessageView> = (1..=50).map(msg).collect();
-        let effects = without_view_messages(apply_history_page(&mut app, CHAT, true, &Ok(page)));
+        let effects =
+            without_view_messages(apply_history_page(&mut app, CHAT, true, &Ok(page)).effects);
 
         assert!(
             matches!(
@@ -2270,7 +2307,7 @@ mod tests {
         let mut reconcile_page: Vec<MessageView> = (30..=50).map(msg).collect();
         reconcile_page.push(msg(51));
         reconcile_page.push(msg(52));
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(reconcile_page));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(reconcile_page)).effects;
 
         assert!(
             effects.is_empty(),
@@ -2296,7 +2333,7 @@ mod tests {
         let mut app = fixture_state();
         fixture_opening(&mut app);
 
-        let effects = apply_history_page(&mut app, CHAT, true, &Ok(Vec::new()));
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(Vec::new())).effects;
 
         assert!(matches!(
             effects.as_slice(),
@@ -2346,7 +2383,7 @@ mod tests {
         let mut app = fixture_state();
         fixture_opening(&mut app);
 
-        let effects = apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)])).effects;
 
         assert_eq!(
             history_requests(&effects),
@@ -2369,7 +2406,7 @@ mod tests {
         fixture_opening(&mut app);
 
         // The cold open: one message, and the fill asks for what precedes it.
-        let effects = apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)])).effects;
         assert!(history_requests(&effects).contains(&(100, false)));
 
         // TDLib is still syncing and dribbles the history out in short
@@ -2385,7 +2422,7 @@ mod tests {
             );
             let page: Vec<MessageView> = ((oldest - 10)..oldest).map(msg).collect();
             oldest -= 10;
-            let effects = apply_history_page(&mut app, CHAT, false, &Ok(page));
+            let effects = apply_history_page(&mut app, CHAT, false, &Ok(page)).effects;
 
             let requested = history_requests(&effects);
             if app.conversations[&CHAT].messages.len() < VIEWPORT_FILL_TARGET_MESSAGES {
@@ -2416,7 +2453,7 @@ mod tests {
         apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
 
         // The server answers the fill with the message we already have.
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(100)]));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(100)])).effects;
 
         assert!(
             history_requests(&effects).is_empty(),
@@ -2434,7 +2471,7 @@ mod tests {
         fixture_opening(&mut app);
         apply_history_page(&mut app, CHAT, true, &Ok(vec![msg(100)]));
 
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(Vec::new()));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(Vec::new())).effects;
 
         assert!(history_requests(&effects).is_empty(), "{effects:?}");
         assert_eq!(app.conversations[&CHAT].paging, PagingState::Idle);
@@ -2452,7 +2489,7 @@ mod tests {
 
         // A page still lands (a reconcile's, say) and is prepended, but the
         // window being short is no reason to ask a chat that has no more.
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(99)]));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(99)])).effects;
 
         assert!(history_requests(&effects).is_empty(), "{effects:?}");
         assert_eq!(app.conversations[&CHAT].messages.len(), 2);
@@ -2472,7 +2509,7 @@ mod tests {
             until: Millis(9_000),
         };
 
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(99)]));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(99)])).effects;
 
         assert!(history_requests(&effects).is_empty(), "{effects:?}");
         assert_eq!(app.conversations[&CHAT].messages.len(), 2);
@@ -2540,7 +2577,7 @@ mod tests {
         let page: Vec<MessageView> = (1..=(VIEWPORT_FILL_TARGET_MESSAGES as i64))
             .map(msg)
             .collect();
-        let effects = apply_history_page(&mut app, CHAT, true, &Ok(page));
+        let effects = apply_history_page(&mut app, CHAT, true, &Ok(page)).effects;
 
         assert_eq!(
             history_requests(&effects),
@@ -2566,7 +2603,8 @@ mod tests {
         // asking older, which is not where the reconcile was looking. (Which
         // id exactly is not this test's subject: the reconcile's own newer
         // message is what `prepend_messages` just put at the front.)
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(100), msg(101)]));
+        let effects =
+            apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(100), msg(101)])).effects;
         let requested = history_requests(&effects);
         assert_eq!(
             requested.len(),
@@ -2582,7 +2620,7 @@ mod tests {
         // The original fill's page lands last and finishes the job; nothing
         // further is asked.
         let page: Vec<MessageView> = (50..100).map(msg).collect();
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page)).effects;
         assert!(history_requests(&effects).is_empty(), "{effects:?}");
         assert_eq!(app.conversations[&CHAT].messages.len(), 52);
     }
@@ -3058,7 +3096,8 @@ mod tests {
             only_local: false,
         };
 
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok((1..=19).map(msg).collect()));
+        let effects =
+            apply_history_page(&mut app, CHAT, false, &Ok((1..=19).map(msg).collect())).effects;
 
         assert!(
             view_requests(&effects).is_empty(),
@@ -3202,7 +3241,8 @@ mod tests {
             only_local: false,
         };
 
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok((1..=3).map(msg).collect()));
+        let effects =
+            apply_history_page(&mut app, CHAT, false, &Ok((1..=3).map(msg).collect())).effects;
 
         assert_eq!(
             view_requests(&effects),
@@ -3364,7 +3404,7 @@ mod tests {
         // A page that neither contains the target nor is empty: the hunt
         // must continue rather than land, give up, or stop.
         let page: Vec<MessageView> = (190..200).map(msg).collect();
-        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page));
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page)).effects;
 
         let requests: Vec<_> = effects
             .iter()

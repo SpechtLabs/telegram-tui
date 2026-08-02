@@ -355,7 +355,27 @@ impl App {
                 // The page itself, an emptied retry round and a cooldown all
                 // change what the viewport shows or how it behaves.
                 self.dirty = true;
-                conversation::apply_history_page(&mut self.state, chat_id, only_local, &outcome)
+                let page = conversation::apply_history_page(
+                    &mut self.state,
+                    chat_id,
+                    only_local,
+                    &outcome,
+                );
+                let mut effects = page.effects;
+                // T9: this page carried the quote a hunt was looking for.
+                // `conversation.rs` anchored the viewport on it and stopped
+                // there on purpose (architecture §7.5.3): the cursor move is
+                // `selection.rs`'s entry path, and the "still in selection
+                // mode" gate is a focus question, which is this router's.
+                // Without it the highlight stays on the message `j` was
+                // pressed from — below the viewport, invisible — and the
+                // next `↑` walks the view back down instead of moving it.
+                if let Some(target) = page.hunt_landed
+                    && matches!(self.state.focus.current(), Focus::Selection)
+                {
+                    effects.extend(selection::select_landing(&mut self.state, chat_id, target));
+                }
+                effects
             }
             Action::TdResult(TdResult::ChatsLoaded { outcome }) => {
                 // `loadChats` only reports that TDLib accepted the request;
@@ -3755,6 +3775,108 @@ mod routing {
         // Critical: the range is produced BY rendering. Marking it dirty
         // would make every frame schedule another frame.
         assert!(!app.take_dirty());
+    }
+
+    /// A chat with `50..60` loaded, selection mode on the newest message,
+    /// and a hunt already looking for `MessageId(45)`.
+    fn hunting_for_an_unloaded_quote(target: MessageId, loaded: std::ops::Range<i64>) -> App {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok(loaded.map(|id| message(1, id)).collect()),
+        }));
+        // `↑` on the empty composer is selection mode, starting at the
+        // newest loaded message — the message the user is quoting *from*.
+        app.update(Action::Key(Key::Up));
+        conversation::start_hunt(&mut app.state, CHAT, target);
+        app.take_dirty();
+        app
+    }
+
+    /// The hunt landing moved the *viewport* onto the quote and left the
+    /// selection cursor where the user pressed `j`: far below the new
+    /// viewport, invisible, and with every subsequent `↑` firing
+    /// `select`'s `(KeepVisible, Some(_))` arm to walk the view back down
+    /// one message at a time with no highlight on screen. The loaded path
+    /// (`Chip::JumpToQuoted` with the quote already in the window) has
+    /// always moved both, so `j` did two different things depending only
+    /// on whether the target happened to be loaded.
+    #[test]
+    fn a_landed_hunt_moves_the_selection_cursor_onto_the_quote() {
+        let mut app = hunting_for_an_unloaded_quote(MessageId(45), 50..60);
+        assert_eq!(selected_message(&app), Some(MessageId(59)));
+
+        // The page that finally contains the target.
+        let effects = app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((40..50).map(|id| message(1, id)).collect()),
+        }));
+
+        // The landing anchors twice — `advance_hunt` and again inside
+        // `select` — which is only safe because the second near-top trigger
+        // finds `PagingState::Loading`. Same duplicate-dispatch trap
+        // `a_hunt_continues_paging_and_asks_for_exactly_one_more_page`
+        // guards on the continuation side.
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Td(TdRequest::GetChatHistory { .. })))
+                .count(),
+            1,
+            "the landing must not double-request: {effects:?}"
+        );
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(45)
+            },
+            "the viewport must land on the quote"
+        );
+        assert_eq!(
+            selected_message(&app),
+            Some(MessageId(45)),
+            "and so must the selection cursor — a highlight below the \
+             viewport is a highlight the user cannot see"
+        );
+    }
+
+    /// The second-order case. `start_hunt` parks the anchor at the front of
+    /// the window precisely so `evict_excess` drops from the *back*, which
+    /// means a long hunt on a full window evicts the message the user
+    /// pressed `j` on and `drop_selection_if_gone` nulls the selection —
+    /// while `Focus::Selection` is still on the stack. Landing has to leave
+    /// that state coherent, not merely avoid making it worse.
+    #[test]
+    fn a_landing_restores_a_selection_eviction_dropped_during_the_hunt() {
+        let full = 1000..1000 + conversation::WINDOW_MAX_MESSAGES as i64;
+        let newest = MessageId(full.end - 1);
+        let mut app = hunting_for_an_unloaded_quote(MessageId(999), full);
+        assert_eq!(selected_message(&app), Some(newest));
+
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((950..1000).map(|id| message(1, id)).collect()),
+        }));
+
+        assert!(
+            !app.state().conversations[&CHAT]
+                .messages
+                .iter()
+                .any(|m| m.id == newest),
+            "the fixture must actually evict the message the hunt started from"
+        );
+        assert_eq!(
+            selected_message(&app),
+            Some(MessageId(999)),
+            "selection mode with nothing selected is not a state any \
+             handler here copes with"
+        );
     }
 
     #[test]

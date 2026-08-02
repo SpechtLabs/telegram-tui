@@ -132,6 +132,23 @@ pub fn enter_at(app: &mut AppState, message_id: MessageId) -> Vec<Effect> {
     select(app, chat_id, message_id, AnchorPolicy::Jump)
 }
 
+/// Moves the cursor onto a message a jump-to-quote hunt just landed on
+/// (`conversation::HistoryPage::hunt_landed`, architecture §7.5.3). Exactly
+/// the call `Chip::JumpToQuoted` makes when the quote was already loaded, so
+/// `j` produces the same chip row, the same capability refresh and the same
+/// top-anchored frame whichever way the target got into the window.
+///
+/// Called only by the router, which is what checks the user is still in
+/// selection mode. A target no longer in the window is a no-op ([`select`]'s
+/// own contract), which is also what makes this safe to call after eviction.
+pub(crate) fn select_landing(
+    app: &mut AppState,
+    chat_id: ChatId,
+    message_id: MessageId,
+) -> Vec<Effect> {
+    select(app, chat_id, message_id, AnchorPolicy::JumpToTop)
+}
+
 /// Leaves selection mode: drops the selection of the open chat. Called by the
 /// router (T28) after popping `Focus::Selection` — including the `Esc` path,
 /// which [`handle_key`] deliberately does not claim.

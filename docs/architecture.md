@@ -2625,6 +2625,40 @@ already in flight). There is one paging state machine and one way to drive
 it toward an id outside the window; the hunt adds a budget and a caller that
 notices when to stop asking, not a competing request path.
 
+**Landing is reported, not performed.** `apply_history_page` returns
+
+```rust
+pub struct HistoryPage {
+    pub effects: Vec<Effect>,
+    pub hunt_landed: Option<MessageId>,
+}
+```
+
+`conversation.rs` moves the *anchor* onto the target and stops there. Moving
+the selection cursor is `app.rs`'s job, for two reasons that pull the same
+way: the chip row and the `getMessageProperties` refresh belong to
+`selection.rs`'s own entry path (`select` with `AnchorPolicy::JumpToTop` —
+the identical call `Chip::JumpToQuoted` makes when the quote *was* already
+loaded, so `j` behaves the same either way), and "only if the user is still
+in selection mode" is a focus question, which the router owns exclusively
+(§6.2). The first shipped version of the hunt reported nothing and moved
+nothing, which left the highlight on the message the user jumped *from*,
+below the viewport and invisible, with `↑` then walking the view back down.
+
+The landing call also repairs the selection when the hunt itself destroyed
+it: `start_hunt` parks the anchor at the front of the window so `evict_excess`
+drops from the back, so a long hunt on a full window evicts the message `j`
+was pressed on and `drop_selection_if_gone` nulls the selection underneath a
+live `Focus::Selection`. `select` sets the selection outright rather than
+moving it, so that state comes back coherent.
+
+Anchoring twice (once in `advance_hunt`, once inside `select`) is deliberate
+and idempotent: the second `anchor_to_top` re-sets the same `Scroll::AtTop`
+and its near-top trigger finds `PagingState::Loading`, which
+`history::on_scroll_near_top` answers with `PagingDirective::None`. Keeping
+`advance_hunt`'s own anchor is what makes the viewport land even when no
+selection move follows.
+
 ### 7.5.4 `Scroll::AtTop`: a jump lands its target at the top of the viewport (2026-08-02)
 
 User feedback after §7.5.1 and §7.5.3 shipped: jumping to a quoted message
