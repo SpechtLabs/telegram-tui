@@ -64,7 +64,7 @@ struct Group {
 }
 
 /// Column the description text starts at, past the longest key label
-/// (`"tab / shift+tab"`, `"r f e c d x l o s v k j"`) plus a two-space
+/// (`"tab / shift+tab"`, `"r f + c e d l o s v k j"`) plus a two-space
 /// gutter.
 const KEY_COL: usize = 25;
 
