@@ -3879,6 +3879,81 @@ mod routing {
         );
     }
 
+    /// The third cancellation site, and the one the router owns: `Esc` out
+    /// of selection mode. Its two siblings (`close_previous_chat`, the
+    /// scroll keys) are pinned in `state::conversation`'s own tests.
+    #[test]
+    fn leaving_selection_mode_cancels_an_in_flight_hunt() {
+        let mut app = hunting_for_an_unloaded_quote(MessageId(45), 50..60);
+        assert!(app.state().conversations[&CHAT].hunt.is_some());
+
+        app.update(Action::Key(Key::Esc));
+
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert!(
+            app.state().conversations[&CHAT].hunt.is_none(),
+            "a hunt that outlives selection mode keeps re-anchoring the \
+             viewport as its pages land, long after the user moved on"
+        );
+    }
+
+    /// Below the two-pane breakpoint, walking focus to the chat list hides
+    /// the conversation — so `Tab` and `Ctrl+←` have to close the chat for
+    /// the same reason `Esc` and a shrinking resize do. This arm returned
+    /// `Vec::new()` before the branch added `close_if_now_hidden` to it, so
+    /// it emits a TDLib request on a path that used to emit none.
+    #[test]
+    fn pane_movement_out_of_a_single_pane_conversation_closes_the_chat() {
+        let mut single = chat_open();
+        single.update(Action::Resize {
+            width: 80,
+            height: 40,
+        });
+        assert_eq!(*single.state().focus.current(), Focus::Composer);
+        single.take_dirty();
+
+        let effects = single.update(Action::Key(Key::CtrlLeft));
+        assert_eq!(*single.state().focus.current(), Focus::ChatList);
+        assert_eq!(describe(&effects), ["Td(CloseChat)"]);
+
+        // Two-pane: the same key, the conversation still on screen, so
+        // nothing to close. Without this the assertion above passes for an
+        // arm that closes the chat unconditionally.
+        let mut two = chat_open();
+        two.take_dirty();
+        let effects = two.update(Action::Key(Key::CtrlLeft));
+        assert_eq!(*two.state().focus.current(), Focus::ChatList);
+        assert!(
+            effects.is_empty(),
+            "the conversation is still visible in two-pane: {effects:?}"
+        );
+    }
+
+    /// `route_chat_list_key`'s clearing has a test
+    /// (`opening_a_different_chat_clears_the_recorded_viewport`); this one
+    /// is the sibling site, and the one that had to be corrected during
+    /// implementation. A left-click on a sidebar row — and `Ctrl+→`, which
+    /// reuses this path — does NOT go through `chat_list::handle_key`'s
+    /// router arm, so without its own clearing it carries the old chat's id
+    /// range into the new chat and suppresses the first scroll there.
+    #[test]
+    fn clicking_a_different_chat_row_clears_the_recorded_viewport() {
+        let mut app = chat_open();
+        app.update(Action::ViewportChanged {
+            first: MessageId(4),
+            last: MessageId(9),
+        });
+        app.update(Action::Td(chat(2, "Bob", 20)));
+
+        app.update(Action::Click {
+            target: HitTarget::ChatRow(ChatId(2)),
+            button: ClickButton::Left,
+        });
+
+        assert_eq!(app.state().open_chat, Some(ChatId(2)));
+        assert_eq!(app.state().visible_messages, None);
+    }
+
     #[test]
     fn opening_a_different_chat_clears_the_recorded_viewport() {
         let mut app = chat_open();

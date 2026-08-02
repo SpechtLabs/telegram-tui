@@ -3428,4 +3428,54 @@ mod tests {
             })
         );
     }
+
+    /// A chat with ten messages loaded and a hunt in flight for a target
+    /// older than all of them.
+    fn hunting(app: &mut AppState) {
+        open(app, CHAT);
+        app.focus = FocusStack::new(Focus::Composer);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 50..60 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Idle;
+        start_hunt(app, CHAT, MessageId(1));
+        assert!(app.conversations[&CHAT].hunt.is_some());
+    }
+
+    /// Every one of the three "the user took over navigation" cancellations
+    /// shipped without a test. The pages a hunt has in flight keep landing
+    /// after the user has moved on, and each landing re-anchors the
+    /// viewport — so a hunt left running past its welcome yanks the view
+    /// out from under whatever the user did next.
+    #[test]
+    fn switching_chats_cancels_the_hunt_on_the_one_being_left() {
+        let mut app = fixture_state();
+        hunting(&mut app);
+
+        let effects = close_previous_chat(&mut app, ChatId(2));
+
+        assert!(app.conversations[&CHAT].hunt.is_none());
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Td(TdRequest::CloseChat { .. })]
+            ),
+            "the close itself must still happen: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_manual_scroll_cancels_the_hunt() {
+        let mut app = fixture_state();
+        hunting(&mut app);
+
+        let effects = handle_key(&mut app, Key::Up).expect("the scroll key is claimed");
+
+        assert!(
+            app.conversations[&CHAT].hunt.is_none(),
+            "a scroll key is the user saying where the view goes, \
+             not the hunt: {effects:?}"
+        );
+    }
 }
