@@ -1652,6 +1652,113 @@ mod tests {
         );
     }
 
+    /// The oldest and newest `msg N` body actually printed in a frame of
+    /// [`numbered_history`]. Read off the rendered cells rather than the hit
+    /// map on purpose: comparing the hit map against itself proves nothing,
+    /// and the drawn text is the only thing that can falsify what
+    /// [`HitMap::visible_messages`] claims.
+    fn drawn_ids(rendered: &str) -> Option<(MessageId, MessageId)> {
+        let mut range: Option<(i64, i64)> = None;
+        for line in rendered.lines() {
+            let Some(rest) = line.split("msg ").nth(1) else {
+                continue;
+            };
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let Ok(id) = digits.parse::<i64>() else {
+                continue;
+            };
+            range = Some(match range {
+                None => (id, id),
+                Some((lo, hi)) => (lo.min(id), hi.max(id)),
+            });
+        }
+        range.map(|(lo, hi)| (MessageId(lo), MessageId(hi)))
+    }
+
+    /// The viewport feature's one wire into `update()` is
+    /// `runtime_loop::viewport_report`, which asks a freshly drawn frame's
+    /// `HitMap` what it drew. Every other test of that feature either sets
+    /// `AppState::visible_messages` by hand or reads `visible_messages()`
+    /// off a hand-built `HitMap`, so nothing connected a real rendered
+    /// frame to the range core is told about — the whole feature could
+    /// report the wrong ids, or none, and stay green. This renders the real
+    /// thing and holds the reported range against the text on screen.
+    ///
+    /// Both fill directions, because they clip at opposite ends: the
+    /// backward fill drops rows off the front and the forward fill off the
+    /// back, and each is a chance for the reported range to run past what
+    /// the user can see.
+    #[test]
+    fn the_hit_map_reports_exactly_the_messages_a_frame_drew() {
+        for (label, scroll) in [
+            (
+                "backward fill",
+                Scroll::At {
+                    message_id: MessageId(30),
+                    line_offset: 0,
+                },
+            ),
+            (
+                "forward fill",
+                Scroll::AtTop {
+                    message_id: MessageId(10),
+                },
+            ),
+        ] {
+            let state = fixture_state(Some(conversation(numbered_history(40), scroll)));
+            let mut rs = RenderState::new(None);
+            let (rendered, hits) = draw_frame(80, 12, &state, &mut rs);
+
+            let drawn = drawn_ids(&rendered);
+            assert_eq!(
+                hits.visible_messages(),
+                drawn,
+                "{label}: the reported range must be what is on screen, \
+                 got:\n{rendered}"
+            );
+            // Not vacuous: a frame that drew nothing, or exactly one
+            // message, would satisfy the equality above without exercising
+            // either clip.
+            let (first, last) = drawn.expect("the frame must draw messages");
+            assert!(
+                last.0 - first.0 >= 2,
+                "{label}: a twelve-row pane must fit several blocks, \
+                 got {first:?}..={last:?}"
+            );
+        }
+    }
+
+    /// The two fills must not agree by accident: a `visible_messages` that
+    /// simply reported the whole loaded window, or always the newest
+    /// messages, would pass the test above for one anchor and is caught
+    /// here.
+    #[test]
+    fn the_two_fill_directions_report_different_ranges() {
+        let history = numbered_history(40);
+        let mut rs = RenderState::new(None);
+        let at = fixture_state(Some(conversation(
+            history.clone(),
+            Scroll::At {
+                message_id: MessageId(30),
+                line_offset: 0,
+            },
+        )));
+        let (_, at_hits) = draw_frame(80, 12, &at, &mut rs);
+
+        let mut rs = RenderState::new(None);
+        let at_top = fixture_state(Some(conversation(
+            history,
+            Scroll::AtTop {
+                message_id: MessageId(10),
+            },
+        )));
+        let (_, top_hits) = draw_frame(80, 12, &at_top, &mut rs);
+
+        // `At` names the LAST visible message, `AtTop` the first.
+        assert_eq!(at_hits.visible_messages().unwrap().1, MessageId(30));
+        assert_eq!(top_hits.visible_messages().unwrap().0, MessageId(10));
+    }
+
     #[test]
     fn empty_conversation_120x40() {
         let state = fixture_state(Some(conversation(Vec::new(), Scroll::Bottom)));
