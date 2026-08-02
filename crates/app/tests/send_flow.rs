@@ -473,9 +473,9 @@ async fn delete_for_everyone_round_trip() {
         "the row is derived from the fetched caps, not a fixed menu"
     );
 
-    // `x` is the Delete chip's shortcut; it raises the confirmation instead
+    // `d` is the Delete chip's shortcut; it raises the confirmation instead
     // of deleting anything.
-    app.press(KeyCode::Char('x')).await;
+    app.press(KeyCode::Char('d')).await;
     app.advance_until("the confirmation modal", |core, _| {
         matches!(core.app().state().focus.current(), Focus::Modal(_))
     })

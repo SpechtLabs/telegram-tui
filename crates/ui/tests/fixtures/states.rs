@@ -89,6 +89,7 @@ pub fn base_main_state() -> AppState {
         crash_reports_available: true,
         telemetry_salt: [0u8; 32],
         now: NOW,
+        visible_messages: None,
     }
 }
 
@@ -452,6 +453,7 @@ pub fn conversation_with(
         pending_view: None,
         search_hits: Vec::new(),
         selection: None,
+        hunt: None,
     }
 }
 

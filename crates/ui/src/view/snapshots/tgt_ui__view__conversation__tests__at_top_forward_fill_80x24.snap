@@ -1,0 +1,27 @@
+---
+source: crates/ui/src/view/conversation.rs
+expression: rendered
+---
+▏ Alice · 23:13                                                                 
+▏ msg 10                                                                        
+                                                                                
+▏ Alice · 23:19                                                                 
+▏ msg 11                                                                        
+                                                                                
+▏ Alice · 23:25                                                                 
+▏ msg 12                                                                        
+                                                                                
+▏ Alice · 23:31                                                                 
+▏ msg 13                                                                        
+                                                                                
+▏ Alice · 23:37                                                                 
+▏ msg 14                                                                        
+                                                                                
+▏ Alice · 23:43                                                                 
+▏ msg 15                                                                        
+                                                                                
+▏ Alice · 23:49                                                                 
+▏ msg 16                                                                        
+                                                                                
+▏ Alice · 23:55                                                                 
+▏ msg 17

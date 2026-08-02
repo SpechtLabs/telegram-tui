@@ -129,7 +129,24 @@ pub fn enter_at(app: &mut AppState, message_id: MessageId) -> Vec<Effect> {
     if conversation::index_of(&convo.messages, message_id).is_none() {
         return Vec::new();
     }
-    select(app, chat_id, message_id)
+    select(app, chat_id, message_id, AnchorPolicy::Jump)
+}
+
+/// Moves the cursor onto a message a jump-to-quote hunt just landed on
+/// (`conversation::HistoryPage::hunt_landed`, architecture §7.5.3). Exactly
+/// the call `Chip::JumpToQuoted` makes when the quote was already loaded, so
+/// `j` produces the same chip row, the same capability refresh and the same
+/// top-anchored frame whichever way the target got into the window.
+///
+/// Called only by the router, which is what checks the user is still in
+/// selection mode. A target no longer in the window is a no-op ([`select`]'s
+/// own contract), which is also what makes this safe to call after eviction.
+pub(crate) fn select_landing(
+    app: &mut AppState,
+    chat_id: ChatId,
+    message_id: MessageId,
+) -> Vec<Effect> {
+    select(app, chat_id, message_id, AnchorPolicy::JumpToTop)
 }
 
 /// Leaves selection mode: drops the selection of the open chat. Called by the
@@ -233,10 +250,36 @@ pub fn handle_td_result(
 
 // --- selection movement ------------------------------------------------
 
+/// How [`select`] should treat the scroll anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorPolicy {
+    /// `↑`/`↓`: hold the viewport still while the target is on screen, and
+    /// scroll by exactly one message when the cursor walks off an edge.
+    KeepVisible,
+    /// A deliberate jump (entering selection on a specific message): bring
+    /// the target into view unconditionally, bottom-anchored.
+    Jump,
+    /// The reply-quote chip: bring the target into view unconditionally AND
+    /// put it on the first visible row (architecture §7.5.4).
+    ///
+    /// Separate from [`AnchorPolicy::Jump`] rather than folded into it
+    /// because `Jump`'s other caller is [`enter_at`], the mouse right-click
+    /// that opens selection on the message under the cursor. That message is
+    /// by definition already on screen, and hoisting it to the top would be a
+    /// scroll the user never asked for — the same defect
+    /// [`AnchorPolicy::KeepVisible`] exists to prevent for `↑`/`↓`.
+    JumpToTop,
+}
+
 /// Points the selection at `message_id`: fills in a missing reply excerpt,
-/// derives the chip row, drags the scroll anchor along and asks TDLib for the
-/// capability flags it withholds from `message`.
-fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Effect> {
+/// derives the chip row, moves the scroll anchor per `policy` and asks TDLib
+/// for the capability flags it withholds from `message`.
+fn select(
+    app: &mut AppState,
+    chat_id: ChatId,
+    message_id: MessageId,
+    policy: AnchorPolicy,
+) -> Vec<Effect> {
     let Some(convo) = app.conversations.get(&chat_id) else {
         return Vec::new();
     };
@@ -246,6 +289,7 @@ fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Eff
     let chips = chips_for_message(&convo.messages[idx], &app.media, &convo.revealed_spoilers);
     let send_failed = matches!(convo.messages[idx].send_state, SendState::Failed(_));
     let now = app.now;
+    let visible = app.visible_messages;
 
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
         return Vec::new();
@@ -267,9 +311,34 @@ fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Eff
             message_id,
         })]
     };
-    effects.extend(conversation::anchor_to(convo, chat_id, message_id, now));
-    // T66: selection landing on (or stepping to) a message drags the scroll
-    // anchor with it, so it's a "the anchor moved" trigger like any other.
+    // T66 / viewport-aware follow-up: selection landing on (or stepping to)
+    // a message moves the scroll anchor, so it's a "the anchor moved"
+    // trigger like any other — `KeepVisible`'s no-op arm is the one
+    // exception, and it fires no history request either.
+    effects.extend(match (policy, visible) {
+        // On screen: leave the anchor completely alone. This is the whole
+        // fix — `anchor_to` here is what pinned the cursor to the last row.
+        (AnchorPolicy::KeepVisible, Some((first, last)))
+            if message_id >= first && message_id <= last =>
+        {
+            Vec::new()
+        }
+        (AnchorPolicy::KeepVisible, Some((first, _))) if message_id < first => {
+            conversation::step_anchor(convo, chat_id, -1, now)
+        }
+        (AnchorPolicy::KeepVisible, Some(_)) => conversation::step_anchor(convo, chat_id, 1, now),
+        // No frame has reported a viewport (every headless caller, and the
+        // first selection after a chat opens), or this is a deliberate
+        // jump: the anchor follows the target, exactly as before.
+        (AnchorPolicy::KeepVisible, None) | (AnchorPolicy::Jump, _) => {
+            conversation::anchor_to(convo, chat_id, message_id, now)
+        }
+        // The quote jump, and the only caller that wants the target on the
+        // FIRST row rather than the last (architecture §7.5.4).
+        (AnchorPolicy::JumpToTop, _) => {
+            conversation::anchor_to_top(convo, chat_id, message_id, now)
+        }
+    });
     effects.extend(media::auto_download_photos(app, chat_id));
     effects
 }
@@ -293,7 +362,7 @@ fn move_selection(app: &mut AppState, chat_id: ChatId, delta: isize) -> Vec<Effe
         return Vec::new();
     }
     let target_id = convo.messages[target].id;
-    select(app, chat_id, target_id)
+    select(app, chat_id, target_id, AnchorPolicy::KeepVisible)
 }
 
 /// `←`/`→` over the chip row, with the visible window following the cursor.
@@ -379,6 +448,12 @@ fn chips_for_message(
     // send otherwise offers only `Resend`. See `Chip::CancelUpload`'s docs.
     if media.uploads.contains_key(&msg.id) {
         chips.push(Chip::CancelUpload);
+    }
+    // Not gated on `send_failed`: a message that failed to send can still
+    // quote one that arrived fine, and the quoted message is the context
+    // the user needs to decide whether to resend.
+    if msg.reply_to.is_some() {
+        chips.push(Chip::JumpToQuoted);
     }
     chips
 }
@@ -485,6 +560,23 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
             let effects = composer::cancel_upload(app, message_id);
             recompute_chips(app, chat_id, message_id);
             effects
+        }
+        Chip::JumpToQuoted => {
+            let Some(quoted) = msg.reply_to.as_ref().map(|r| r.message_id) else {
+                return Vec::new();
+            };
+            let loaded = app
+                .conversations
+                .get(&chat_id)
+                .is_some_and(|convo| conversation::index_of(&convo.messages, quoted).is_some());
+            if loaded {
+                // A deliberate jump: the view follows unconditionally,
+                // unlike an `↑`/`↓` step (see `AnchorPolicy`), and lands the
+                // quote on the first row rather than the last.
+                select(app, chat_id, quoted, AnchorPolicy::JumpToTop)
+            } else {
+                conversation::start_hunt(app, chat_id, quoted)
+            }
         }
     }
 }
@@ -728,6 +820,7 @@ mod tests {
             crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
+            visible_messages: None,
         }
     }
 
@@ -1005,6 +1098,101 @@ mod tests {
         );
     }
 
+    // --- viewport-aware anchor movement -------------------------------------
+
+    #[test]
+    fn stepping_the_selection_within_the_viewport_does_not_scroll() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        // Frame showed messages 5..=10; the newest is at the bottom.
+        app.visible_messages = Some((MessageId(5), MessageId(10)));
+        enter(&mut app);
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+
+        // Four steps up, all landing on messages already on screen.
+        for _ in 0..4 {
+            handle_key(&mut app, Key::Up);
+        }
+
+        assert_eq!(selection(&app).message_id, MessageId(6));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::Bottom,
+            "the viewport must not move while the cursor is on screen"
+        );
+    }
+
+    #[test]
+    fn stepping_off_the_top_edge_scrolls_by_exactly_one_message() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        app.visible_messages = Some((MessageId(5), MessageId(10)));
+        enter(&mut app);
+        for _ in 0..5 {
+            handle_key(&mut app, Key::Up);
+        }
+        // Cursor is on 5, the topmost visible message; nothing has scrolled.
+        assert_eq!(selection(&app).message_id, MessageId(5));
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+
+        handle_key(&mut app, Key::Up);
+
+        assert_eq!(selection(&app).message_id, MessageId(4));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(9),
+                line_offset: 0,
+            },
+            "one message of scroll, not a jump to the cursor"
+        );
+    }
+
+    #[test]
+    fn stepping_back_down_off_the_bottom_edge_scrolls_one_message() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        app.visible_messages = Some((MessageId(5), MessageId(10)));
+        enter(&mut app);
+        // Park the anchor and the cursor above the bottom edge.
+        app.conversations.get_mut(&CHAT).unwrap().scroll = Scroll::At {
+            message_id: MessageId(8),
+            line_offset: 0,
+        };
+        app.visible_messages = Some((MessageId(3), MessageId(8)));
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.selection.as_mut().unwrap().message_id = MessageId(8);
+
+        handle_key(&mut app, Key::Down);
+
+        assert_eq!(selection(&app).message_id, MessageId(9));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(9),
+                line_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn with_no_viewport_information_the_anchor_follows_the_selection() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        assert_eq!(app.visible_messages, None);
+        enter(&mut app);
+
+        handle_key(&mut app, Key::Up);
+
+        // The pre-existing behavior, unchanged. Every test in this workspace
+        // and every headless caller lands here; it must not become "never
+        // scroll", or the suite would be green about a path no user reaches.
+        assert_eq!(selection(&app).message_id, MessageId(9));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(9),
+                line_offset: 0,
+            }
+        );
+    }
+
     // --- chip cursor -------------------------------------------------------
 
     #[test]
@@ -1154,7 +1342,7 @@ mod tests {
         let mut app = with_messages(vec![msg(1)]);
         enter(&mut app);
 
-        let effects = handle_key(&mut app, Key::Char('e')).expect("React answers to 'e'");
+        let effects = handle_key(&mut app, Key::Char('+')).expect("React answers to '+'");
 
         assert!(matches!(
             effects.as_slice(),
@@ -1182,7 +1370,7 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
 
-        let effects = handle_key(&mut app, Key::Char('x')).expect("Delete answers to 'x'");
+        let effects = handle_key(&mut app, Key::Char('d')).expect("Delete answers to 'd'");
 
         assert!(
             effects.is_empty(),
@@ -1208,7 +1396,7 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
 
-        handle_key(&mut app, Key::Char('x')).unwrap();
+        handle_key(&mut app, Key::Char('d')).unwrap();
 
         assert_eq!(
             *app.focus.current(),
@@ -1301,7 +1489,7 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
 
-        let effects = handle_key(&mut app, Key::Char('d')).expect("Edit answers to 'd'");
+        let effects = handle_key(&mut app, Key::Char('e')).expect("Edit answers to 'e'");
 
         assert!(effects.is_empty(), "the edit is submitted by the composer");
         assert_eq!(app.composer.editing, Some(MessageId(1)));
@@ -1489,5 +1677,50 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
         assert_eq!(selection(&app).chips, vec![Chip::Resend, Chip::Delete]);
+    }
+
+    #[test]
+    fn a_reply_offers_the_jump_chip_and_a_plain_message_does_not() {
+        let mut replying = msg(2);
+        replying.reply_to = Some(ReplyPreview {
+            message_id: MessageId(1),
+            sender_name: "Ada".to_string(),
+            excerpt: "earlier".to_string(),
+        });
+        let mut app = with_messages(vec![msg(1), replying]);
+        enter(&mut app);
+
+        assert!(selection(&app).chips.contains(&Chip::JumpToQuoted));
+
+        handle_key(&mut app, Key::Up);
+        assert_eq!(selection(&app).message_id, MessageId(1));
+        assert!(!selection(&app).chips.contains(&Chip::JumpToQuoted));
+    }
+
+    #[test]
+    fn the_jump_chip_selects_the_quoted_message_when_it_is_loaded() {
+        let mut replying = msg(9);
+        replying.reply_to = Some(ReplyPreview {
+            message_id: MessageId(3),
+            sender_name: "Ada".to_string(),
+            excerpt: "earlier".to_string(),
+        });
+        let mut app = with_messages((1..=8).map(msg).chain([replying]).collect());
+        // A viewport that does NOT contain the quoted message: a jump must
+        // move the view even though a plain `↑` step would not.
+        app.visible_messages = Some((MessageId(7), MessageId(9)));
+        enter(&mut app);
+
+        handle_key(&mut app, Key::Char('j'));
+
+        assert_eq!(selection(&app).message_id, MessageId(3));
+        // Top-anchored, not `Scroll::At`: `AnchorPolicy::JumpToTop` puts the
+        // quote on the first visible row (architecture §7.5.4).
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(3),
+            }
+        );
     }
 }

@@ -9,7 +9,6 @@
 //! (`crates/app/tests/`) drive the same `Core` against `FakeTd`, so what they
 //! exercise is the real machinery rather than a re-implementation of it.
 
-use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +25,7 @@ use tgt_core::action::Action;
 use tgt_core::app::App;
 use tgt_core::effect::Effect;
 use tgt_core::model::hit::ClickButton;
+use tgt_core::model::ids::MessageId;
 use tgt_core::model::time::Millis;
 use tgt_core::td::runtime::TdRuntime;
 use tgt_core::td::update::{AuthPhase, TdUpdate};
@@ -123,6 +123,10 @@ pub struct Core {
     /// is up, so a click that arrives before or under either resolves to
     /// nothing rather than to a stale frame's geometry.
     last_hits: HitMap,
+    /// The last viewport range handed to `update()`. Kept so the report is
+    /// sent only when it changes: a frame that draws the same messages as
+    /// the one before it produces no action at all.
+    last_viewport: Option<(MessageId, MessageId)>,
     /// Builds a replacement TDLib client. `None` — the default, and what
     /// every test that is not about restarting gets — means a client that
     /// reaches `Closed` stays closed, exactly as before this existed.
@@ -187,6 +191,7 @@ impl Core {
             effects: Vec::new(),
             render: RenderState::new(graphics),
             last_hits: HitMap::new(),
+            last_viewport: None,
             cell_size_stale: true,
         }
     }
@@ -197,6 +202,42 @@ impl Core {
     #[allow(dead_code)]
     pub fn app(&self) -> &App {
         &self.app
+    }
+
+    /// One frame through the real [`draw_if_due`], for tests that care about
+    /// the wiring a frame performs rather than the pixels it produces.
+    /// [`viewport_report`] is why this exists: it is the only thing carrying
+    /// what was drawn back into `update()`, and drawing `tgt_ui::view` into
+    /// a scratch `HitMap` — which is what every test harness here did —
+    /// exercises none of it. Deleting that block used to leave the whole
+    /// workspace green.
+    ///
+    /// Not the call [`run`] makes: `run` owns a [`LiveTheme`] and a
+    /// [`DrawGate`] across frames and threads them in. Both are
+    /// module-private, so this builds a one-shot pair and forces the gate
+    /// open — the loop's 16 ms frame pacing has its own unit tests and is
+    /// not what a caller of this is asking about.
+    // Dead in the bin target itself, like `app()` above: consumed by the
+    // integration tests, which `#[path]`-include this module.
+    #[allow(dead_code)]
+    pub fn draw_once<B: Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let mut live_theme = LiveTheme {
+            theme: Theme::default_dark(),
+            generation: self.app.state().theme_generation,
+        };
+        let mut gate = DrawGate::default();
+        gate.note_dirty(true);
+        draw_if_due(
+            self,
+            &mut live_theme,
+            |_| Theme::default_dark(),
+            || None,
+            terminal,
+            &mut gate,
+        )
     }
 
     /// True once per render-worthy change; cleared on read.
@@ -425,6 +466,24 @@ fn translate_mouse(hits: &HitMap, ev: MouseEvent) -> Option<Action> {
     }
 }
 
+/// What viewport report a freshly drawn frame owes `update()`, given the
+/// range last reported. `None` means nothing to send: either the frame drew
+/// no messages, or it drew the same ones as the frame before it.
+///
+/// Shaped like [`translate_mouse`] and for the same reason — the frame's
+/// geometry is resolved here so that `update()` receives message ids and
+/// never a `Rect` (architecture §7.5).
+fn viewport_report(hits: &HitMap, last: Option<(MessageId, MessageId)>) -> Option<Action> {
+    let range = hits.visible_messages()?;
+    if Some(range) == last {
+        return None;
+    }
+    Some(Action::ViewportChanged {
+        first: range.0,
+        last: range.1,
+    })
+}
+
 /// Expands a pasted `~/…` path against `$HOME` when the file it names is
 /// really there, so the send-file offer `state::composer::handle_paste`
 /// raises carries a path TDLib can open. Core cannot do this itself: `$HOME`
@@ -609,14 +668,14 @@ impl DrawGate {
     }
 }
 
-fn draw_if_due(
+fn draw_if_due<B: Backend>(
     core: &mut Core,
     live_theme: &mut LiveTheme,
     resolve_theme: ThemeResolver,
     measure_cell: CellMeasure,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
     gate: &mut DrawGate,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     // `take_dirty` ALWAYS clears the flag, so it has to be accumulated
     // rather than tested alongside the gate: `take_dirty() && gate_ready`
     // silently discards the change whenever the gate is shut. Human input
@@ -688,6 +747,19 @@ fn draw_if_due(
             terminal.draw(|f| *last_hits = tgt_ui::view(state, &live_theme.theme, f, render))?;
         }
         gate.mark_drawn(Instant::now());
+
+        // The frame now on screen is the only frame a keystroke can mean
+        // anything against, so the report goes out here, before the loop
+        // goes back to awaiting input. Sharing the one action channel with
+        // keys is what orders them: `update()` always holds the range from
+        // the frame the user was looking at when they pressed a key.
+        //
+        // `Action::ViewportChanged` sets no dirty flag, so this cannot
+        // drive the loop round again.
+        if let Some(action) = viewport_report(&core.last_hits, core.last_viewport) {
+            core.last_viewport = core.last_hits.visible_messages();
+            core.apply(action);
+        }
     }
     Ok(())
 }
@@ -712,7 +784,7 @@ fn draw_if_due(
 /// graphics layer untouched, which is the bug. `swap_buffers` resets the
 /// inactive buffer and flips, so calling it once out of band leaves both
 /// buffers blank — matching the screen that was just cleared.
-fn repaint(terminal: &mut DefaultTerminal) -> io::Result<()> {
+fn repaint<B: Backend>(terminal: &mut ratatui::Terminal<B>) -> Result<(), B::Error> {
     terminal.backend_mut().clear()?;
     terminal.swap_buffers();
     Ok(())
@@ -918,5 +990,35 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_frame_reports_its_message_range_once_per_change() {
+        let hits = hit_map();
+
+        // First frame: nothing reported yet, so the range is news.
+        assert!(matches!(
+            viewport_report(&hits, None),
+            Some(Action::ViewportChanged {
+                first: MessageId(3),
+                last: MessageId(3),
+            })
+        ));
+
+        // Same range as last time: no action at all. Without this, every
+        // frame would push an action and the loop would never go quiet.
+        assert!(viewport_report(&hits, Some((MessageId(3), MessageId(3)))).is_none());
+
+        // A different range is news again.
+        assert!(matches!(
+            viewport_report(&hits, Some((MessageId(1), MessageId(2)))),
+            Some(Action::ViewportChanged { .. })
+        ));
+
+        // A frame with no message on it (an overlay, an empty chat) reports
+        // nothing rather than reporting an empty range.
+        let mut chrome_only = HitMap::new();
+        chrome_only.push_area(Rect::new(0, 0, 30, 20), ScrollArea::ChatList);
+        assert!(viewport_report(&chrome_only, None).is_none());
     }
 }

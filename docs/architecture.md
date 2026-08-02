@@ -230,6 +230,11 @@ pub enum Key {
     PageUp,
     PageDown,
     Ctrl(char), // Ctrl('c'), Ctrl('p'), …
+    // Pane movement (§6.2). Terminals that do not emit modified arrow
+    // sequences (notably Apple Terminal.app) deliver these as plain
+    // Left/Right instead.
+    CtrlLeft,
+    CtrlRight,
 }
 
 /// Rebindable global keys, parsed from config ("ctrl+p" → Key::Ctrl('p')).
@@ -478,21 +483,25 @@ use crate::model::message::MessageCaps;
 pub enum Chip {
     Reply,    // 'r'
     Forward,  // 'f'
-    React,    // 'e'
+    React,    // '+'  (reads as "add a reaction"; frees 'e' for Edit)
     Copy,     // 'c'
-    Edit,     // 'd'  (only own editable messages)
-    Delete,   // 'x'
+    Edit,     // 'e'  (only own editable messages)
+    Delete,   // 'd'
     Download, // 'l'  (file content, not yet downloaded)
     Open,     // 'o'  (file content, downloaded)
     Resend,   // 's'  (only SendState::Failed)
+    Reveal,   // 'v'  (message has an unrevealed spoiler; §7.5.1)
+    CancelUpload, // 'k'  (an upload for this message is still in flight)
+    JumpToQuoted, // 'j'  (this message quotes another; §7.5.3)
 }
 
 impl Chip {
     pub fn shortcut(self) -> char {
         match self {
-            Chip::Reply => 'r', Chip::Forward => 'f', Chip::React => 'e',
-            Chip::Copy => 'c', Chip::Edit => 'd', Chip::Delete => 'x',
+            Chip::Reply => 'r', Chip::Forward => 'f', Chip::React => '+',
+            Chip::Copy => 'c', Chip::Edit => 'e', Chip::Delete => 'd',
             Chip::Download => 'l', Chip::Open => 'o', Chip::Resend => 's',
+            Chip::Reveal => 'v', Chip::CancelUpload => 'k', Chip::JumpToQuoted => 'j',
         }
     }
     pub fn label(self) -> &'static str {
@@ -500,6 +509,8 @@ impl Chip {
             Chip::Reply => "Reply", Chip::Forward => "Forward", Chip::React => "React",
             Chip::Copy => "Copy", Chip::Edit => "Edit", Chip::Delete => "Delete",
             Chip::Download => "Download", Chip::Open => "Open", Chip::Resend => "Resend",
+            Chip::Reveal => "Reveal", Chip::CancelUpload => "Cancel upload",
+            Chip::JumpToQuoted => "Jump to quote",
         }
     }
 }
@@ -575,6 +586,15 @@ pub enum Action {
     /// bindings, telemetry mode and salt, consent, terminal size, clock —
     /// none of which the sign-out invalidates.
     AccountReset,
+    /// Which messages the last drawn frame actually put on screen (§7.5).
+    /// Like `Click`, the coordinates are resolved at the `tgt-ui` boundary —
+    /// `update()` receives two message ids, never a `Rect`. Sent by
+    /// `runtime_loop` after each draw, and only when the range changed.
+    ///
+    /// Deliberately does NOT set `dirty`: this action is produced *by*
+    /// rendering, so marking it render-worthy would make every frame
+    /// schedule another one.
+    ViewportChanged { first: MessageId, last: MessageId },
 }
 
 /// Domain-specific completions: the dispatcher maps (request, response) pairs
@@ -813,8 +833,35 @@ impl FocusStack {
     }
     pub fn replace_base(&mut self, f: Focus) { self.stack[0] = f; }
     pub fn depth(&self) -> usize { self.stack.len() }
+    /// Whether `f` is anywhere in the stack, not merely on top.
+    pub fn contains(&self, f: &Focus) -> bool { self.stack.contains(f) }
 }
 ```
+
+**`current()` answers "what claims keys", `contains()` answers "what mode is
+the user in".** They differ whenever a level is pushed *over* another without
+leaving it, which is every modal and both overlays. Key routing wants
+`current()` — that is the whole point of a stack. Anything asking whether the
+user is still *in* a mode wants `contains()`, and using `current()` there is a
+silent bug rather than a compile error.
+
+The case that forced the distinction: `Chip::JumpToQuoted` starts a hunt, the
+user presses `d` before the page lands, and `Focus::Modal(ConfirmDelete)` goes
+on top of `Focus::Selection`. The landing (§7.5.3) then has to move the
+selection cursor — selection mode has not been left — but a `current()` gate
+sees `Modal(_)` and skips it, which is the finding-1 defect on a path that
+never self-corrects, since `hunt` is cleared on landing and no later page
+repairs the highlight.
+
+`convo.selection.is_some()` is *not* an equivalent gate, despite reading like
+one. Eviction during a long hunt nulls that field while `Focus::Selection` is
+still on the stack (§7.5.3), so it is `None` in precisely the state the
+landing exists to repair.
+
+`contains` compares by equality, so for the payload-carrying `Modal(_)` it
+matches an exact `ModalKind`. Every present caller asks about a payload-free
+variant; a "some modal is open" query would need its own discriminant-based
+helper rather than this one.
 
 ### 4.6 `AppState` and sub-states — `core/src/app.rs`, `core/src/state/`
 
@@ -828,7 +875,7 @@ isolation.
 use std::collections::HashMap;
 use crate::action::Action;
 use crate::effect::{Effect, TelemetryMode};
-use crate::model::ids::ChatId;
+use crate::model::ids::{ChatId, MessageId};
 use crate::model::key::KeyBindings;
 use crate::model::time::Millis;
 use crate::state::auth::AuthState;
@@ -880,6 +927,19 @@ pub struct AppState {
     pub telemetry_salt: [u8; 32],
     /// Last observed tick time; the only "clock" update logic may consult.
     pub now: Millis,
+    /// The oldest and newest message the last drawn frame put on screen, or
+    /// `None` before the first frame and whenever no message was drawn.
+    ///
+    /// Read only by `state::selection`'s anchor policy. `None` means "no
+    /// information", and every consumer must fall back to its pre-existing
+    /// behavior — every unit and integration test in this workspace drives
+    /// `update()` with no renderer attached, so `None` is the value they all
+    /// see, and treating it as "everything is visible" would leave the suite
+    /// green about a path no user reaches. Not render-affecting: it is
+    /// produced by rendering, not consumed by it, so `Action::ViewportChanged`
+    /// must never set `dirty`. Cleared whenever `open_chat` changes to a
+    /// different chat — a stale range would suppress the first scroll in it.
+    pub visible_messages: Option<(MessageId, MessageId)>,
 }
 
 /// Boot-time data computed impurely in tgt-app and injected as plain values.
@@ -917,6 +977,16 @@ Routing contract inside `App::update` (spec §6.2): keys go modal → focused pa
 actions route by payload (e.g. `TdUpdate::ChatPosition` → `chat_list`,
 `HistoryLoaded` → `history`/`conversation`). Every sub-state module exposes
 plain functions; the canonical handler shapes are:
+
+`move_pane_focus` (`app.rs`) runs the pane-movement row of that table:
+`Key::CtrlLeft`/`Key::CtrlRight` move between `Focus::ChatList` and
+`Focus::Composer` at depth 1, same as `Tab`/`BackTab`. `Focus::Selection` gets
+the one exception above depth 1 — `Ctrl+←` there pops it and swaps the base to
+`Focus::ChatList` in the same keystroke, since selection sits on the
+conversation side and "go left" means the same thing there as in the
+composer. Every other overlay (filter, search, palette, modal) keeps the
+depth-1 gate. `Ctrl+→` from `Focus::ChatList` additionally opens the selected
+chat, reusing `click_chat_row`'s bracket rather than a second open path.
 
 ```rust
 // state/<name>.rs — handlers own their sub-struct, may read AppState context
@@ -1099,7 +1169,16 @@ pub enum Scroll {
     /// Pinned to newest; new messages keep the view at the bottom.
     Bottom,
     /// Anchored at a message (stable across prepends), offset in laid-out lines.
+    /// The message's BOTTOM edge sits at the viewport's last row; the view
+    /// fills backward from it.
     At { message_id: MessageId, line_offset: u16 },
+    /// Anchored with this message's TOP edge at the viewport's first row —
+    /// where a deliberate jump lands (the reply-quote chip, its backward hunt,
+    /// and the mouse click on a quote line). The opposite fill direction to
+    /// `At`.
+    ///
+    /// Carries no `line_offset`: the target's first line IS row 0.
+    AtTop { message_id: MessageId },
 }
 
 #[derive(Debug)]
@@ -1142,6 +1221,38 @@ Selection is per open chat and transient, so it lives on the conversation it
 selects in: `ConversationState` gains
 `pub selection: Option<SelectionState>` in milestone 4 (task T26). The field is
 listed here so neighboring tasks can rely on the name.
+
+```rust
+// core/src/state/conversation.rs
+use crate::model::ids::MessageId;
+
+/// A search for a message older than the loaded window, started by the
+/// jump-to-quote chip (§7.5.3). Pages backward until the target arrives, the
+/// start of history is reached, or the budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JumpHunt {
+    pub target: MessageId,
+    pub pages_spent: u8,
+}
+
+/// 20 × `history::PAGE_SIZE` = 1000 messages. A reply quote is nearly always
+/// a message still in the window or a page behind it; this bounds the
+/// pathological case (quoting something from a year ago) rather than sizing
+/// the common one.
+pub const MAX_HUNT_PAGES: u8 = 20;
+```
+
+`ConversationState` gains `pub hunt: Option<JumpHunt>` for the same reason
+(post-plan, jump-to-quote keyboard path, §7.5.3). One subtlety this field
+forces on `evict_excess`: that function drops from the **front** of the
+window whenever the anchor is `Scroll::Bottom`. A hunt that left the anchor
+there would evict every page it fetched the moment the window reached
+`WINDOW_MAX_MESSAGES` (500) — it would spend its whole budget and find
+nothing. So `start_hunt`/`advance_hunt` move the anchor to the oldest loaded
+message after every page; `evict_excess` then drops from the back instead,
+and the window walks backward through history as the hunt runs. That anchor
+move is also the hunt's progress indicator — the view visibly scrolls back
+while it searches, so no separate "searching…" affordance exists.
 
 ```rust
 // core/src/state/composer.rs
@@ -2460,8 +2571,8 @@ cache key from a bool to a per-entity set, a §8.2 change out of scope here;
 this amendment reads that existing commitment rather than relitigating it.
 
 **Jump when the quoted message is not loaded.** `conversation::jump_to_message`
-sets `Scroll::At { message_id: quoted, line_offset: 0 }` and nothing else —
-deliberately mirroring `state::search`'s `n`/`N` stepping (`step()`), which
+sets the scroll anchor to the quoted id and nothing else — deliberately
+mirroring `state::search`'s `n`/`N` stepping (`step()`), which
 already jumps to a TDLib-supplied message id with no guarantee it is in the
 loaded window and does not page for it directly. Per that module's own doc
 comment, "conversation.rs's own near-top/near-bottom paging logic... is
@@ -2511,6 +2622,159 @@ about to change.
 through `escape()` or `Action::Resize`, and both tear down the whole
 session regardless, so there is nothing for a `CloseChat` to accomplish
 ahead of it.
+
+### 7.5.3 Jump-to-quote hunt: a keyboard path, not a reopening of §7.5.1's rejected one (T9, 2026-08-02)
+
+§7.5.1's "Jump when the quoted message is not loaded" note rejected building
+"a second, direct 'load toward an arbitrary id' path" for the mouse
+reply-quote click, on the grounds that the existing near-top paging trigger
+already carries an anchor set past the loaded window toward wherever it
+needs to go. `JumpHunt` (above) is exactly the kind of thing that note
+argued against building — so it is worth being explicit about why adding it
+here does not undo that decision rather than silently contradicting it.
+
+The two paths solve different problems. A mouse click's `jump_to_message`
+is a passive anchor move: it trusts `trigger_paging_if_near_top` to notice,
+eventually, that the anchor sits outside the window, and it accepts however
+long that takes with no feedback beyond the view slowly filling in. The
+keyboard chip needs more than that, because unlike a click it is discrete
+and repeatable — a user pressing `j` needs to know within a bounded time
+whether the jump is going to land or never will, not watch a paging
+indicator that does not exist. `JumpHunt` supplies exactly that: a request
+budget (`MAX_HUNT_PAGES`) and an explicit give-up with a toast, neither of
+which the ambient mechanism §7.5.1 relies on provides on its own.
+
+Mechanically the hunt still drives the same `state/history.rs` `PagingState`
+machine §7.5.1 was protecting — `start_hunt`/`advance_hunt` call the same
+`anchor_to` the click path calls, and issue their own `GetChatHistory` only
+as a fallback when that anchor move's near-top trigger stayed silent. There
+is one paging state machine and one way to drive it toward an id outside the
+window; the hunt adds a budget and a caller that notices when to stop asking,
+not a competing request path.
+
+**The fallback's guard is `PagingState::Loading`, not "always" and not
+"never".** Both extremes are real bugs and each is pinned by its own test.
+Always, and the continuation double-dispatches against the empty-page retry
+`apply_history_page`'s directive handling already issued. Never, and the hunt
+stalls silently in the two states where `trigger_paging_if_near_top` emits
+nothing: a window collapsed to a single message (the oldest loaded message is
+also the newest, so `anchor_to_flavoured` re-pins to `Scroll::Bottom`, which
+the trigger bails on) and a `Cooldown` predating the hunt (`start_hunt` fires
+its own fallback straight into that state, which is how a hunt comes to be
+running under one). Either leaves `convo.hunt` set with no request out and no
+toast — "looks stalled, not stopped", the failure the `Err` arm exists to
+prevent. `pages_spent` increments on every non-terminal call regardless, so
+`MAX_HUNT_PAGES` bounds the fallback as tightly as everything else.
+
+**Landing is reported, not performed.** `apply_history_page` returns
+
+```rust
+pub struct HistoryPage {
+    pub effects: Vec<Effect>,
+    pub hunt_landed: Option<MessageId>,
+}
+```
+
+`conversation.rs` moves the *anchor* onto the target and stops there. Moving
+the selection cursor is `app.rs`'s job, for two reasons that pull the same
+way: the chip row and the `getMessageProperties` refresh belong to
+`selection.rs`'s own entry path (`select` with `AnchorPolicy::JumpToTop` —
+the identical call `Chip::JumpToQuoted` makes when the quote *was* already
+loaded, so `j` behaves the same either way), and "only if the user is still
+in selection mode" is a focus question, which the router owns exclusively
+(§6.2). The first shipped version of the hunt reported nothing and moved
+nothing, which left the highlight on the message the user jumped *from*,
+below the viewport and invisible, with `↑` then walking the view back down.
+
+The landing call also repairs the selection when the hunt itself destroyed
+it: `start_hunt` parks the anchor at the front of the window so `evict_excess`
+drops from the back, so a long hunt on a full window evicts the message `j`
+was pressed on and `drop_selection_if_gone` nulls the selection underneath a
+live `Focus::Selection`. `select` sets the selection outright rather than
+moving it, so that state comes back coherent.
+
+Anchoring twice (once in `advance_hunt`, once inside `select`) is deliberate
+and idempotent: the second `anchor_to_top` re-sets the same `Scroll::AtTop`
+and its near-top trigger finds `PagingState::Loading`, which
+`history::on_scroll_near_top` answers with `PagingDirective::None`. Keeping
+`advance_hunt`'s own anchor is what makes the viewport land even when no
+selection move follows.
+
+### 7.5.4 `Scroll::AtTop`: a jump lands its target at the top of the viewport (2026-08-02)
+
+User feedback after §7.5.1 and §7.5.3 shipped: jumping to a quoted message
+put it on the **last** visible row, with the whole screen above it showing
+context the user had just come from and nothing of what they jumped to read.
+It belongs on the **first** row.
+
+This cannot be fixed by choosing a different anchor message. `Scroll::At`
+means "this message's bottom edge sits at the viewport bottom" and the view
+fills backward from it, so landing message M at the top would mean anchoring
+at whichever message ends up one screen *below* M — which needs laid-out line
+heights, and those live in `tgt-ui` and never come back to core (§4.6, §7.5).
+So `Scroll::AtTop { message_id }` names the intent and the view resolves the
+direction, the same division of labour §7.5 already uses for click
+coordinates.
+
+**Anchor movement preserves the flavour.** `step_anchor` and `move_anchor`
+map `AtTop{M}` to `AtTop{M±1}` and `At{M}` to `At{M±1}`; only reaching the
+newest loaded message re-pins either to `Scroll::Bottom`. Converting `AtTop`
+back to `At` on a scroll or a selection step would flip the message the user
+just jumped to from the top of the screen to the bottom on their very next
+keypress — a worse defect than the one this fixes, and one that a unit test
+reading `convo.scroll` immediately after the jump cannot see. `anchor_to` and
+`anchor_to_top` are therefore two thin wrappers over one flavoured helper,
+`anchor_to_flavoured`, which builds the variant through `anchored(id, top)`.
+
+**`anchored` is not a choke point, and nothing should be written as though it
+were.** Three sites build a `Scroll` from a message id without it, each
+deliberately: `jump_to_message` writes `Scroll::AtTop` directly to keep its
+"sets the anchor and nothing else" contract (its own doc comment says why —
+the target is routinely not loaded, and the paging that fetches it is §7.5.1's
+ambient trigger rather than a request from there), and `state::search`'s two
+hit-stepping sites write `Scroll::At` directly because search stepping stays
+bottom-anchored by decision, not by omission. What `anchored` actually
+guarantees is narrower and still worth having: every mover that *carries a
+flavour forward* — `anchor_to_flavoured`, `move_anchor`,
+`scroll_conversation_move`, `reanchor_after_deletion` — builds the variant in
+one place, so the two flavours cannot drift in the paths where preserving one
+is the whole point.
+
+**The bottom-fill fallback is part of the contract, not an edge case.** When
+too few newer messages exist to fill the pane, the target *cannot* be
+top-most: rendering it there would leave blank rows below real content.
+`view::conversation`'s forward fill detects the short result and continues
+backward from the same anchor, which produces exactly the bottom-anchored
+frame. A quoted message a few from the end of history hits this routinely.
+Continuing the existing fill rather than restarting one from the newest
+message is deliberate: each message's block is then built once per frame, so
+`RenderState::images` is never asked to plan the same photo twice and its
+end-of-frame sweep cannot see a message as touched that was never drawn.
+
+**Core treats `AtTop` exactly like `At` wherever only the anchored *message*
+matters.** Both resolve to the same index, so four of the seven core match
+sites take a shared `Scroll::At { message_id, .. } | Scroll::AtTop
+{ message_id }` arm and never ask which: `media`'s auto-download anchor,
+`evict_excess` (whose own comment says the pinned edge is irrelevant to a
+distance-from-each-end question), `trigger_paging_if_near_top`, and
+`move_anchor`/`scroll_conversation_move`, which match jointly and then read
+the flavour back out with a separate `matches!` in order to carry it forward.
+
+The two that split into per-flavour arms do so because they need the bit, not
+by accident: `step_anchor` and the deletion re-anchor in
+`remove_deleted_messages` both map the current variant to a `top: bool` they
+hand to `anchored`. That is the same "movement preserves the flavour" rule
+above, so a shared arm is exactly what they cannot use.
+
+`mark_visible_read` is the site that treats neither like the other: it gates
+on `Scroll::Bottom`, because a user who jumped backward is not looking at the
+newest messages and not marking them read is correct.
+
+**Scope.** The three quote-jump paths use it — `Chip::JumpToQuoted`
+(`AnchorPolicy::JumpToTop`), `advance_hunt`'s landing, and
+`jump_to_message`, which §7.5.1's mouse click calls. `state::search`'s `n`/`N`
+hit stepping stays bottom-anchored: same annoyance, different feature, and
+changing it is a decision about search, not about quotes.
 
 ## 8. Decisions the spec delegated
 

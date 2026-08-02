@@ -432,6 +432,7 @@ mod tests {
                     pending_view: None,
                     search_hits: Vec::new(),
                     selection: None,
+                    hunt: None,
                 },
             );
         }
@@ -476,6 +477,7 @@ mod tests {
             crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
+            visible_messages: None,
         }
     }
 
@@ -549,7 +551,7 @@ mod tests {
             rendered.contains("[R Reply]"),
             "chip row missing:\n{rendered}"
         );
-        assert!(rendered.contains("[X Delete]"));
+        assert!(rendered.contains("[D Delete]"));
         assert!(
             !rendered.contains(hint_bar::HINT_TEXT),
             "the hint bar must give the row up entirely:\n{rendered}"

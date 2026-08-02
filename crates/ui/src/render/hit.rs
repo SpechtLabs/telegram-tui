@@ -20,6 +20,7 @@
 
 use ratatui::layout::{Position, Rect};
 use tgt_core::model::hit::{HitTarget, ScrollArea};
+use tgt_core::model::ids::MessageId;
 
 /// The clickable and scrollable regions of one rendered frame.
 ///
@@ -60,6 +61,32 @@ impl HitMap {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.panes.is_empty()
+    }
+
+    /// The oldest and newest message id drawn in this frame, or `None` if no
+    /// message block was drawn at all (an overlay, a chat with no history,
+    /// or before the first frame).
+    ///
+    /// This is what lets `update()` know where the viewport is without ever
+    /// seeing a `Rect` (architecture §7.5): the coordinates are resolved
+    /// here, and core receives two message ids.
+    ///
+    /// Only `HitTarget::Message` entries count. `Spoiler` and `ReplyQuote`
+    /// also carry ids — the first for a sub-run of a block that is already
+    /// counted, the second for a message that may not be loaded at all —
+    /// and either would report a range the user is not looking at.
+    pub fn visible_messages(&self) -> Option<(MessageId, MessageId)> {
+        let mut range: Option<(MessageId, MessageId)> = None;
+        for (_, target) in &self.entries {
+            let HitTarget::Message(id) = target else {
+                continue;
+            };
+            range = Some(match range {
+                None => (*id, *id),
+                Some((lo, hi)) => (lo.min(*id), hi.max(*id)),
+            });
+        }
+        range
     }
 }
 
@@ -133,6 +160,29 @@ mod tests {
         assert_eq!(hits.area_at(50, 10), Some(ScrollArea::Conversation));
         assert_eq!(hits.area_at(2, 25), None);
         assert_eq!(hits.target_at(50, 10), None);
+    }
+
+    #[test]
+    fn visible_messages_reports_the_drawn_id_range() {
+        let mut hits = HitMap::new();
+        assert_eq!(hits.visible_messages(), None);
+
+        hits.push(Rect::new(0, 0, 10, 2), HitTarget::Message(MessageId(7)));
+        hits.push(Rect::new(0, 2, 10, 2), HitTarget::Message(MessageId(9)));
+        hits.push(Rect::new(0, 4, 10, 1), HitTarget::Message(MessageId(3)));
+        // Non-message targets carrying ids must not widen the range: a
+        // ReplyQuote names a message that may not be on screen at all.
+        hits.push(
+            Rect::new(0, 4, 10, 1),
+            HitTarget::ReplyQuote {
+                containing: MessageId(3),
+                quoted: MessageId(1),
+            },
+        );
+        hits.push(Rect::new(0, 6, 4, 1), HitTarget::Spoiler(MessageId(99)));
+        hits.push(Rect::new(0, 8, 10, 1), HitTarget::ChatRow(ChatId(1)));
+
+        assert_eq!(hits.visible_messages(), Some((MessageId(3), MessageId(9))));
     }
 
     #[test]

@@ -42,6 +42,8 @@ fn map_key_event(ev: KeyEvent) -> Option<Key> {
         KeyCode::BackTab => Some(Key::BackTab),
         KeyCode::Up => Some(Key::Up),
         KeyCode::Down => Some(Key::Down),
+        KeyCode::Left if ctrl => Some(Key::CtrlLeft),
+        KeyCode::Right if ctrl => Some(Key::CtrlRight),
         KeyCode::Left => Some(Key::Left),
         KeyCode::Right => Some(Key::Right),
         KeyCode::Backspace => Some(Key::Backspace),
@@ -114,6 +116,28 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(map_event(repeat), Some(Action::Key(Key::Up))));
+    }
+
+    #[test]
+    fn ctrl_arrows_map_to_their_own_variants() {
+        assert!(matches!(
+            map_event(press(KeyCode::Left, KeyModifiers::CONTROL)),
+            Some(Action::Key(Key::CtrlLeft))
+        ));
+        assert!(matches!(
+            map_event(press(KeyCode::Right, KeyModifiers::CONTROL)),
+            Some(Action::Key(Key::CtrlRight))
+        ));
+        // Unmodified arrows are untouched, and a modifier that is not Ctrl
+        // still yields the plain variant.
+        assert!(matches!(
+            map_event(press(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::Key(Key::Left))
+        ));
+        assert!(matches!(
+            map_event(press(KeyCode::Left, KeyModifiers::ALT)),
+            Some(Action::Key(Key::Left))
+        ));
     }
 
     #[test]

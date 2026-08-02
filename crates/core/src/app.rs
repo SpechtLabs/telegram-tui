@@ -71,6 +71,16 @@ pub struct AppState {
     pub telemetry_salt: [u8; 32],
     /// Last observed tick time; the only "clock" update logic may consult.
     pub now: Millis,
+    /// The oldest and newest message the last drawn frame put on screen, or
+    /// `None` before the first frame and whenever no message was drawn.
+    ///
+    /// Read only by `state::selection`'s anchor policy. `None` means "no
+    /// information", and every consumer must fall back to its pre-existing
+    /// behavior — every unit and integration test in this workspace drives
+    /// `update()` with no renderer attached, so `None` is the value they all
+    /// see, and treating it as "everything is visible" would leave the suite
+    /// green about a path no user reaches.
+    pub visible_messages: Option<(MessageId, MessageId)>,
 }
 
 /// Boot-time data computed impurely in tgt-app and injected as plain values.
@@ -236,6 +246,7 @@ impl App {
             crash_reports_available: boot.crash_reports_available,
             telemetry_salt: boot.telemetry_salt,
             now: Millis::default(),
+            visible_messages: None,
         };
         // Set so the first frame draws even before any action arrives.
         App { state, dirty: true }
@@ -309,6 +320,11 @@ impl App {
                 self.dirty = true;
                 Vec::new()
             }
+            Action::ViewportChanged { first, last } => {
+                // No `self.dirty = true` — see the variant's docs.
+                self.state.visible_messages = Some((first, last));
+                Vec::new()
+            }
             Action::Key(key) => self.route_key(key),
             // Bracketed paste. `handle_paste` decides between inserting the
             // text and holding it as a send-file offer, and enforces its own
@@ -339,7 +355,37 @@ impl App {
                 // The page itself, an emptied retry round and a cooldown all
                 // change what the viewport shows or how it behaves.
                 self.dirty = true;
-                conversation::apply_history_page(&mut self.state, chat_id, only_local, &outcome)
+                let page = conversation::apply_history_page(
+                    &mut self.state,
+                    chat_id,
+                    only_local,
+                    &outcome,
+                );
+                let mut effects = page.effects;
+                // T9: this page carried the quote a hunt was looking for.
+                // `conversation.rs` anchored the viewport on it and stopped
+                // there on purpose (architecture §7.5.3): the cursor move is
+                // `selection.rs`'s entry path, and the "still in selection
+                // mode" gate is a focus question, which is this router's.
+                // Without it the highlight stays on the message `j` was
+                // pressed from — below the viewport, invisible — and the
+                // next `↑` walks the view back down instead of moving it.
+                //
+                // `contains`, not `current`: a modal opened over selection
+                // mode (`j` then `d` before the page lands) does not leave
+                // it, and gating on the top of the stack would skip the
+                // move on a path that never self-corrects — `hunt` is
+                // cleared here, so no later page repairs it. Nor is
+                // `convo.selection.is_some()` the same question: eviction
+                // during a long hunt nulls that field while
+                // `Focus::Selection` is still on the stack, which is
+                // exactly the state this call exists to repair.
+                if let Some(target) = page.hunt_landed
+                    && self.state.focus.contains(&Focus::Selection)
+                {
+                    effects.extend(selection::select_landing(&mut self.state, chat_id, target));
+                }
+                effects
             }
             Action::TdResult(TdResult::ChatsLoaded { outcome }) => {
                 // `loadChats` only reports that TDLib accepted the request;
@@ -685,10 +731,26 @@ impl App {
             return Some(effects);
         }
 
-        // 6. Pane movement.
-        if self.move_pane_focus(key) {
+        // 6. Pane movement. `Ctrl+→` from the chat list opens the selected
+        //    chat — the same path `⏎` and a left-click take (`click_chat_row`)
+        //    — before falling into the swap/pop table below.
+        if key == Key::CtrlRight
+            && self.state.focus.depth() == 1
+            && *self.state.focus.current() == Focus::ChatList
+            && let Some(chat_id) = self.state.chat_list.selected
+        {
             self.dirty = true;
-            return Some(Vec::new());
+            return Some(self.click_chat_row(chat_id));
+        }
+
+        let was_visible = conversation_pane_visible(&self.state);
+        if self.move_pane_focus(key) {
+            // Nothing else fed into `effects` at this call site before —
+            // `move_pane_focus` returns only a bool — so the close check is
+            // the entire payload.
+            let effects = conversation::close_if_now_hidden(&self.state, was_visible);
+            self.dirty = true;
+            return Some(effects);
         }
 
         // 7. Global. Reached only by keys no pane above claimed, which is
@@ -871,6 +933,13 @@ impl App {
         let open_before = self.state.open_chat;
         let effects = chat_list::handle_key(&mut self.state, key)?;
 
+        if self.state.open_chat != open_before {
+            // The old chat's ids say nothing about the new chat's viewport,
+            // and a stale range would suppress the first scroll in it
+            // (`selection::select`'s `AnchorPolicy::KeepVisible` arm).
+            self.state.visible_messages = None;
+        }
+
         if self.state.open_chat != open_before && self.state.open_chat.is_some() {
             // `⏎` opened a chat: the conversation side takes focus, whose
             // resting level is the composer (spec §6.2 — typing goes to the
@@ -968,6 +1037,14 @@ impl App {
             // lifecycle into `enter`/`exit` precisely so the router can run
             // the second half on the generic pop path.
             Focus::Selection => {
+                // T9: popping out of selection mode is the user taking over
+                // navigation — an in-flight jump-to-quote hunt no longer
+                // speaks for where the view should go.
+                if let Some(chat_id) = self.state.open_chat
+                    && let Some(convo) = self.state.conversations.get_mut(&chat_id)
+                {
+                    conversation::cancel_hunt(convo);
+                }
                 selection::exit(&mut self.state);
                 self.state.focus.pop();
             }
@@ -1035,16 +1112,27 @@ impl App {
     /// conversation side is therefore `tab` or `esc`, both of which always
     /// work.
     fn move_pane_focus(&mut self, key: Key) -> bool {
-        if self.state.focus.depth() != 1 {
+        // `Ctrl+←` out of selection mode is the one movement allowed above
+        // depth 1: selection sits on the conversation side and "go left"
+        // means the same thing there as it does in the composer. Every
+        // other overlay (filter, search, palette, modal) keeps the depth
+        // gate — swapping the pane under one would leave it on a pane it
+        // does not belong to.
+        let popping_selection =
+            key == Key::CtrlLeft && *self.state.focus.current() == Focus::Selection;
+        if self.state.focus.depth() != 1 && !popping_selection {
             return false;
         }
+        if popping_selection {
+            selection::exit(&mut self.state);
+            self.state.focus.pop();
+        }
+
         let target = match (self.state.focus.current(), key) {
             (Focus::ChatList, Key::Right | Key::Tab | Key::BackTab) => Focus::Composer,
-            (Focus::Composer, Key::Tab | Key::BackTab) => Focus::ChatList,
-            _ => return false,
+            (Focus::Composer, Key::Tab | Key::BackTab | Key::CtrlLeft) => Focus::ChatList,
+            _ => return popping_selection,
         };
-        // Focusing the conversation side with no chat open would strand the
-        // cursor on a pane where nothing claims a key.
         if target == Focus::Composer && self.state.open_chat.is_none() {
             return false;
         }
@@ -1159,10 +1247,16 @@ impl App {
     /// the bracket leaves the stack exactly as it found it. The focus
     /// transition afterward is the one `route_chat_list_key` runs for `⏎`.
     fn click_chat_row(&mut self, chat_id: ChatId) -> Vec<Effect> {
+        let open_before = self.state.open_chat;
         self.state.chat_list.selected = Some(chat_id);
         self.state.focus.push(Focus::ChatList);
         let effects = chat_list::handle_key(&mut self.state, Key::Enter).unwrap_or_default();
         self.state.focus.pop();
+        if self.state.open_chat != open_before {
+            // Same reasoning as `route_chat_list_key`: the old chat's ids
+            // say nothing about the new chat's viewport.
+            self.state.visible_messages = None;
+        }
         if self.state.open_chat.is_some() {
             self.state.focus.replace_base(Focus::Composer);
         }
@@ -1254,16 +1348,20 @@ impl App {
             return Vec::new();
         }
         let last_idx = (convo.messages.len() - 1) as isize;
-        let current_idx = match convo.scroll {
+        // `top` rides along for the same reason `move_anchor`'s does: a wheel
+        // notch after a jump-to-quote must not flip the target from the first
+        // visible row to the last (`Scroll::AtTop`).
+        let (current_idx, top) = match convo.scroll {
             Scroll::Bottom => {
                 if delta >= 0 {
                     return Vec::new();
                 }
-                last_idx + 1
+                (last_idx + 1, false)
             }
-            Scroll::At { message_id, .. } => {
+            Scroll::At { message_id, .. } | Scroll::AtTop { message_id } => {
+                let top = matches!(convo.scroll, Scroll::AtTop { .. });
                 match conversation::index_of(&convo.messages, message_id) {
-                    Some(idx) => idx as isize,
+                    Some(idx) => (idx as isize, top),
                     // Anchor older than everything loaded: waiting on the page
                     // that contains it, same as `move_anchor`'s own arm for this
                     // case. Stepping it by `delta` is meaningless with nothing
@@ -1289,10 +1387,7 @@ impl App {
         }
         let clamped_idx = target_idx.clamp(0, last_idx) as usize;
         let new_id = convo.messages[clamped_idx].id;
-        convo.scroll = Scroll::At {
-            message_id: new_id,
-            line_offset: 0,
-        };
+        convo.scroll = conversation::anchored(new_id, top);
         conversation::trigger_paging_if_near_top(convo, chat_id, now)
     }
 
@@ -2288,7 +2383,7 @@ mod routing {
         assert_eq!(selected_message(&app), Some(NEWEST));
 
         // The Delete chip confirms before it deletes (spec §6.3).
-        let effects = app.update(Action::Key(Key::Char('x')));
+        let effects = app.update(Action::Key(Key::Char('d')));
         assert!(effects.is_empty(), "delete confirms first: {effects:?}");
         assert!(matches!(
             app.state().focus.current(),
@@ -2327,7 +2422,7 @@ mod routing {
     #[test]
     fn esc_dismisses_a_modal_without_its_effect() {
         let mut app = selection_with_delete_chip();
-        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Char('d')));
 
         let effects = app.update(Action::Key(Key::Esc));
         assert!(effects.is_empty(), "dismissal deletes nothing: {effects:?}");
@@ -2621,6 +2716,66 @@ mod routing {
         assert_eq!(*app.state().focus.current(), Focus::ChatFilter);
     }
 
+    #[test]
+    fn ctrl_left_moves_from_composer_to_the_chat_list() {
+        let mut app = chat_open();
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+
+        app.update(Action::Key(Key::CtrlLeft));
+
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert_eq!(app.state().focus.depth(), 1);
+    }
+
+    #[test]
+    fn ctrl_left_pops_selection_mode_on_its_way_to_the_chat_list() {
+        let mut app = chat_open();
+        // `↑` on the empty composer is how selection mode is entered (T25).
+        app.update(Action::Key(Key::Up));
+        assert_eq!(*app.state().focus.current(), Focus::Selection);
+
+        app.update(Action::Key(Key::CtrlLeft));
+
+        // One keystroke, not two: the pushed level is unwound AND the base
+        // swapped, and the selection itself is dropped rather than left
+        // dangling under a pane it does not belong to.
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+        assert_eq!(app.state().focus.depth(), 1);
+        assert!(app.state().conversations[&CHAT].selection.is_none());
+    }
+
+    #[test]
+    fn ctrl_left_leaves_overlays_alone() {
+        for overlay in [Focus::Palette, Focus::Help, Focus::ChatFilter] {
+            let mut app = chat_open();
+            app.state.focus.push(overlay.clone());
+
+            app.update(Action::Key(Key::CtrlLeft));
+
+            assert_eq!(
+                *app.state().focus.current(),
+                overlay,
+                "ctrl+left must not swap the pane under an overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_right_opens_the_selected_chat_from_the_chat_list() {
+        // `logged_in()` plus one chat, deliberately NOT opened — `chat_open()`
+        // has already taken the open path this test is about.
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        assert!(app.state().open_chat.is_none());
+        assert_eq!(*app.state().focus.current(), Focus::ChatList);
+
+        app.update(Action::Key(Key::CtrlRight));
+
+        assert_eq!(app.state().open_chat, Some(CHAT));
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+    }
+
     /// `ctrl+p` from every pane, because no pane above the global layer
     /// claims it — and from none of the contexts that sit above that layer:
     /// a modal (which swallows every key) and the auth screen.
@@ -2659,7 +2814,7 @@ mod routing {
 
         // A modal is the one context it cannot be opened from: the key is
         // claimed and swallowed with the modal left standing.
-        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Char('d')));
         assert!(app.update(Action::Key(palette)).is_empty());
         assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
         assert!(app.state().palette.is_none());
@@ -3274,11 +3429,13 @@ mod routing {
             button: ClickButton::Left,
         });
         assert!(effects.is_empty());
+        // Top-anchored: a click on a quote line is a deliberate jump, and
+        // landing the target on the last row would fill the pane with what
+        // the user was already looking at (architecture §7.5.4).
         assert_eq!(
             app.state().conversations[&CHAT].scroll,
-            Scroll::At {
+            Scroll::AtTop {
                 message_id: MessageId(10),
-                line_offset: 0,
             }
         );
         assert_eq!(
@@ -3485,7 +3642,7 @@ mod routing {
     #[test]
     fn clicks_ignored_under_modal() {
         let mut app = selection_with_delete_chip();
-        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Char('d')));
         assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
         app.take_dirty();
 
@@ -3557,6 +3714,69 @@ mod routing {
         );
     }
 
+    /// `Scroll::AtTop`'s flavour survives an anchor step in three places:
+    /// `step_anchor`, `move_anchor`, and this one — the mouse wheel's own
+    /// copy of the stepping logic, which is the copy that got neither of
+    /// the dedicated tests the other two did. Replacing its
+    /// `matches!(convo.scroll, Scroll::AtTop { .. })` with `false` left the
+    /// whole workspace green while flipping the message a user just jumped
+    /// to from the first visible row to the last on their first wheel
+    /// notch, which is precisely what the variant exists to prevent.
+    #[test]
+    fn a_wheel_notch_after_a_jump_keeps_the_target_top_anchored() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((1..=21).map(|id| message(1, id)).collect()),
+        }));
+
+        // A left-click on a reply-quote line is a jump: the quoted message
+        // lands on the FIRST visible row (architecture §7.5.4).
+        app.update(Action::Click {
+            target: HitTarget::ReplyQuote {
+                containing: MessageId(21),
+                quoted: MessageId(10),
+            },
+            button: ClickButton::Left,
+        });
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(10)
+            }
+        );
+        app.take_dirty();
+
+        app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: true,
+        });
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(9)
+            },
+            "one wheel notch must step the anchor and keep it top-anchored; \
+             `Scroll::At` here means the jump target jumped to the bottom"
+        );
+
+        // And downward, which walks back toward where the jump came from.
+        app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: false,
+        });
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(10)
+            }
+        );
+    }
+
     /// The chat-list wheel claims the pane on its own — even while the
     /// keyboard focus is elsewhere — but moves only `scroll_offset`, the
     /// viewport. `selected` and the focus stack are untouched: a mouse
@@ -3608,5 +3828,268 @@ mod routing {
         assert!(effects.is_empty());
         assert!(!app.take_dirty());
         assert_eq!(*app.state().focus.current(), Focus::ChatList);
+    }
+
+    #[test]
+    fn viewport_changed_records_the_range_without_requesting_a_redraw() {
+        let mut app = chat_open();
+        let _ = app.take_dirty();
+
+        let effects = app.update(Action::ViewportChanged {
+            first: MessageId(4),
+            last: MessageId(9),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.state().visible_messages,
+            Some((MessageId(4), MessageId(9)))
+        );
+        // Critical: the range is produced BY rendering. Marking it dirty
+        // would make every frame schedule another frame.
+        assert!(!app.take_dirty());
+    }
+
+    /// A chat with `50..60` loaded, selection mode on the newest message,
+    /// and a hunt already looking for `MessageId(45)`.
+    fn hunting_for_an_unloaded_quote(target: MessageId, loaded: std::ops::Range<i64>) -> App {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok(loaded.map(|id| message(1, id)).collect()),
+        }));
+        // `↑` on the empty composer is selection mode, starting at the
+        // newest loaded message — the message the user is quoting *from*.
+        app.update(Action::Key(Key::Up));
+        conversation::start_hunt(&mut app.state, CHAT, target);
+        app.take_dirty();
+        app
+    }
+
+    /// The hunt landing moved the *viewport* onto the quote and left the
+    /// selection cursor where the user pressed `j`: far below the new
+    /// viewport, invisible, and with every subsequent `↑` firing
+    /// `select`'s `(KeepVisible, Some(_))` arm to walk the view back down
+    /// one message at a time with no highlight on screen. The loaded path
+    /// (`Chip::JumpToQuoted` with the quote already in the window) has
+    /// always moved both, so `j` did two different things depending only
+    /// on whether the target happened to be loaded.
+    #[test]
+    fn a_landed_hunt_moves_the_selection_cursor_onto_the_quote() {
+        let mut app = hunting_for_an_unloaded_quote(MessageId(45), 50..60);
+        assert_eq!(selected_message(&app), Some(MessageId(59)));
+
+        // The page that finally contains the target.
+        let effects = app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((40..50).map(|id| message(1, id)).collect()),
+        }));
+
+        // The landing anchors twice — `advance_hunt` and again inside
+        // `select` — which is only safe because the second near-top trigger
+        // finds `PagingState::Loading`. Same duplicate-dispatch trap
+        // `a_hunt_continues_paging_and_asks_for_exactly_one_more_page`
+        // guards on the continuation side.
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Td(TdRequest::GetChatHistory { .. })))
+                .count(),
+            1,
+            "the landing must not double-request: {effects:?}"
+        );
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(45)
+            },
+            "the viewport must land on the quote"
+        );
+        assert_eq!(
+            selected_message(&app),
+            Some(MessageId(45)),
+            "and so must the selection cursor — a highlight below the \
+             viewport is a highlight the user cannot see"
+        );
+    }
+
+    /// A modal sits *on top of* `Focus::Selection` without leaving it, so
+    /// `focus.current()` answers `Modal(_)` and a gate written against it
+    /// skips the cursor move — reproducing finding 1 exactly, on a path
+    /// that never self-corrects: `hunt` is cleared on landing, so no later
+    /// page repairs the highlight.
+    ///
+    /// Reachable by pressing `j` on a reply whose quote is not loaded and
+    /// then `d` before the page arrives, which is the sequence below.
+    #[test]
+    fn a_landing_under_a_modal_still_moves_the_selection_cursor() {
+        let mut app = hunting_for_an_unloaded_quote(MessageId(45), 50..60);
+        // The delete capability only arrives via `getMessageProperties`, so
+        // the chip row does not offer Delete until it lands.
+        app.update(Action::TdResult(TdResult::MessagePropertiesLoaded {
+            chat_id: CHAT,
+            message_id: MessageId(59),
+            outcome: Ok(MessageCaps {
+                can_be_deleted_for_all_users: true,
+                ..MessageCaps::default()
+            }),
+        }));
+        app.update(Action::Key(Key::Char('d')));
+        assert!(
+            matches!(
+                app.state().focus.current(),
+                Focus::Modal(ModalKind::ConfirmDelete { .. })
+            ),
+            "the confirm modal must be up, over selection mode: {:?}",
+            app.state().focus.current()
+        );
+        assert_eq!(app.state().focus.depth(), 3);
+
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((40..50).map(|id| message(1, id)).collect()),
+        }));
+
+        assert_eq!(
+            selected_message(&app),
+            Some(MessageId(45)),
+            "selection mode is still on the stack under the modal, so the \
+             landing owes it a cursor move"
+        );
+    }
+
+    /// The second-order case. `start_hunt` parks the anchor at the front of
+    /// the window precisely so `evict_excess` drops from the *back*, which
+    /// means a long hunt on a full window evicts the message the user
+    /// pressed `j` on and `drop_selection_if_gone` nulls the selection —
+    /// while `Focus::Selection` is still on the stack. Landing has to leave
+    /// that state coherent, not merely avoid making it worse.
+    #[test]
+    fn a_landing_restores_a_selection_eviction_dropped_during_the_hunt() {
+        let full = 1000..1000 + conversation::WINDOW_MAX_MESSAGES as i64;
+        let newest = MessageId(full.end - 1);
+        let mut app = hunting_for_an_unloaded_quote(MessageId(999), full);
+        assert_eq!(selected_message(&app), Some(newest));
+
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((950..1000).map(|id| message(1, id)).collect()),
+        }));
+
+        assert!(
+            !app.state().conversations[&CHAT]
+                .messages
+                .iter()
+                .any(|m| m.id == newest),
+            "the fixture must actually evict the message the hunt started from"
+        );
+        assert_eq!(
+            selected_message(&app),
+            Some(MessageId(999)),
+            "selection mode with nothing selected is not a state any \
+             handler here copes with"
+        );
+    }
+
+    /// The third cancellation site, and the one the router owns: `Esc` out
+    /// of selection mode. Its two siblings (`close_previous_chat`, the
+    /// scroll keys) are pinned in `state::conversation`'s own tests.
+    #[test]
+    fn leaving_selection_mode_cancels_an_in_flight_hunt() {
+        let mut app = hunting_for_an_unloaded_quote(MessageId(45), 50..60);
+        assert!(app.state().conversations[&CHAT].hunt.is_some());
+
+        app.update(Action::Key(Key::Esc));
+
+        assert_eq!(*app.state().focus.current(), Focus::Composer);
+        assert!(
+            app.state().conversations[&CHAT].hunt.is_none(),
+            "a hunt that outlives selection mode keeps re-anchoring the \
+             viewport as its pages land, long after the user moved on"
+        );
+    }
+
+    /// Below the two-pane breakpoint, walking focus to the chat list hides
+    /// the conversation — so `Tab` and `Ctrl+←` have to close the chat for
+    /// the same reason `Esc` and a shrinking resize do. This arm returned
+    /// `Vec::new()` before the branch added `close_if_now_hidden` to it, so
+    /// it emits a TDLib request on a path that used to emit none.
+    #[test]
+    fn pane_movement_out_of_a_single_pane_conversation_closes_the_chat() {
+        let mut single = chat_open();
+        single.update(Action::Resize {
+            width: 80,
+            height: 40,
+        });
+        assert_eq!(*single.state().focus.current(), Focus::Composer);
+        single.take_dirty();
+
+        let effects = single.update(Action::Key(Key::CtrlLeft));
+        assert_eq!(*single.state().focus.current(), Focus::ChatList);
+        assert_eq!(describe(&effects), ["Td(CloseChat)"]);
+
+        // Two-pane: the same key, the conversation still on screen, so
+        // nothing to close. Without this the assertion above passes for an
+        // arm that closes the chat unconditionally.
+        let mut two = chat_open();
+        two.take_dirty();
+        let effects = two.update(Action::Key(Key::CtrlLeft));
+        assert_eq!(*two.state().focus.current(), Focus::ChatList);
+        assert!(
+            effects.is_empty(),
+            "the conversation is still visible in two-pane: {effects:?}"
+        );
+    }
+
+    /// `route_chat_list_key`'s clearing has a test
+    /// (`opening_a_different_chat_clears_the_recorded_viewport`); this one
+    /// is the sibling site, and the one that had to be corrected during
+    /// implementation. A left-click on a sidebar row — and `Ctrl+→`, which
+    /// reuses this path — does NOT go through `chat_list::handle_key`'s
+    /// router arm, so without its own clearing it carries the old chat's id
+    /// range into the new chat and suppresses the first scroll there.
+    #[test]
+    fn clicking_a_different_chat_row_clears_the_recorded_viewport() {
+        let mut app = chat_open();
+        app.update(Action::ViewportChanged {
+            first: MessageId(4),
+            last: MessageId(9),
+        });
+        app.update(Action::Td(chat(2, "Bob", 20)));
+
+        app.update(Action::Click {
+            target: HitTarget::ChatRow(ChatId(2)),
+            button: ClickButton::Left,
+        });
+
+        assert_eq!(app.state().open_chat, Some(ChatId(2)));
+        assert_eq!(app.state().visible_messages, None);
+    }
+
+    #[test]
+    fn opening_a_different_chat_clears_the_recorded_viewport() {
+        let mut app = chat_open();
+        app.update(Action::ViewportChanged {
+            first: MessageId(4),
+            last: MessageId(9),
+        });
+
+        // A second chat, selected and opened from the list.
+        app.update(Action::Td(chat(2, "Bob", 20)));
+        app.state.focus.replace_base(Focus::ChatList);
+        app.state.chat_list.selected = Some(ChatId(2));
+        app.update(Action::Key(Key::Enter));
+        assert_eq!(app.state().open_chat, Some(ChatId(2)));
+
+        // The old chat's ids say nothing about the new chat's viewport, and
+        // a stale range would suppress the first scroll in it.
+        assert_eq!(app.state().visible_messages, None);
     }
 }

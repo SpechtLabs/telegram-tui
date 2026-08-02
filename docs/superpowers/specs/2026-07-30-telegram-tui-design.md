@@ -235,7 +235,7 @@ first handler to claim a key stops propagation.
 | Context | Keys |
 |---|---|
 | Global | `ctrl+p` palette · `?` help · `ctrl+c` quit |
-| Pane movement | `←` `→` move focus, `tab` / `shift+tab` cycle |
+| Pane movement | `←` `→` move focus, `tab` / `shift+tab` cycle, `ctrl+←` / `ctrl+→` move pane focus (`ctrl+→` also opens the selected chat from the chat list; `ctrl+←` from selection mode pops it on the way to the chat list) |
 | Chat list | `↑` `↓` move · `⏎` open · `/` filter |
 | Composer | typing · `⏎` send · `alt+⏎` newline · `↑` on empty input enters selection mode |
 | Selection mode | `↑` `↓` message · `←` `→` action chip · `⏎` invoke · letter shortcut · `esc` back to composer |
@@ -258,7 +258,7 @@ simultaneously.
 │ │ take your time, no rush at all                        │ │
 │ ╰───────────────────────────────────────────────────────╯ │
 ├───────────────────────────────────────────────────────────┤
-│ ‹ [R Reply] [F Forward] [E React] [C Copy] [D Delete] ›    │
+│ ‹ [R Reply] [F Forward] [+ React] [C Copy] [D Delete] ›    │
 └───────────────────────────────────────────────────────────┘
 ```
 

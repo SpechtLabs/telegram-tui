@@ -11,8 +11,9 @@
 //! stepping). The extra bindings later tasks added on top of §6.2's original
 //! table are folded into their owning group rather than listed separately:
 //! `a` archive toggle and `[`/`]` folder cycling (T43, chat list),
-//! `/send <path>` (T39, composer), and the chip letter shortcuts
-//! r/f/e/c/d/x/l/o/s (T26, selection mode — `model::chips::Chip::shortcut`).
+//! `/send <path>` (T39, composer), and the chip shortcuts
+//! r/f/+/c/e/d/l/o/s/v/k/j (T26, selection mode —
+//! `model::chips::Chip::shortcut`).
 //!
 //! ## `Focus::Help` gate
 //!
@@ -63,8 +64,9 @@ struct Group {
 }
 
 /// Column the description text starts at, past the longest key label
-/// (`"tab / shift+tab"`, `"r f e c d x l o s"`) plus a two-space gutter.
-const KEY_COL: usize = 19;
+/// (`"tab / shift+tab"`, `"r f + c e d l o s v k j"`) plus a two-space
+/// gutter.
+const KEY_COL: usize = 25;
 
 const GROUPS: &[Group] = &[
     Group {
@@ -94,6 +96,10 @@ const GROUPS: &[Group] = &[
             Row {
                 key: "tab / shift+tab",
                 desc: "cycle panes",
+            },
+            Row {
+                key: "ctrl+← / ctrl+→",
+                desc: "move pane focus (ctrl+→ opens the selected chat)",
             },
         ],
     },
@@ -163,8 +169,12 @@ const GROUPS: &[Group] = &[
                 desc: "invoke focused chip",
             },
             Row {
-                key: "r f e c d x l o s",
-                desc: "chip shortcuts: reply forward react copy edit delete download open resend",
+                key: "r f + c e d l o s v k j",
+                desc: "reply forward react copy edit delete download open resend reveal cancel jump-to-quote",
+            },
+            Row {
+                key: "ctrl+←",
+                desc: "back to the chat list",
             },
             Row {
                 key: "esc",
@@ -406,6 +416,7 @@ mod tests {
             crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
+            visible_messages: None,
         }
     }
 
@@ -457,8 +468,10 @@ mod tests {
         assert!(rendered.contains("/send <path>"));
         // T42: search hit stepping.
         assert!(rendered.contains("n / N"));
-        // T26: chip letter shortcuts.
-        assert!(rendered.contains("r f e c d x l o s"));
+        // T26: chip shortcuts. `+` is React, `e` Edit, `d` Delete — the
+        // three that moved together so each letter matches its word.
+        assert!(rendered.contains("r f + c e d l o s v k j"));
+        assert!(rendered.contains("jump-to-quote"));
     }
 
     #[test]
@@ -467,6 +480,38 @@ mod tests {
         let rendered = render_to_string(120, 40, &state);
         assert!(!rendered.contains(TRUNCATION_MARK));
         insta::assert_snapshot!(rendered);
+    }
+
+    /// Tripwire for a failure mode the test above cannot see: `draw` clamps
+    /// the box to `area.width` whenever content is wider than that, and a
+    /// clamped box clips an over-long row silently at the edge — no
+    /// `TRUNCATION_MARK` involved, since that constant only guards row
+    /// *count*, not row *width*. A help-row description once overflowed
+    /// this way (task 7's jump-to-quote row, caught only by eyeballing the
+    /// rendered diff) with `full_table_fits_120x40_without_truncation`
+    /// green the whole time. This mirrors `draw`'s own width computation so
+    /// it can assert what that function's doc comment on `build_content`
+    /// promises — the table actually fits a 120-wide frame, not just that
+    /// nothing got padded with an ellipsis.
+    #[test]
+    fn the_table_actually_fits_within_a_120_wide_frame() {
+        let theme = Theme::default_dark();
+        let content = build_content(&theme);
+        let max_content_width = content
+            .iter()
+            .map(line_width)
+            .max()
+            .unwrap_or(0)
+            .max(TITLE.len())
+            .max(FOOTER.len());
+        // Border column plus two columns of internal padding, both sides —
+        // the same `+ 6` `draw` uses to turn content width into box width.
+        assert!(
+            max_content_width + 6 <= 120,
+            "content is {max_content_width} columns wide; +6 for border/padding \
+             exceeds the 120-wide frame draw() clamps to, so a row would clip \
+             silently at the box edge with no TRUNCATION_MARK"
+        );
     }
 
     #[test]
