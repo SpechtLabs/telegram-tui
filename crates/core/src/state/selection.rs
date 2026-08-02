@@ -417,6 +417,12 @@ fn chips_for_message(
     if media.uploads.contains_key(&msg.id) {
         chips.push(Chip::CancelUpload);
     }
+    // Not gated on `send_failed`: a message that failed to send can still
+    // quote one that arrived fine, and the quoted message is the context
+    // the user needs to decide whether to resend.
+    if msg.reply_to.is_some() {
+        chips.push(Chip::JumpToQuoted);
+    }
     chips
 }
 
@@ -523,6 +529,7 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
             recompute_chips(app, chat_id, message_id);
             effects
         }
+        Chip::JumpToQuoted => Vec::new(),
     }
 }
 
@@ -1622,5 +1629,23 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
         assert_eq!(selection(&app).chips, vec![Chip::Resend, Chip::Delete]);
+    }
+
+    #[test]
+    fn a_reply_offers_the_jump_chip_and_a_plain_message_does_not() {
+        let mut replying = msg(2);
+        replying.reply_to = Some(ReplyPreview {
+            message_id: MessageId(1),
+            sender_name: "Ada".to_string(),
+            excerpt: "earlier".to_string(),
+        });
+        let mut app = with_messages(vec![msg(1), replying]);
+        enter(&mut app);
+
+        assert!(selection(&app).chips.contains(&Chip::JumpToQuoted));
+
+        handle_key(&mut app, Key::Up);
+        assert_eq!(selection(&app).message_id, MessageId(1));
+        assert!(!selection(&app).chips.contains(&Chip::JumpToQuoted));
     }
 }

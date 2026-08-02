@@ -4,24 +4,24 @@ expression: rendered
 ---
 ╭──────────────────────────────────── help ────────────────────────────────────╮
 │  Global                                                                      │
-│    ctrl+p             open command palette                                   │
-│    ?                  show this help                                         │
-│    ctrl+c             quit                                                   │
+│    ctrl+p                   open command palette                             │
+│    ?                        show this help                                   │
+│    ctrl+c                   quit                                             │
 │  Panes                                                                       │
-│    ← / →              move focus between panes                               │
-│    tab / shift+tab    cycle panes                                            │
-│    ctrl+← / ctrl+→    move pane focus (ctrl+→ opens the selected chat)       │
+│    ← / →                    move focus between panes                         │
+│    tab / shift+tab          cycle panes                                      │
+│    ctrl+← / ctrl+→          move pane focus (ctrl+→ opens the selected chat  │
 │  Chat list                                                                   │
-│    ↑ / ↓              move selection                                         │
-│    ⏎                  open chat                                              │
-│    /                  filter chats                                           │
-│    a                  toggle archive                                         │
-│    [ / ]              cycle folders                                          │
+│    ↑ / ↓                    move selection                                   │
+│    ⏎                        open chat                                        │
+│    /                        filter chats                                     │
+│    a                        toggle archive                                   │
+│    [ / ]                    cycle folders                                    │
 │  Composer                                                                    │
-│    type               write a message                                        │
-│    ⏎                  send                                                   │
-│    alt+⏎              insert newline                                         │
-│    ↑ (empty input)    enter selection mode                                   │
+│    type                     write a message                                  │
+│    ⏎                        send                                             │
+│    alt+⏎                    insert newline                                   │
+│    ↑ (empty input)          enter selection mode                             │
 │  …                                                                           │
 │                                                                              │
 │  esc close                                                                   │

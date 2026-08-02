@@ -12,7 +12,8 @@
 //! table are folded into their owning group rather than listed separately:
 //! `a` archive toggle and `[`/`]` folder cycling (T43, chat list),
 //! `/send <path>` (T39, composer), and the chip letter shortcuts
-//! r/f/e/c/d/x/l/o/s (T26, selection mode — `model::chips::Chip::shortcut`).
+//! r/f/e/c/d/x/l/o/s/v/k/j (T26, selection mode —
+//! `model::chips::Chip::shortcut`).
 //!
 //! ## `Focus::Help` gate
 //!
@@ -63,8 +64,9 @@ struct Group {
 }
 
 /// Column the description text starts at, past the longest key label
-/// (`"tab / shift+tab"`, `"r f e c d x l o s"`) plus a two-space gutter.
-const KEY_COL: usize = 19;
+/// (`"tab / shift+tab"`, `"r f e c d x l o s v k j"`) plus a two-space
+/// gutter.
+const KEY_COL: usize = 25;
 
 const GROUPS: &[Group] = &[
     Group {
@@ -167,8 +169,8 @@ const GROUPS: &[Group] = &[
                 desc: "invoke focused chip",
             },
             Row {
-                key: "r f e c d x l o s",
-                desc: "chip shortcuts: reply forward react copy edit delete download open resend",
+                key: "r f e c d x l o s v k j",
+                desc: "reply forward react copy edit delete download open resend reveal cancel jump-to-quote",
             },
             Row {
                 key: "ctrl+←",
@@ -467,7 +469,8 @@ mod tests {
         // T42: search hit stepping.
         assert!(rendered.contains("n / N"));
         // T26: chip letter shortcuts.
-        assert!(rendered.contains("r f e c d x l o s"));
+        assert!(rendered.contains("r f e c d x l o s v k j"));
+        assert!(rendered.contains("jump-to-quote"));
     }
 
     #[test]

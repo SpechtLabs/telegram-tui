@@ -43,6 +43,15 @@ pub enum Chip {
     /// the only other chip a failed send offers. Withholding cancel there
     /// would leave a stuck upload with no way out but quitting.
     CancelUpload, // 'k'  (an upload for this message is still in flight)
+    /// Jump to the message this one quotes. Like [`Chip::Reveal`] and
+    /// [`Chip::CancelUpload`] it is not a TDLib capability — `reply_to`
+    /// being `Some` is the local fact that gates it — so `selection.rs`
+    /// appends it after `chips_for` runs.
+    ///
+    /// Offered even when the quoted message is not in the loaded window:
+    /// the chip starts a bounded search for it rather than failing, so the
+    /// row stays a truthful statement about what is possible.
+    JumpToQuoted, // 'j'  (this message quotes another)
 }
 
 impl Chip {
@@ -61,6 +70,7 @@ impl Chip {
             // Not 'c' (Copy) and not 'x' (Delete); 'k' is free and reads as
             // "kill" without colliding with either.
             Chip::CancelUpload => 'k',
+            Chip::JumpToQuoted => 'j',
         }
     }
 
@@ -77,6 +87,7 @@ impl Chip {
             Chip::Resend => "Resend",
             Chip::Reveal => "Reveal",
             Chip::CancelUpload => "Cancel upload",
+            Chip::JumpToQuoted => "Jump to quote",
         }
     }
 }
@@ -135,6 +146,7 @@ mod tests {
         Chip::Open,
         Chip::Resend,
         Chip::Reveal,
+        Chip::JumpToQuoted,
     ];
 
     fn caps(
@@ -380,5 +392,30 @@ mod tests {
     fn labels_are_distinct() {
         let labels: HashSet<&str> = ALL.iter().map(|c| c.label()).collect();
         assert_eq!(labels.len(), ALL.len());
+    }
+
+    #[test]
+    fn jump_to_quoted_is_not_derived_from_caps() {
+        // It is a local fact about the message, so `chips_for` — which sees
+        // only capability flags — must never produce it.
+        for bits in 0u8..32 {
+            let caps = caps(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+            );
+            for flags in 0u8..16 {
+                let row = chips_for(
+                    &caps,
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
+                    flags & 8 != 0,
+                );
+                assert!(!row.contains(&Chip::JumpToQuoted));
+            }
+        }
     }
 }

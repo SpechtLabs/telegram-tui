@@ -490,6 +490,9 @@ pub enum Chip {
     Download, // 'l'  (file content, not yet downloaded)
     Open,     // 'o'  (file content, downloaded)
     Resend,   // 's'  (only SendState::Failed)
+    Reveal,   // 'v'  (message has an unrevealed spoiler; §7.5.1)
+    CancelUpload, // 'k'  (an upload for this message is still in flight)
+    JumpToQuoted, // 'j'  (this message quotes another; §7.5.3)
 }
 
 impl Chip {
@@ -498,6 +501,7 @@ impl Chip {
             Chip::Reply => 'r', Chip::Forward => 'f', Chip::React => 'e',
             Chip::Copy => 'c', Chip::Edit => 'd', Chip::Delete => 'x',
             Chip::Download => 'l', Chip::Open => 'o', Chip::Resend => 's',
+            Chip::Reveal => 'v', Chip::CancelUpload => 'k', Chip::JumpToQuoted => 'j',
         }
     }
     pub fn label(self) -> &'static str {
@@ -505,6 +509,8 @@ impl Chip {
             Chip::Reply => "Reply", Chip::Forward => "Forward", Chip::React => "React",
             Chip::Copy => "Copy", Chip::Edit => "Edit", Chip::Delete => "Delete",
             Chip::Download => "Download", Chip::Open => "Open", Chip::Resend => "Resend",
+            Chip::Reveal => "Reveal", Chip::CancelUpload => "Cancel upload",
+            Chip::JumpToQuoted => "Jump to quote",
         }
     }
 }
