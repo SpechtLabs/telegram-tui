@@ -478,7 +478,7 @@ impl Harness {
         .await;
 
         // `message.react`.
-        self.press(KeyCode::Char('e')).await;
+        self.press(KeyCode::Char('+')).await;
         self.advance_until("the reaction to reach TDLib", |_, fake| {
             received(fake).contains(&"ToggleReaction")
         })
@@ -486,7 +486,7 @@ impl Harness {
 
         // `message.delete`, which goes through the confirmation modal: `↓`
         // moves off "Delete for me", `⏎` confirms.
-        self.press(KeyCode::Char('x')).await;
+        self.press(KeyCode::Char('d')).await;
         self.advance_until("the confirmation modal", |core, _| {
             matches!(core.app().state().focus.current(), Focus::Modal(_))
         })
@@ -547,7 +547,7 @@ impl Harness {
         })
         .await;
 
-        self.press(KeyCode::Char('d')).await;
+        self.press(KeyCode::Char('e')).await;
         self.advance_until("the composer to be armed for an edit", |core, _| {
             core.app().state().composer.editing == Some(SENT_ID)
         })

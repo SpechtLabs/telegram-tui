@@ -2,4 +2,4 @@
 source: crates/ui/src/view/chips.rs
 expression: rendered
 ---
-[R Reply] [F Forward] [E React] [C Copy] [X Delete]
+[R Reply] [F Forward] [+ React] [C Copy] [D Delete]

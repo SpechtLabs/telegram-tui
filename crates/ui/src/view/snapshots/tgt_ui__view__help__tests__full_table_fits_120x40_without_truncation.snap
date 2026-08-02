@@ -27,7 +27,7 @@ expression: rendered
  │    ↑ / ↓                    move highlighted message                                                               │ 
  │    ← / →                    move focused action chip                                                               │ 
  │    ⏎                        invoke focused chip                                                                    │ 
- │    r f e c d x l o s v k j  reply forward react copy edit delete download open resend reveal cancel jump-to-quote  │ 
+ │    r f + c e d l o s v k j  reply forward react copy edit delete download open resend reveal cancel jump-to-quote  │ 
  │    ctrl+←                   back to the chat list                                                                  │ 
  │    esc                      back to composer                                                                       │ 
  │  Modal                                                                                                             │ 

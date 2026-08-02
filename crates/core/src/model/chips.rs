@@ -15,10 +15,10 @@ use crate::model::message::MessageCaps;
 pub enum Chip {
     Reply,    // 'r'
     Forward,  // 'f'
-    React,    // 'e'
+    React,    // '+'
     Copy,     // 'c'
-    Edit,     // 'd'  (only own editable messages)
-    Delete,   // 'x'
+    Edit,     // 'e'  (only own editable messages)
+    Delete,   // 'd'
     Download, // 'l'  (file content, not yet downloaded)
     Open,     // 'o'  (file content, downloaded)
     Resend,   // 's'  (only SendState::Failed)
@@ -59,10 +59,14 @@ impl Chip {
         match self {
             Chip::Reply => 'r',
             Chip::Forward => 'f',
-            Chip::React => 'e',
+            // Not a letter, and that is the point: `+` reads as "add a
+            // reaction" and frees `e` for Edit. `map_key_event` maps
+            // `KeyCode::Char(c)` to `Key::Char(c)` regardless of modifiers,
+            // so Shift+`=` arrives here like any other character.
+            Chip::React => '+',
             Chip::Copy => 'c',
-            Chip::Edit => 'd',
-            Chip::Delete => 'x',
+            Chip::Edit => 'e',
+            Chip::Delete => 'd',
             Chip::Download => 'l',
             Chip::Open => 'o',
             Chip::Resend => 's',
@@ -337,6 +341,25 @@ mod tests {
         );
         assert!(for_all.contains(&Chip::Delete));
         assert!(self_only.contains(&Chip::Delete));
+    }
+
+    /// The three shortcuts that had to move as a set, pinned so a future
+    /// edit cannot silently swap them back into each other's letters —
+    /// which is exactly what would happen, since each one's new key was
+    /// occupied by another of the three until all three changed at once.
+    /// `chip_shortcut_letters_unique_per_row` would stay green through such
+    /// a swap: it proves no two chips collide, not that any chip has the
+    /// letter a user would guess.
+    #[test]
+    fn shortcuts_match_the_word_they_stand_for() {
+        assert_eq!(Chip::Edit.shortcut(), 'e');
+        assert_eq!(Chip::Delete.shortcut(), 'd');
+        assert_eq!(Chip::React.shortcut(), '+');
+        // Unchanged neighbours, asserted here so the set reads as a whole.
+        assert_eq!(Chip::Reply.shortcut(), 'r');
+        assert_eq!(Chip::Forward.shortcut(), 'f');
+        assert_eq!(Chip::Copy.shortcut(), 'c');
+        assert_eq!(Chip::JumpToQuoted.shortcut(), 'j');
     }
 
     #[test]

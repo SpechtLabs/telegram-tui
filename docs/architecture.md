@@ -483,10 +483,10 @@ use crate::model::message::MessageCaps;
 pub enum Chip {
     Reply,    // 'r'
     Forward,  // 'f'
-    React,    // 'e'
+    React,    // '+'  (reads as "add a reaction"; frees 'e' for Edit)
     Copy,     // 'c'
-    Edit,     // 'd'  (only own editable messages)
-    Delete,   // 'x'
+    Edit,     // 'e'  (only own editable messages)
+    Delete,   // 'd'
     Download, // 'l'  (file content, not yet downloaded)
     Open,     // 'o'  (file content, downloaded)
     Resend,   // 's'  (only SendState::Failed)
@@ -498,8 +498,8 @@ pub enum Chip {
 impl Chip {
     pub fn shortcut(self) -> char {
         match self {
-            Chip::Reply => 'r', Chip::Forward => 'f', Chip::React => 'e',
-            Chip::Copy => 'c', Chip::Edit => 'd', Chip::Delete => 'x',
+            Chip::Reply => 'r', Chip::Forward => 'f', Chip::React => '+',
+            Chip::Copy => 'c', Chip::Edit => 'e', Chip::Delete => 'd',
             Chip::Download => 'l', Chip::Open => 'o', Chip::Resend => 's',
             Chip::Reveal => 'v', Chip::CancelUpload => 'k', Chip::JumpToQuoted => 'j',
         }

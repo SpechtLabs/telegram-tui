@@ -2353,7 +2353,7 @@ mod routing {
         assert_eq!(selected_message(&app), Some(NEWEST));
 
         // The Delete chip confirms before it deletes (spec §6.3).
-        let effects = app.update(Action::Key(Key::Char('x')));
+        let effects = app.update(Action::Key(Key::Char('d')));
         assert!(effects.is_empty(), "delete confirms first: {effects:?}");
         assert!(matches!(
             app.state().focus.current(),
@@ -2392,7 +2392,7 @@ mod routing {
     #[test]
     fn esc_dismisses_a_modal_without_its_effect() {
         let mut app = selection_with_delete_chip();
-        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Char('d')));
 
         let effects = app.update(Action::Key(Key::Esc));
         assert!(effects.is_empty(), "dismissal deletes nothing: {effects:?}");
@@ -2784,7 +2784,7 @@ mod routing {
 
         // A modal is the one context it cannot be opened from: the key is
         // claimed and swallowed with the modal left standing.
-        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Char('d')));
         assert!(app.update(Action::Key(palette)).is_empty());
         assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
         assert!(app.state().palette.is_none());
@@ -3612,7 +3612,7 @@ mod routing {
     #[test]
     fn clicks_ignored_under_modal() {
         let mut app = selection_with_delete_chip();
-        app.update(Action::Key(Key::Char('x')));
+        app.update(Action::Key(Key::Char('d')));
         assert!(matches!(app.state().focus.current(), Focus::Modal(_)));
         app.take_dirty();
 

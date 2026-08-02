@@ -1,5 +1,5 @@
 //! Selection-mode action chip row (spec §6.3 mock:
-//! `‹ [R Reply] [F Forward] [E React] [C Copy] [D Delete] ›`).
+//! `‹ [R Reply] [F Forward] [+ React] [C Copy] [D Delete] ›`).
 //!
 //! Each chip renders as `[<SHORTCUT> <Label>]`. The row has two states and
 //! only two: the focused chip (`SelectionState::chip_cursor`) sits on
@@ -273,9 +273,9 @@ mod tests {
         let rendered = render_to_string(120, 1, &state);
         assert!(rendered.contains("[R Reply]"));
         assert!(rendered.contains("[F Forward]"));
-        assert!(rendered.contains("[E React]"));
+        assert!(rendered.contains("[+ React]"));
         assert!(rendered.contains("[C Copy]"));
-        assert!(rendered.contains("[X Delete]"));
+        assert!(rendered.contains("[D Delete]"));
         assert!(!rendered.contains('‹'));
         assert!(!rendered.contains('›'));
         insta::assert_snapshot!(rendered);
@@ -316,6 +316,6 @@ mod tests {
         // the focused index differ.
         let state = fixture_state(spec_chips(), 2, 0);
         let rendered = render_to_string(120, 1, &state);
-        assert!(rendered.contains("[E React]"));
+        assert!(rendered.contains("[+ React]"));
     }
 }

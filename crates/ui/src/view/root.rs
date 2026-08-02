@@ -551,7 +551,7 @@ mod tests {
             rendered.contains("[R Reply]"),
             "chip row missing:\n{rendered}"
         );
-        assert!(rendered.contains("[X Delete]"));
+        assert!(rendered.contains("[D Delete]"));
         assert!(
             !rendered.contains(hint_bar::HINT_TEXT),
             "the hint bar must give the row up entirely:\n{rendered}"

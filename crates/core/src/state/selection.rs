@@ -1325,7 +1325,7 @@ mod tests {
         let mut app = with_messages(vec![msg(1)]);
         enter(&mut app);
 
-        let effects = handle_key(&mut app, Key::Char('e')).expect("React answers to 'e'");
+        let effects = handle_key(&mut app, Key::Char('+')).expect("React answers to '+'");
 
         assert!(matches!(
             effects.as_slice(),
@@ -1353,7 +1353,7 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
 
-        let effects = handle_key(&mut app, Key::Char('x')).expect("Delete answers to 'x'");
+        let effects = handle_key(&mut app, Key::Char('d')).expect("Delete answers to 'd'");
 
         assert!(
             effects.is_empty(),
@@ -1379,7 +1379,7 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
 
-        handle_key(&mut app, Key::Char('x')).unwrap();
+        handle_key(&mut app, Key::Char('d')).unwrap();
 
         assert_eq!(
             *app.focus.current(),
@@ -1472,7 +1472,7 @@ mod tests {
         let mut app = with_messages(vec![m]);
         enter(&mut app);
 
-        let effects = handle_key(&mut app, Key::Char('d')).expect("Edit answers to 'd'");
+        let effects = handle_key(&mut app, Key::Char('e')).expect("Edit answers to 'e'");
 
         assert!(effects.is_empty(), "the edit is submitted by the composer");
         assert_eq!(app.composer.editing, Some(MessageId(1)));
