@@ -115,6 +115,7 @@ mod tests {
             crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
+            visible_messages: None,
         }
     }
 

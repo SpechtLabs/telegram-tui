@@ -89,6 +89,7 @@ pub fn base_main_state() -> AppState {
         crash_reports_available: true,
         telemetry_salt: [0u8; 32],
         now: NOW,
+        visible_messages: None,
     }
 }
 

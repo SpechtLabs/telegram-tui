@@ -71,6 +71,16 @@ pub struct AppState {
     pub telemetry_salt: [u8; 32],
     /// Last observed tick time; the only "clock" update logic may consult.
     pub now: Millis,
+    /// The oldest and newest message the last drawn frame put on screen, or
+    /// `None` before the first frame and whenever no message was drawn.
+    ///
+    /// Read only by `state::selection`'s anchor policy. `None` means "no
+    /// information", and every consumer must fall back to its pre-existing
+    /// behavior — every unit and integration test in this workspace drives
+    /// `update()` with no renderer attached, so `None` is the value they all
+    /// see, and treating it as "everything is visible" would leave the suite
+    /// green about a path no user reaches.
+    pub visible_messages: Option<(MessageId, MessageId)>,
 }
 
 /// Boot-time data computed impurely in tgt-app and injected as plain values.
@@ -236,6 +246,7 @@ impl App {
             crash_reports_available: boot.crash_reports_available,
             telemetry_salt: boot.telemetry_salt,
             now: Millis::default(),
+            visible_messages: None,
         };
         // Set so the first frame draws even before any action arrives.
         App { state, dirty: true }
@@ -307,6 +318,11 @@ impl App {
             Action::AccountReset => {
                 self.state.reset_account();
                 self.dirty = true;
+                Vec::new()
+            }
+            Action::ViewportChanged { first, last } => {
+                // No `self.dirty = true` — see the variant's docs.
+                self.state.visible_messages = Some((first, last));
                 Vec::new()
             }
             Action::Key(key) => self.route_key(key),
@@ -887,6 +903,13 @@ impl App {
         let open_before = self.state.open_chat;
         let effects = chat_list::handle_key(&mut self.state, key)?;
 
+        if self.state.open_chat != open_before {
+            // The old chat's ids say nothing about the new chat's viewport,
+            // and a stale range would suppress the first scroll in it
+            // (`selection::select`'s `AnchorPolicy::KeepVisible` arm).
+            self.state.visible_messages = None;
+        }
+
         if self.state.open_chat != open_before && self.state.open_chat.is_some() {
             // `⏎` opened a chat: the conversation side takes focus, whose
             // resting level is the composer (spec §6.2 — typing goes to the
@@ -1186,10 +1209,16 @@ impl App {
     /// the bracket leaves the stack exactly as it found it. The focus
     /// transition afterward is the one `route_chat_list_key` runs for `⏎`.
     fn click_chat_row(&mut self, chat_id: ChatId) -> Vec<Effect> {
+        let open_before = self.state.open_chat;
         self.state.chat_list.selected = Some(chat_id);
         self.state.focus.push(Focus::ChatList);
         let effects = chat_list::handle_key(&mut self.state, Key::Enter).unwrap_or_default();
         self.state.focus.pop();
+        if self.state.open_chat != open_before {
+            // Same reasoning as `route_chat_list_key`: the old chat's ids
+            // say nothing about the new chat's viewport.
+            self.state.visible_messages = None;
+        }
         if self.state.open_chat.is_some() {
             self.state.focus.replace_base(Focus::Composer);
         }
@@ -3695,5 +3724,45 @@ mod routing {
         assert!(effects.is_empty());
         assert!(!app.take_dirty());
         assert_eq!(*app.state().focus.current(), Focus::ChatList);
+    }
+
+    #[test]
+    fn viewport_changed_records_the_range_without_requesting_a_redraw() {
+        let mut app = chat_open();
+        let _ = app.take_dirty();
+
+        let effects = app.update(Action::ViewportChanged {
+            first: MessageId(4),
+            last: MessageId(9),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.state().visible_messages,
+            Some((MessageId(4), MessageId(9)))
+        );
+        // Critical: the range is produced BY rendering. Marking it dirty
+        // would make every frame schedule another frame.
+        assert!(!app.take_dirty());
+    }
+
+    #[test]
+    fn opening_a_different_chat_clears_the_recorded_viewport() {
+        let mut app = chat_open();
+        app.update(Action::ViewportChanged {
+            first: MessageId(4),
+            last: MessageId(9),
+        });
+
+        // A second chat, selected and opened from the list.
+        app.update(Action::Td(chat(2, "Bob", 20)));
+        app.state.focus.replace_base(Focus::ChatList);
+        app.state.chat_list.selected = Some(ChatId(2));
+        app.update(Action::Key(Key::Enter));
+        assert_eq!(app.state().open_chat, Some(ChatId(2)));
+
+        // The old chat's ids say nothing about the new chat's viewport, and
+        // a stale range would suppress the first scroll in it.
+        assert_eq!(app.state().visible_messages, None);
     }
 }

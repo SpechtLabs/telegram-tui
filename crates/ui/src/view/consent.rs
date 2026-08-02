@@ -315,6 +315,7 @@ mod tests {
             telemetry_mode: TelemetryMode::Off,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
+            visible_messages: None,
         }
     }
 

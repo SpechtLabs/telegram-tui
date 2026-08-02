@@ -217,6 +217,7 @@ mod tests {
             crash_reports_available: false,
             telemetry_salt: [0u8; 32],
             now: Millis(0),
+            visible_messages: None,
         };
         conversation::open(&mut app, CHAT);
         let convo: &mut ConversationState = app.conversations.get_mut(&CHAT).unwrap();

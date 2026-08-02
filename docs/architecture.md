@@ -580,6 +580,15 @@ pub enum Action {
     /// bindings, telemetry mode and salt, consent, terminal size, clock —
     /// none of which the sign-out invalidates.
     AccountReset,
+    /// Which messages the last drawn frame actually put on screen (§7.5).
+    /// Like `Click`, the coordinates are resolved at the `tgt-ui` boundary —
+    /// `update()` receives two message ids, never a `Rect`. Sent by
+    /// `runtime_loop` after each draw, and only when the range changed.
+    ///
+    /// Deliberately does NOT set `dirty`: this action is produced *by*
+    /// rendering, so marking it render-worthy would make every frame
+    /// schedule another one.
+    ViewportChanged { first: MessageId, last: MessageId },
 }
 
 /// Domain-specific completions: the dispatcher maps (request, response) pairs
@@ -833,7 +842,7 @@ isolation.
 use std::collections::HashMap;
 use crate::action::Action;
 use crate::effect::{Effect, TelemetryMode};
-use crate::model::ids::ChatId;
+use crate::model::ids::{ChatId, MessageId};
 use crate::model::key::KeyBindings;
 use crate::model::time::Millis;
 use crate::state::auth::AuthState;
@@ -885,6 +894,19 @@ pub struct AppState {
     pub telemetry_salt: [u8; 32],
     /// Last observed tick time; the only "clock" update logic may consult.
     pub now: Millis,
+    /// The oldest and newest message the last drawn frame put on screen, or
+    /// `None` before the first frame and whenever no message was drawn.
+    ///
+    /// Read only by `state::selection`'s anchor policy. `None` means "no
+    /// information", and every consumer must fall back to its pre-existing
+    /// behavior — every unit and integration test in this workspace drives
+    /// `update()` with no renderer attached, so `None` is the value they all
+    /// see, and treating it as "everything is visible" would leave the suite
+    /// green about a path no user reaches. Not render-affecting: it is
+    /// produced by rendering, not consumed by it, so `Action::ViewportChanged`
+    /// must never set `dirty`. Cleared whenever `open_chat` changes to a
+    /// different chat — a stale range would suppress the first scroll in it.
+    pub visible_messages: Option<(MessageId, MessageId)>,
 }
 
 /// Boot-time data computed impurely in tgt-app and injected as plain values.

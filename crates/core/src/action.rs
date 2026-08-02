@@ -51,6 +51,19 @@ pub enum Action {
     /// which is exactly why this variant exists rather than the restart
     /// reaching in.
     AccountReset,
+    /// Which messages the last drawn frame actually put on screen
+    /// (architecture §7.5). Like `Click`, the coordinates are resolved at
+    /// the `tgt-ui` boundary — `update()` receives two message ids, never a
+    /// `Rect`. Sent by `runtime_loop` after each draw, and only when the
+    /// range changed.
+    ///
+    /// Deliberately does NOT set `dirty`: this action is produced *by*
+    /// rendering, so marking it render-worthy would make every frame
+    /// schedule another one.
+    ViewportChanged {
+        first: MessageId,
+        last: MessageId,
+    },
 }
 
 /// Domain-specific completions: the dispatcher maps (request, response) pairs
