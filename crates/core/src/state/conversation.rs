@@ -900,6 +900,31 @@ pub(crate) fn anchor_to(
     trigger_paging_if_near_top(convo, chat_id, now)
 }
 
+/// Moves the scroll anchor by one message in `delta`'s direction, clamped to
+/// the loaded window, and re-triggers paging like any other anchor move.
+///
+/// This is the minimum-scroll counterpart to [`anchor_to`]: selection
+/// movement uses it when the cursor walks off an edge, so the viewport
+/// follows by one message instead of jumping to wherever the cursor went.
+pub(crate) fn step_anchor(
+    convo: &mut ConversationState,
+    chat_id: ChatId,
+    delta: isize,
+    now: Millis,
+) -> Vec<Effect> {
+    if convo.messages.is_empty() {
+        return Vec::new();
+    }
+    let last = convo.messages.len() - 1;
+    let current = match convo.scroll {
+        Scroll::Bottom => last,
+        Scroll::At { message_id, .. } => index_of(&convo.messages, message_id).unwrap_or(last),
+    };
+    let target = (current as isize + delta).clamp(0, last as isize) as usize;
+    let id = convo.messages[target].id;
+    anchor_to(convo, chat_id, id, now)
+}
+
 /// Whether `id` names a message older than every message loaded, which is
 /// the one way an anchor can point outside the window and still be reachable
 /// by paging (older history is the only direction v1 ever fetches).

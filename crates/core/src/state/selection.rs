@@ -129,7 +129,7 @@ pub fn enter_at(app: &mut AppState, message_id: MessageId) -> Vec<Effect> {
     if conversation::index_of(&convo.messages, message_id).is_none() {
         return Vec::new();
     }
-    select(app, chat_id, message_id)
+    select(app, chat_id, message_id, AnchorPolicy::Jump)
 }
 
 /// Leaves selection mode: drops the selection of the open chat. Called by the
@@ -233,10 +233,26 @@ pub fn handle_td_result(
 
 // --- selection movement ------------------------------------------------
 
+/// How [`select`] should treat the scroll anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorPolicy {
+    /// `↑`/`↓`: hold the viewport still while the target is on screen, and
+    /// scroll by exactly one message when the cursor walks off an edge.
+    KeepVisible,
+    /// A deliberate jump (entering selection, the reply-quote chip): bring
+    /// the target into view unconditionally.
+    Jump,
+}
+
 /// Points the selection at `message_id`: fills in a missing reply excerpt,
-/// derives the chip row, drags the scroll anchor along and asks TDLib for the
-/// capability flags it withholds from `message`.
-fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Effect> {
+/// derives the chip row, moves the scroll anchor per `policy` and asks TDLib
+/// for the capability flags it withholds from `message`.
+fn select(
+    app: &mut AppState,
+    chat_id: ChatId,
+    message_id: MessageId,
+    policy: AnchorPolicy,
+) -> Vec<Effect> {
     let Some(convo) = app.conversations.get(&chat_id) else {
         return Vec::new();
     };
@@ -246,6 +262,7 @@ fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Eff
     let chips = chips_for_message(&convo.messages[idx], &app.media, &convo.revealed_spoilers);
     let send_failed = matches!(convo.messages[idx].send_state, SendState::Failed(_));
     let now = app.now;
+    let visible = app.visible_messages;
 
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
         return Vec::new();
@@ -267,9 +284,29 @@ fn select(app: &mut AppState, chat_id: ChatId, message_id: MessageId) -> Vec<Eff
             message_id,
         })]
     };
-    effects.extend(conversation::anchor_to(convo, chat_id, message_id, now));
-    // T66: selection landing on (or stepping to) a message drags the scroll
-    // anchor with it, so it's a "the anchor moved" trigger like any other.
+    // T66 / viewport-aware follow-up: selection landing on (or stepping to)
+    // a message moves the scroll anchor, so it's a "the anchor moved"
+    // trigger like any other — `KeepVisible`'s no-op arm is the one
+    // exception, and it fires no history request either.
+    effects.extend(match (policy, visible) {
+        // On screen: leave the anchor completely alone. This is the whole
+        // fix — `anchor_to` here is what pinned the cursor to the last row.
+        (AnchorPolicy::KeepVisible, Some((first, last)))
+            if message_id >= first && message_id <= last =>
+        {
+            Vec::new()
+        }
+        (AnchorPolicy::KeepVisible, Some((first, _))) if message_id < first => {
+            conversation::step_anchor(convo, chat_id, -1, now)
+        }
+        (AnchorPolicy::KeepVisible, Some(_)) => conversation::step_anchor(convo, chat_id, 1, now),
+        // No frame has reported a viewport (every headless caller, and the
+        // first selection after a chat opens), or this is a deliberate
+        // jump: the anchor follows the target, exactly as before.
+        (AnchorPolicy::KeepVisible, None) | (AnchorPolicy::Jump, _) => {
+            conversation::anchor_to(convo, chat_id, message_id, now)
+        }
+    });
     effects.extend(media::auto_download_photos(app, chat_id));
     effects
 }
@@ -293,7 +330,7 @@ fn move_selection(app: &mut AppState, chat_id: ChatId, delta: isize) -> Vec<Effe
         return Vec::new();
     }
     let target_id = convo.messages[target].id;
-    select(app, chat_id, target_id)
+    select(app, chat_id, target_id, AnchorPolicy::KeepVisible)
 }
 
 /// `←`/`→` over the chip row, with the visible window following the cursor.
@@ -1003,6 +1040,101 @@ mod tests {
                 })
             )),
             "expected a history page request, got {effects:?}"
+        );
+    }
+
+    // --- viewport-aware anchor movement -------------------------------------
+
+    #[test]
+    fn stepping_the_selection_within_the_viewport_does_not_scroll() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        // Frame showed messages 5..=10; the newest is at the bottom.
+        app.visible_messages = Some((MessageId(5), MessageId(10)));
+        enter(&mut app);
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+
+        // Four steps up, all landing on messages already on screen.
+        for _ in 0..4 {
+            handle_key(&mut app, Key::Up);
+        }
+
+        assert_eq!(selection(&app).message_id, MessageId(6));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::Bottom,
+            "the viewport must not move while the cursor is on screen"
+        );
+    }
+
+    #[test]
+    fn stepping_off_the_top_edge_scrolls_by_exactly_one_message() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        app.visible_messages = Some((MessageId(5), MessageId(10)));
+        enter(&mut app);
+        for _ in 0..5 {
+            handle_key(&mut app, Key::Up);
+        }
+        // Cursor is on 5, the topmost visible message; nothing has scrolled.
+        assert_eq!(selection(&app).message_id, MessageId(5));
+        assert_eq!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+
+        handle_key(&mut app, Key::Up);
+
+        assert_eq!(selection(&app).message_id, MessageId(4));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(9),
+                line_offset: 0,
+            },
+            "one message of scroll, not a jump to the cursor"
+        );
+    }
+
+    #[test]
+    fn stepping_back_down_off_the_bottom_edge_scrolls_one_message() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        app.visible_messages = Some((MessageId(5), MessageId(10)));
+        enter(&mut app);
+        // Park the anchor and the cursor above the bottom edge.
+        app.conversations.get_mut(&CHAT).unwrap().scroll = Scroll::At {
+            message_id: MessageId(8),
+            line_offset: 0,
+        };
+        app.visible_messages = Some((MessageId(3), MessageId(8)));
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.selection.as_mut().unwrap().message_id = MessageId(8);
+
+        handle_key(&mut app, Key::Down);
+
+        assert_eq!(selection(&app).message_id, MessageId(9));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(9),
+                line_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn with_no_viewport_information_the_anchor_follows_the_selection() {
+        let mut app = with_messages((1..=10).map(msg).collect());
+        assert_eq!(app.visible_messages, None);
+        enter(&mut app);
+
+        handle_key(&mut app, Key::Up);
+
+        // The pre-existing behavior, unchanged. Every test in this workspace
+        // and every headless caller lands here; it must not become "never
+        // scroll", or the suite would be green about a path no user reaches.
+        assert_eq!(selection(&app).message_id, MessageId(9));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(9),
+                line_offset: 0,
+            }
         );
     }
 
