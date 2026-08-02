@@ -1594,3 +1594,381 @@ Both must be clean — `mise run snapshots` fails on any pending insta snapshot,
 git add -A
 git commit -m "chore: telemetry allowlist and snapshot sweep for keyboard navigation"
 ```
+
+---
+
+### Task 11: A jump lands its target at the TOP of the viewport
+
+Added after the first three features landed, from user feedback: jumping to a
+quoted message put it on the **last** visible row. It should be the **first**.
+
+**Files:**
+- Modify: `crates/core/src/state/conversation.rs` (`Scroll` enum, `anchor_to_top`, the anchor-flavour rule)
+- Modify: `crates/ui/src/view/conversation.rs` (`resolve_anchor`, `build_window`)
+- Modify: `crates/core/src/state/selection.rs` (the `j` chip's jump, the hunt landing)
+- Modify: `crates/core/src/app.rs` (mouse `ReplyQuote` click path)
+- Modify: `docs/architecture.md` (`Scroll` definition)
+
+**Interfaces:**
+- Produces: `Scroll::AtTop { message_id }`; `conversation::anchor_to_top(convo, chat_id, message_id, now) -> Vec<Effect>`.
+
+#### Why a new variant is needed
+
+`Scroll::At { message_id, line_offset }` means "this message's bottom edge sits
+at the viewport bottom", and `build_window` walks **backward** from it. Landing
+a message at the top cannot be done by choosing a different anchor message:
+that would require knowing how many messages fill a screen downward from the
+target, which needs laid-out line heights. Those live in `tgt-ui` and never
+come back to core. So the view resolves it, exactly as it already resolves
+click coordinates (architecture §7.5).
+
+#### The anchor-flavour rule — read this before writing any code
+
+`AtTop` is **not** a transient landing state. If a scroll or a selection step
+converted it back to `At`, the target would flip from the top of the screen to
+the bottom on the user's very next keypress — a worse bug than the one this
+task fixes, and one that unit tests on `Scroll` values alone will not reveal.
+
+So: **anchor movement preserves the flavour.** `step_anchor` and `move_anchor`
+map `AtTop{M}` to `AtTop{M±1}`, and `At{M}` to `At{M±1}`, and only ever
+re-pin to `Scroll::Bottom` when the new anchor is the newest loaded message.
+There is one exception, and it is the fallback below doing its job, not a
+conversion.
+
+#### Core: seven of the eight match sites treat AtTop exactly like At
+
+`AtTop` resolves to the same message index as `At` everywhere in core. Only
+the view cares about the difference. These sites all take
+`Scroll::At { message_id, .. } | Scroll::AtTop { message_id }` arms that behave
+identically:
+
+- `crates/core/src/app.rs:1313` — `scroll_conversation_move`'s `current_idx`
+- `crates/core/src/state/media.rs:235` — auto-download's `anchor_idx`
+- `crates/core/src/state/conversation.rs:588` — deletion re-anchor
+- `crates/core/src/state/conversation.rs:919` — `step_anchor`'s `current` (preserve flavour, per the rule above)
+- `crates/core/src/state/conversation.rs:947` — `evict_excess`'s `evict_back`
+- `crates/core/src/state/conversation.rs:1018` — `move_anchor`'s `current_idx` (preserve flavour)
+- `crates/core/src/state/conversation.rs:1075` — `trigger_paging_if_near_top`
+
+`mark_visible_read` needs no change and must not get one: it gates on
+`Scroll::Bottom`, and `AtTop` is correctly not that — a user who jumped
+backward is not looking at the newest messages.
+
+#### The view: a forward-fill path with a bottom-fill fallback
+
+`resolve_anchor` (`view/conversation.rs:783`) returns `(index, line_offset)`
+for the backward walk. Add a fill *direction* alongside it, and give
+`build_window` a forward branch: start at the target, append blocks to the
+back, stop at `rows.len() >= height` or the newest message, then clip from the
+**back** (so the target stays pinned at row 0 and the bottom-most block is the
+one clipped mid-render).
+
+**The fallback is required, not an edge case.** If there are not enough newer
+messages to fill the screen, the target *cannot* be top-most — rendering it
+there would leave blank rows below real content. Detect the short fill and
+redo it as the existing bottom-fill from the newest message. A quoted message
+three from the end of history is the common case for this, not a rarity.
+
+- [ ] **Step 1: Edit `docs/architecture.md` first**
+
+Add `AtTop { message_id }` to the `Scroll` definition, with the flavour rule
+and the fallback both stated.
+
+- [ ] **Step 2: Write the failing view test**
+
+In `crates/ui/src/view/conversation.rs`'s test module, alongside the existing
+`Scroll::At` render tests. Use that module's existing state fixture and
+`render_to_string`-style helper — read a neighbouring test and match it.
+
+```rust
+#[test]
+fn at_top_puts_its_message_on_the_first_row_and_clips_the_bottom() {
+    // A window long enough that a screen's worth of messages sits BELOW the
+    // target, so top-anchoring is actually achievable.
+    let state = /* fixture: chat open, messages 1..=40, scroll =
+                   Scroll::AtTop { message_id: MessageId(10) } */;
+    let rendered = render_to_string(80, 12, &state);
+    let rows: Vec<&str> = rendered.lines().collect();
+
+    assert!(
+        rows[0].contains("msg 10"),
+        "the jump target must be the FIRST visible row, got: {:?}",
+        rows[0]
+    );
+    // And the view is full of real content, not padded blanks.
+    assert!(
+        rows.iter().filter(|r| !r.trim().is_empty()).count() >= 10,
+        "forward fill must fill the pane"
+    );
+}
+
+#[test]
+fn at_top_near_the_end_of_history_falls_back_to_the_bottom() {
+    // Only two messages newer than the target: it CANNOT be top-most
+    // without leaving blank rows under real content.
+    let state = /* fixture: messages 1..=12, scroll =
+                   Scroll::AtTop { message_id: MessageId(11) } */;
+    let rendered = render_to_string(80, 12, &state);
+    let rows: Vec<&str> = rendered.lines().collect();
+
+    assert!(
+        rows.last().unwrap().contains("msg 12"),
+        "short fill must fall back to bottom-anchored, newest last"
+    );
+}
+```
+
+- [ ] **Step 3: Run them and confirm they fail**
+
+Run: `env -u TGT_SENTRY_DSN cargo test -p tgt-ui view::conversation::tests::at_top_`
+Expected: compile error, no `Scroll::AtTop` variant.
+
+- [ ] **Step 4: Add the variant and the core arms**
+
+Add to `enum Scroll`:
+
+```rust
+    /// Anchored with this message's TOP edge at the viewport's first row —
+    /// where a deliberate jump lands (the reply-quote chip, its hunt, and
+    /// the mouse click on a quote line). The opposite of [`Scroll::At`],
+    /// which pins a message's bottom edge to the last row.
+    ///
+    /// Carries no `line_offset`: the target's first line IS row 0.
+    ///
+    /// Anchor movement preserves this flavour (`step_anchor`,
+    /// `move_anchor`) — converting back to `At` on the next keypress would
+    /// flip the target from the top of the screen to the bottom.
+    ///
+    /// The view falls back to a bottom-anchored fill when too few newer
+    /// messages exist to fill the pane; see `view::conversation`.
+    AtTop { message_id: MessageId },
+```
+
+Then work through the seven core sites listed above. The compiler finds them.
+
+- [ ] **Step 5: Implement the forward fill**
+
+In `view/conversation.rs`, per the design above. Keep the per-frame
+attachment/reaction/receipt appends and the `HitMap` pushes identical between
+the two directions — they are not direction-dependent, and duplicating that
+block would be the wrong fix. Extract the per-message block build into a
+helper both directions call.
+
+- [ ] **Step 6: Run the view tests and confirm they pass**
+
+Run: `env -u TGT_SENTRY_DSN cargo test -p tgt-ui view::conversation`
+Expected: PASS, including every pre-existing render test.
+
+- [ ] **Step 7: Add `anchor_to_top` and repoint the three jump paths**
+
+```rust
+/// Anchors so `message_id` is the FIRST visible row. Used by deliberate
+/// jumps; `anchor_to` (bottom-anchored) stays the default for everything
+/// else. Re-pins to `Scroll::Bottom` when the target is the newest loaded
+/// message, where "at the top" has no meaning.
+pub(crate) fn anchor_to_top(
+    convo: &mut ConversationState,
+    chat_id: ChatId,
+    message_id: MessageId,
+    now: Millis,
+) -> Vec<Effect> {
+    let is_newest = convo.messages.back().is_some_and(|m| m.id == message_id);
+    convo.scroll = if is_newest {
+        Scroll::Bottom
+    } else {
+        Scroll::AtTop { message_id }
+    };
+    trigger_paging_if_near_top(convo, chat_id, now)
+}
+```
+
+Repoint all three quote-jump paths to it:
+1. `selection.rs`'s `Chip::JumpToQuoted` arm (its `AnchorPolicy::Jump` path)
+2. `conversation.rs`'s hunt landing in `advance_hunt`
+3. `conversation.rs`'s `jump_to_message`, which the mouse `ReplyQuote` click
+   at `app.rs:1136` calls
+
+Leave `state::search`'s hit stepping on the old bottom-anchored `anchor_to`.
+Same annoyance, different feature, not in this task's scope.
+
+- [ ] **Step 8: Write the flavour-preservation test**
+
+This is the trap this task exists to avoid. In `conversation.rs`'s tests:
+
+```rust
+#[test]
+fn stepping_from_a_top_anchor_stays_top_anchored() {
+    let mut app = fixture_state();
+    open(&mut app, CHAT);
+    let convo = app.conversations.get_mut(&CHAT).unwrap();
+    for id in 1..=20 {
+        convo.messages.push_back(msg(id));
+    }
+    convo.paging = PagingState::Exhausted;
+    convo.scroll = Scroll::AtTop { message_id: MessageId(10) };
+
+    step_anchor(convo, CHAT, -1, Millis(0));
+
+    // NOT Scroll::At — converting flavour here would flip the message
+    // from the top of the screen to the bottom on the user's next keypress.
+    assert_eq!(
+        app.conversations[&CHAT].scroll,
+        Scroll::AtTop { message_id: MessageId(9) }
+    );
+}
+```
+
+- [ ] **Step 9: Watch each half fail**
+
+Three breakages, restoring between each:
+1. Make the forward fill clip from the front instead of the back →
+   `at_top_puts_its_message_on_the_first_row_and_clips_the_bottom` red.
+2. Delete the short-fill fallback →
+   `at_top_near_the_end_of_history_falls_back_to_the_bottom` red.
+3. Make `step_anchor`'s `AtTop` arm return `Scroll::At` →
+   `stepping_from_a_top_anchor_stays_top_anchored` red.
+
+- [ ] **Step 10: Review snapshots**
+
+Run: `cargo insta test -p tgt-ui --check`. Read every diff. Pre-existing
+conversation snapshots use `Scroll::Bottom` or `Scroll::At` and must be
+**unchanged** — a moved snapshot here means the bottom-fill path was disturbed,
+which is a regression, not a new baseline. Do not accept those.
+
+- [ ] **Step 11: Full check and commit**
+
+```bash
+env -u TGT_SENTRY_DSN mise run check
+git add crates/core/src/state/conversation.rs crates/ui/src/view/conversation.rs \
+        crates/core/src/state/selection.rs crates/core/src/app.rs \
+        crates/core/src/state/media.rs docs/architecture.md
+git commit -m "feat(conversation): land a quote jump at the top of the viewport"
+```
+
+---
+
+### Task 12: Chip shortcut letters that match what they do
+
+From user feedback: `[D] Edit` and `[E] React` are unguessable, and `[X]
+Delete` is second-best to `[D]`. The three move as a set, because each new
+letter is occupied by one of the others until all three change at once.
+
+| Chip | was | becomes | why |
+| --- | --- | --- | --- |
+| `Edit` | `d` | `e` | first letter of the word |
+| `Delete` | `x` | `d` | first letter, freed by Edit's move |
+| `React` | `e` | `+` | reads as "add a reaction", frees `e` |
+
+**No behavior change to `React`.** It already sends a thumbs-up:
+`selection.rs:55` defines `DEFAULT_REACTION = "👍"` and the chip's arm
+(`selection.rs:480`) fires `ToggleReaction` with it. This task renames the
+shortcut only. The arbitrary-emoji picker is a separate spec.
+
+`+` is not a letter, which is fine: `map_key_event` maps `KeyCode::Char(c)`
+to `Key::Char(c)` regardless of modifiers, so Shift+`=` arrives as
+`Key::Char('+')` and `selection::handle_key`'s existing `Key::Char(c)` arm
+matches it against `Chip::shortcut()` like any other. No key-model change.
+
+**Files:**
+- Modify: `crates/core/src/model/chips.rs` (`shortcut()`)
+- Modify: `crates/ui/src/view/help.rs` (the Selection mode chip row + module doc)
+- Modify: `docs/architecture.md` §4.2 chip listing
+
+**Interfaces:** consumes `Chip::JumpToQuoted` (Task 7). No new symbols.
+
+- [ ] **Step 1: Write the failing test**
+
+In `crates/core/src/model/chips.rs`'s `mod tests`:
+
+```rust
+#[test]
+fn shortcuts_match_the_word_they_stand_for() {
+    // The three that moved together, pinned so a future edit cannot
+    // silently swap them back into each other's letters.
+    assert_eq!(Chip::Edit.shortcut(), 'e');
+    assert_eq!(Chip::Delete.shortcut(), 'd');
+    assert_eq!(Chip::React.shortcut(), '+');
+    // Unchanged neighbours, asserted here so the set is read as a whole.
+    assert_eq!(Chip::Reply.shortcut(), 'r');
+    assert_eq!(Chip::Forward.shortcut(), 'f');
+    assert_eq!(Chip::Copy.shortcut(), 'c');
+    assert_eq!(Chip::JumpToQuoted.shortcut(), 'j');
+}
+```
+
+`chip_shortcut_letters_unique_per_row` already proves no row can contain two
+chips answering the same key, over every combination of the five inputs — it
+covers the collision risk of this swap for free, and must stay green.
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Run: `env -u TGT_SENTRY_DSN cargo test -p tgt-core chips::tests::shortcuts_match_the_word_they_stand_for`
+Expected: FAIL on the first assertion, `assertion \`left == right\` failed: left: 'd', right: 'e'`.
+
+- [ ] **Step 3: Make the swap**
+
+In `Chip::shortcut()`:
+
+```rust
+            Chip::React => '+',
+            Chip::Edit => 'e',
+            Chip::Delete => 'd',
+```
+
+Leave `Chip::label()` alone. "React" is still what the action does.
+
+- [ ] **Step 4: Run the chip tests**
+
+Run: `env -u TGT_SENTRY_DSN cargo test -p tgt-core chips`
+Expected: PASS, including `chip_shortcut_letters_unique_per_row` and
+`labels_are_distinct`.
+
+- [ ] **Step 5: Run the selection tests**
+
+Run: `env -u TGT_SENTRY_DSN cargo test -p tgt-core state::selection`
+Expected: some FAIL. Selection tests drive chips by their letter
+(`handle_key(&mut app, Key::Char('d'))` for Edit, `'x'` for Delete, `'e'` for
+React). Update each to the new letter. Do not change what they assert — only
+the key pressed.
+
+This step is the real risk in this task: a test that pressed `'d'` for Edit
+will now silently exercise Delete, which still exists and still claims the
+key. Read each failure rather than pattern-replacing.
+
+- [ ] **Step 6: Update the help overlay**
+
+The Selection mode chip row's key list and its description must stay in the
+same order as each other. Whatever Task 7 left it as, it becomes:
+
+```rust
+                key: "r f + c e d l o s v k j",
+                desc: "reply forward react copy edit delete download open resend reveal cancel jump-to-quote",
+```
+
+Update `help.rs`'s module doc comment (around line 15) to the same letters, so
+the doc and the row cannot drift.
+
+Check the width budget: Task 7 established the content limit is
+`area.width - 6` = 114 columns at the 120-wide test frame, and added an
+assertion for it. This row is one character shorter than Task 7's, so it fits
+— but run the assertion, do not assume.
+
+- [ ] **Step 7: Review snapshots**
+
+Run: `cargo insta test -p tgt-ui --check`. Every chip-row snapshot moves (the
+letters are rendered in the row) and so does the help overlay. Read each diff
+and confirm the change is exactly the three letters, then `cargo insta accept`.
+
+- [ ] **Step 8: Update `docs/architecture.md` §4.2**
+
+The chip listing carries the shortcut letters. Update the three.
+
+- [ ] **Step 9: Full check and commit**
+
+```bash
+env -u TGT_SENTRY_DSN mise run check
+git add crates/core/src/model/chips.rs crates/core/src/state/selection.rs \
+        crates/ui/src/view/help.rs crates/ui/src/view/snapshots \
+        crates/ui/tests/snapshots docs/architecture.md
+git commit -m "feat(selection): give edit, delete and react memorable shortcuts"
+```
