@@ -1007,6 +1007,14 @@ impl App {
             // lifecycle into `enter`/`exit` precisely so the router can run
             // the second half on the generic pop path.
             Focus::Selection => {
+                // T9: popping out of selection mode is the user taking over
+                // navigation — an in-flight jump-to-quote hunt no longer
+                // speaks for where the view should go.
+                if let Some(chat_id) = self.state.open_chat
+                    && let Some(convo) = self.state.conversations.get_mut(&chat_id)
+                {
+                    conversation::cancel_hunt(convo);
+                }
                 selection::exit(&mut self.state);
                 self.state.focus.pop();
             }

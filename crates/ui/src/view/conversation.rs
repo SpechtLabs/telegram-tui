@@ -1290,6 +1290,7 @@ mod tests {
             pending_view: None,
             search_hits: Vec::new(),
             selection: None,
+            hunt: None,
         }
     }
 

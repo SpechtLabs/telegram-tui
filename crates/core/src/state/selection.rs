@@ -542,8 +542,7 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
                 // unlike an `↑`/`↓` step (see `AnchorPolicy`).
                 select(app, chat_id, quoted, AnchorPolicy::Jump)
             } else {
-                // Task 9 replaces this with the hunt.
-                Vec::new()
+                conversation::start_hunt(app, chat_id, quoted)
             }
         }
     }

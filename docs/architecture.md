@@ -1187,6 +1187,38 @@ selects in: `ConversationState` gains
 listed here so neighboring tasks can rely on the name.
 
 ```rust
+// core/src/state/conversation.rs
+use crate::model::ids::MessageId;
+
+/// A search for a message older than the loaded window, started by the
+/// jump-to-quote chip (§7.5.3). Pages backward until the target arrives, the
+/// start of history is reached, or the budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JumpHunt {
+    pub target: MessageId,
+    pub pages_spent: u8,
+}
+
+/// 20 × `history::PAGE_SIZE` = 1000 messages. A reply quote is nearly always
+/// a message still in the window or a page behind it; this bounds the
+/// pathological case (quoting something from a year ago) rather than sizing
+/// the common one.
+pub const MAX_HUNT_PAGES: u8 = 20;
+```
+
+`ConversationState` gains `pub hunt: Option<JumpHunt>` for the same reason
+(post-plan, jump-to-quote keyboard path, §7.5.3). One subtlety this field
+forces on `evict_excess`: that function drops from the **front** of the
+window whenever the anchor is `Scroll::Bottom`. A hunt that left the anchor
+there would evict every page it fetched the moment the window reached
+`WINDOW_MAX_MESSAGES` (500) — it would spend its whole budget and find
+nothing. So `start_hunt`/`advance_hunt` move the anchor to the oldest loaded
+message after every page; `evict_excess` then drops from the back instead,
+and the window walks backward through history as the hunt runs. That anchor
+move is also the hunt's progress indicator — the view visibly scrolls back
+while it searches, so no separate "searching…" affordance exists.
+
+```rust
 // core/src/state/composer.rs
 use std::path::PathBuf;
 use crate::model::ids::MessageId;
@@ -2554,6 +2586,35 @@ about to change.
 through `escape()` or `Action::Resize`, and both tear down the whole
 session regardless, so there is nothing for a `CloseChat` to accomplish
 ahead of it.
+
+### 7.5.3 Jump-to-quote hunt: a keyboard path, not a reopening of §7.5.1's rejected one (T9, 2026-08-02)
+
+§7.5.1's "Jump when the quoted message is not loaded" note rejected building
+"a second, direct 'load toward an arbitrary id' path" for the mouse
+reply-quote click, on the grounds that the existing near-top paging trigger
+already carries an anchor set past the loaded window toward wherever it
+needs to go. `JumpHunt` (above) is exactly the kind of thing that note
+argued against building — so it is worth being explicit about why adding it
+here does not undo that decision rather than silently contradicting it.
+
+The two paths solve different problems. A mouse click's `jump_to_message`
+is a passive anchor move: it trusts `trigger_paging_if_near_top` to notice,
+eventually, that the anchor sits outside the window, and it accepts however
+long that takes with no feedback beyond the view slowly filling in. The
+keyboard chip needs more than that, because unlike a click it is discrete
+and repeatable — a user pressing `j` needs to know within a bounded time
+whether the jump is going to land or never will, not watch a paging
+indicator that does not exist. `JumpHunt` supplies exactly that: a request
+budget (`MAX_HUNT_PAGES`) and an explicit give-up with a toast, neither of
+which the ambient mechanism §7.5.1 relies on provides on its own.
+
+Mechanically the hunt still drives the same `state/history.rs` `PagingState`
+machine §7.5.1 was protecting — `start_hunt`/`advance_hunt` call the same
+`anchor_to` the click path calls, and issue their own `GetChatHistory` only
+as a fallback when that anchor move's own near-top trigger does not (paging
+already in flight). There is one paging state machine and one way to drive
+it toward an id outside the window; the hunt adds a budget and a caller that
+notices when to stop asking, not a competing request path.
 
 ## 8. Decisions the spec delegated
 

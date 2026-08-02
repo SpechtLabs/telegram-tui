@@ -453,6 +453,7 @@ pub fn conversation_with(
         pending_view: None,
         search_hits: Vec::new(),
         selection: None,
+        hunt: None,
     }
 }
 

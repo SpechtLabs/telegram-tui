@@ -101,6 +101,7 @@ use crate::state::focus::Focus;
 use crate::state::history::{self, PagingDirective, PagingState};
 use crate::state::media;
 use crate::state::selection::SelectionState;
+use crate::state::toasts;
 use crate::td::error::TdError;
 use crate::td::request::TdRequest;
 use crate::td::update::TdUpdate;
@@ -179,6 +180,21 @@ pub struct PendingView {
     pub attempts: u8,
 }
 
+/// A search for a message older than the loaded window, started by the
+/// jump-to-quote chip. Pages backward until the target arrives, the start of
+/// history is reached, or the budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JumpHunt {
+    pub target: MessageId,
+    pub pages_spent: u8,
+}
+
+/// 20 × `history::PAGE_SIZE` = 1000 messages. A reply quote is nearly always
+/// a message still in the window or a page behind it; this bounds the
+/// pathological case (quoting something from a year ago) rather than sizing
+/// the common one.
+pub const MAX_HUNT_PAGES: u8 = 20;
+
 #[derive(Debug)]
 pub struct ConversationState {
     pub chat_id: ChatId,
@@ -201,6 +217,8 @@ pub struct ConversationState {
     /// leaves the window (deleted server-side, or evicted by the window
     /// bound), so no handler ever has to cope with a dangling selection.
     pub selection: Option<SelectionState>,
+    /// An in-flight jump-to-quote search, or `None`. See [`JumpHunt`].
+    pub hunt: Option<JumpHunt>,
 }
 
 /// Ensures a `ConversationState` exists for `chat_id` and makes it the open
@@ -223,6 +241,7 @@ pub fn open(app: &mut AppState, chat_id: ChatId) {
             pending_view: None,
             search_hits: Vec::new(),
             selection: None,
+            hunt: None,
         });
     app.open_chat = Some(chat_id);
 }
@@ -242,9 +261,18 @@ pub fn open(app: &mut AppState, chat_id: ChatId) {
 /// the common case of re-selecting the current row) returns nothing — this
 /// is what keeps that path from emitting a close/open churn pair for the
 /// same chat.
-pub fn close_previous_chat(app: &AppState, new_chat_id: ChatId) -> Vec<Effect> {
+///
+/// T9: also where a jump-to-quote hunt on the chat being left gets
+/// cancelled — the one place both call sites (`chat_list::open_selected`,
+/// `palette::open_chat`) already read `open_chat`'s outgoing value, so
+/// cancelling it here rather than at each call site keeps it from being two
+/// places that could drift, same as the `CloseChat` effect itself.
+pub fn close_previous_chat(app: &mut AppState, new_chat_id: ChatId) -> Vec<Effect> {
     match app.open_chat {
         Some(previous) if previous != new_chat_id => {
+            if let Some(convo) = app.conversations.get_mut(&previous) {
+                cancel_hunt(convo);
+            }
             vec![Effect::Td(TdRequest::CloseChat { chat_id: previous })]
         }
         _ => Vec::new(),
@@ -328,6 +356,110 @@ pub fn jump_to_message(app: &mut AppState, chat_id: ChatId, message_id: MessageI
         };
     }
     Vec::new()
+}
+
+/// Begins a backward search for `target` (architecture §7.5.3): the
+/// keyboard jump-to-quote chip's counterpart to [`jump_to_message`] for a
+/// target that is not in the loaded window. Unlike that function, this does
+/// issue a direct request — see §7.5.3 for why that is not a reopening of
+/// the "no second path into paging" decision `jump_to_message`'s own doc
+/// comment records.
+///
+/// Moves the anchor to the oldest loaded message first: `evict_excess` drops
+/// from the FRONT while the anchor is at the bottom, which would evict each
+/// page the hunt fetches as soon as the window hit `WINDOW_MAX_MESSAGES` —
+/// the hunt would spend its whole budget and find nothing. With the anchor
+/// at the front, eviction drops from the back and the window walks backward
+/// instead. The moving anchor is also the progress indicator, which is why
+/// there is no spinner.
+pub fn start_hunt(app: &mut AppState, chat_id: ChatId, target: MessageId) -> Vec<Effect> {
+    let now = app.now;
+    let Some(convo) = app.conversations.get_mut(&chat_id) else {
+        return Vec::new();
+    };
+    let Some(oldest) = convo.messages.front().map(|m| m.id) else {
+        return Vec::new();
+    };
+    convo.hunt = Some(JumpHunt {
+        target,
+        pages_spent: 0,
+    });
+    let mut effects = anchor_to(convo, chat_id, oldest, now);
+    if effects.is_empty() {
+        // `anchor_to`'s paging trigger is a no-op when the machine is not
+        // `Idle`; ask directly so the hunt always has a page in flight.
+        effects.push(Effect::Td(TdRequest::GetChatHistory {
+            chat_id,
+            from_message_id: oldest,
+            limit: history::PAGE_SIZE,
+            only_local: false,
+        }));
+    }
+    effects
+}
+
+/// Abandons an in-flight hunt. Called when the user takes over navigation:
+/// `Esc`, closing the chat, or a manual scroll key.
+pub fn cancel_hunt(convo: &mut ConversationState) {
+    convo.hunt = None;
+}
+
+/// One step of an in-flight hunt, run from [`apply_history_page`] after a
+/// page has been prepended (or a request failed). Returns the request that
+/// continues it, a toast if it gave up, or nothing when there is no hunt to
+/// advance.
+///
+/// Deliberately issues no `GetChatHistory` of its own when continuing:
+/// [`anchor_to`]'s own near-top trigger already asks for the next page
+/// whenever `convo.paging` is `Idle`, which is exactly the state
+/// `on_history_loaded` leaves it in for any non-empty page — the same
+/// condition this function's own "keep going" branch requires. Adding a
+/// second, unconditional request here (mirroring [`start_hunt`]'s fallback)
+/// would double-dispatch: either against that trigger (a non-empty page,
+/// where both fire) or against the empty-page retry `apply_history_page`'s
+/// `directive` handling already issues on its own (where `convo.paging` is
+/// `Loading`, not `Idle`, so the near-top trigger is silent but a request is
+/// already outstanding regardless). `start_hunt`'s fallback exists because
+/// it runs outside `apply_history_page` with no such directive alongside it;
+/// this function always runs with one.
+fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> Vec<Effect> {
+    let now = app.now;
+    let Some(convo) = app.conversations.get_mut(&chat_id) else {
+        return Vec::new();
+    };
+    let Some(hunt) = convo.hunt else {
+        return Vec::new();
+    };
+
+    if index_of(&convo.messages, hunt.target).is_some() {
+        convo.hunt = None;
+        return anchor_to(convo, chat_id, hunt.target, now);
+    }
+    if matches!(convo.paging, PagingState::Exhausted) {
+        convo.hunt = None;
+        return toasts::on_action_failed(
+            app,
+            chat_id,
+            "the quoted message is no longer available".to_string(),
+        );
+    }
+    if hunt.pages_spent >= MAX_HUNT_PAGES {
+        convo.hunt = None;
+        return toasts::on_action_failed(
+            app,
+            chat_id,
+            "could not find the quoted message".to_string(),
+        );
+    }
+    let Some(oldest) = convo.messages.front().map(|m| m.id) else {
+        convo.hunt = None;
+        return Vec::new();
+    };
+    convo.hunt = Some(JumpHunt {
+        target: hunt.target,
+        pages_spent: hunt.pages_spent + 1,
+    });
+    anchor_to(convo, chat_id, oldest, now)
 }
 
 /// Tells TDLib which messages the user has actually seen in `chat_id`, so it
@@ -709,7 +841,18 @@ pub fn apply_history_page(
                 }));
             }
 
-            effects.extend(fill_viewport(convo, chat_id, added));
+            // T9: advance an in-flight jump-to-quote hunt now that this page
+            // has landed. Runs before `fill_viewport` deliberately: if the
+            // hunt continues, its own `anchor_to` call may put `paging` back
+            // into `Loading`, which is exactly what stops `fill_viewport`
+            // from also asking for a page in the same call. Needs `app`
+            // wholesale (the give-up toast does), so it runs after the
+            // `convo` borrow above has gone out of use; `fill_viewport`
+            // re-borrows fresh rather than reusing that binding.
+            effects.extend(advance_hunt(app, chat_id));
+            if let Some(convo) = app.conversations.get(&chat_id) {
+                effects.extend(fill_viewport(convo, chat_id, added));
+            }
 
             effects
         }
@@ -719,7 +862,18 @@ pub fn apply_history_page(
                 _ => None,
             };
             history::on_history_error(&mut convo.paging, retry_after, app.now);
-            Vec::new()
+            // T9: a hunt that silently waits out a cooldown looks stalled,
+            // not stopped — end it and say so rather than leaving the user
+            // wondering whether `j` did anything.
+            if convo.hunt.take().is_some() {
+                toasts::on_action_failed(
+                    app,
+                    chat_id,
+                    "could not reach the quoted message".to_string(),
+                )
+            } else {
+                Vec::new()
+            }
         }
     };
 
@@ -985,6 +1139,10 @@ pub fn handle_key(app: &mut AppState, key: Key) -> Option<Vec<Effect>> {
     let now = app.now;
     let mut effects = {
         let convo = app.conversations.get_mut(&chat_id)?;
+        // T9: a manual scroll is the user taking over navigation — an
+        // in-flight jump-to-quote hunt no longer speaks for where the view
+        // should go.
+        cancel_hunt(convo);
         move_anchor(convo, chat_id, delta, now)
     };
     // T66: every anchor step changes what's near it.
@@ -1251,14 +1409,14 @@ mod tests {
         const OTHER: ChatId = ChatId(2);
 
         // Nothing open yet: no chat to close.
-        assert!(close_previous_chat(&app, CHAT).is_empty());
+        assert!(close_previous_chat(&mut app, CHAT).is_empty());
 
         open(&mut app, CHAT);
         // Same chat again: no close/open churn against itself.
-        assert!(close_previous_chat(&app, CHAT).is_empty());
+        assert!(close_previous_chat(&mut app, CHAT).is_empty());
 
         // A different chat: close the one being left.
-        let effects = close_previous_chat(&app, OTHER);
+        let effects = close_previous_chat(&mut app, OTHER);
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             effects[0],
@@ -2862,6 +3020,183 @@ mod tests {
         assert_eq!(
             view_requests(&effects),
             vec![(CHAT, vec![MessageId(1), MessageId(2), MessageId(3)])]
+        );
+    }
+
+    // --- T9: jump-to-quote hunt ----------------------------------------
+
+    #[test]
+    fn a_hunt_pages_backward_and_moves_the_anchor_so_pages_are_not_evicted() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 50..60 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.scroll = Scroll::Bottom;
+        convo.paging = PagingState::Idle;
+
+        let effects = start_hunt(&mut app, CHAT, MessageId(20));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Td(TdRequest::GetChatHistory { from_message_id, .. })]
+                if *from_message_id == MessageId(50)
+        ));
+        assert!(app.conversations[&CHAT].hunt.is_some());
+        // The anchor left the bottom, or eviction would drop the pages the
+        // hunt is about to fetch.
+        assert_ne!(app.conversations[&CHAT].scroll, Scroll::Bottom);
+    }
+
+    #[test]
+    fn a_hunt_lands_when_its_target_arrives() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 50..60 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: false,
+        };
+        start_hunt(&mut app, CHAT, MessageId(45));
+
+        let page: Vec<MessageView> = (40..50).map(msg).collect();
+        apply_history_page(&mut app, CHAT, false, &Ok(page));
+
+        assert!(app.conversations[&CHAT].hunt.is_none(), "hunt cleared");
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(45),
+                line_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hunt_gives_up_after_max_pages_and_says_so() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 900..1000 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: false,
+        };
+        start_hunt(&mut app, CHAT, MessageId(1));
+        app.conversations.get_mut(&CHAT).unwrap().hunt = Some(JumpHunt {
+            target: MessageId(1),
+            pages_spent: MAX_HUNT_PAGES,
+        });
+
+        let page: Vec<MessageView> = (800..900).map(msg).collect();
+        apply_history_page(&mut app, CHAT, false, &Ok(page));
+
+        assert!(app.conversations[&CHAT].hunt.is_none());
+        assert!(
+            !app.toasts.toasts.is_empty(),
+            "giving up silently is the failure this bound exists to make visible"
+        );
+    }
+
+    #[test]
+    fn a_hunt_stops_at_the_start_of_history() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.push_back(msg(5));
+        convo.paging = PagingState::Loading {
+            attempt: history::MAX_EMPTY_ATTEMPTS,
+            only_local: false,
+        };
+        start_hunt(&mut app, CHAT, MessageId(1));
+
+        // An empty non-local page at max attempts latches `Exhausted`.
+        apply_history_page(&mut app, CHAT, false, &Ok(Vec::new()));
+
+        assert_eq!(app.conversations[&CHAT].paging, PagingState::Exhausted);
+        assert!(app.conversations[&CHAT].hunt.is_none());
+        assert!(!app.toasts.toasts.is_empty());
+    }
+
+    #[test]
+    fn a_history_error_ends_the_hunt_rather_than_stalling_it() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.push_back(msg(50));
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: false,
+        };
+        start_hunt(&mut app, CHAT, MessageId(1));
+
+        apply_history_page(
+            &mut app,
+            CHAT,
+            false,
+            &Err(TdError::FloodWait { seconds: 30 }),
+        );
+
+        // Waiting out a 30-second cooldown with no sign of life is worse than
+        // saying it stopped; the user can press `j` again.
+        assert!(app.conversations[&CHAT].hunt.is_none());
+        assert!(!app.toasts.toasts.is_empty());
+    }
+
+    /// None of the five termination-arm tests above ever drive a hunt past
+    /// its first page: each hits `Landed`, `GaveUp` or the `Err` arm on the
+    /// very first response. The continuing case — the page didn't have the
+    /// target, the window isn't exhausted, and the budget isn't spent — is
+    /// the hunt's actual steady state for anything more than one page away,
+    /// and it is exactly the kind of arm that can go dead while the other
+    /// five carry the suite (CLAUDE.md's own warning). This drives two
+    /// pages and checks the second request is asked exactly once — a
+    /// regression test for a real duplicate-dispatch bug: `anchor_to`'s own
+    /// near-top trigger already re-requests once `convo.paging` goes back to
+    /// `Idle` after a non-empty page, so a continuation that also pushes its
+    /// own unconditional `GetChatHistory` fires the same request twice.
+    #[test]
+    fn a_hunt_continues_paging_and_asks_for_exactly_one_more_page() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 200..210 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Idle;
+        start_hunt(&mut app, CHAT, MessageId(1));
+
+        // A page that neither contains the target nor is empty: the hunt
+        // must continue rather than land, give up, or stop.
+        let page: Vec<MessageView> = (190..200).map(msg).collect();
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page));
+
+        let requests: Vec<_> = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Td(TdRequest::GetChatHistory { .. })))
+            .collect();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one continuation request, got {effects:?}"
+        );
+        assert!(matches!(
+            requests.as_slice(),
+            [Effect::Td(TdRequest::GetChatHistory { from_message_id, .. })]
+                if *from_message_id == MessageId(190)
+        ));
+        assert_eq!(
+            app.conversations[&CHAT].hunt,
+            Some(JumpHunt {
+                target: MessageId(1),
+                pages_spent: 1,
+            })
         );
     }
 }
