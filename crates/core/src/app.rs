@@ -3704,6 +3704,69 @@ mod routing {
         );
     }
 
+    /// `Scroll::AtTop`'s flavour survives an anchor step in three places:
+    /// `step_anchor`, `move_anchor`, and this one — the mouse wheel's own
+    /// copy of the stepping logic, which is the copy that got neither of
+    /// the dedicated tests the other two did. Replacing its
+    /// `matches!(convo.scroll, Scroll::AtTop { .. })` with `false` left the
+    /// whole workspace green while flipping the message a user just jumped
+    /// to from the first visible row to the last on their first wheel
+    /// notch, which is precisely what the variant exists to prevent.
+    #[test]
+    fn a_wheel_notch_after_a_jump_keeps_the_target_top_anchored() {
+        let mut app = logged_in();
+        app.update(Action::Td(chat(1, "Ada", 10)));
+        app.update(Action::Key(Key::Down));
+        app.update(Action::Key(Key::Enter));
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((1..=21).map(|id| message(1, id)).collect()),
+        }));
+
+        // A left-click on a reply-quote line is a jump: the quoted message
+        // lands on the FIRST visible row (architecture §7.5.4).
+        app.update(Action::Click {
+            target: HitTarget::ReplyQuote {
+                containing: MessageId(21),
+                quoted: MessageId(10),
+            },
+            button: ClickButton::Left,
+        });
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(10)
+            }
+        );
+        app.take_dirty();
+
+        app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: true,
+        });
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(9)
+            },
+            "one wheel notch must step the anchor and keep it top-anchored; \
+             `Scroll::At` here means the jump target jumped to the bottom"
+        );
+
+        // And downward, which walks back toward where the jump came from.
+        app.update(Action::Scroll {
+            area: ScrollArea::Conversation,
+            up: false,
+        });
+        assert_eq!(
+            app.state().conversations[&CHAT].scroll,
+            Scroll::AtTop {
+                message_id: MessageId(10)
+            }
+        );
+    }
+
     /// The chat-list wheel claims the pane on its own — even while the
     /// keyboard focus is elsewhere — but moves only `scroll_offset`, the
     /// viewport. `selected` and the focus stack are untouched: a mouse
