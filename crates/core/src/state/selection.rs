@@ -529,7 +529,23 @@ fn invoke(app: &mut AppState, chat_id: ChatId, message_id: MessageId, chip: Chip
             recompute_chips(app, chat_id, message_id);
             effects
         }
-        Chip::JumpToQuoted => Vec::new(),
+        Chip::JumpToQuoted => {
+            let Some(quoted) = msg.reply_to.as_ref().map(|r| r.message_id) else {
+                return Vec::new();
+            };
+            let loaded = app
+                .conversations
+                .get(&chat_id)
+                .is_some_and(|convo| conversation::index_of(&convo.messages, quoted).is_some());
+            if loaded {
+                // A deliberate jump: the view follows unconditionally,
+                // unlike an `↑`/`↓` step (see `AnchorPolicy`).
+                select(app, chat_id, quoted, AnchorPolicy::Jump)
+            } else {
+                // Task 9 replaces this with the hunt.
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -1647,5 +1663,31 @@ mod tests {
         handle_key(&mut app, Key::Up);
         assert_eq!(selection(&app).message_id, MessageId(1));
         assert!(!selection(&app).chips.contains(&Chip::JumpToQuoted));
+    }
+
+    #[test]
+    fn the_jump_chip_selects_the_quoted_message_when_it_is_loaded() {
+        let mut replying = msg(9);
+        replying.reply_to = Some(ReplyPreview {
+            message_id: MessageId(3),
+            sender_name: "Ada".to_string(),
+            excerpt: "earlier".to_string(),
+        });
+        let mut app = with_messages((1..=8).map(msg).chain([replying]).collect());
+        // A viewport that does NOT contain the quoted message: a jump must
+        // move the view even though a plain `↑` step would not.
+        app.visible_messages = Some((MessageId(7), MessageId(9)));
+        enter(&mut app);
+
+        handle_key(&mut app, Key::Char('j'));
+
+        assert_eq!(selection(&app).message_id, MessageId(3));
+        assert_eq!(
+            app.conversations[&CHAT].scroll,
+            Scroll::At {
+                message_id: MessageId(3),
+                line_offset: 0,
+            }
+        );
     }
 }
