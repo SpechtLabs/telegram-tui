@@ -230,6 +230,11 @@ pub enum Key {
     PageUp,
     PageDown,
     Ctrl(char), // Ctrl('c'), Ctrl('p'), …
+    // Pane movement (§6.2). Terminals that do not emit modified arrow
+    // sequences (notably Apple Terminal.app) deliver these as plain
+    // Left/Right instead.
+    CtrlLeft,
+    CtrlRight,
 }
 
 /// Rebindable global keys, parsed from config ("ctrl+p" → Key::Ctrl('p')).
