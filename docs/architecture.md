@@ -2620,10 +2620,24 @@ which the ambient mechanism §7.5.1 relies on provides on its own.
 Mechanically the hunt still drives the same `state/history.rs` `PagingState`
 machine §7.5.1 was protecting — `start_hunt`/`advance_hunt` call the same
 `anchor_to` the click path calls, and issue their own `GetChatHistory` only
-as a fallback when that anchor move's own near-top trigger does not (paging
-already in flight). There is one paging state machine and one way to drive
-it toward an id outside the window; the hunt adds a budget and a caller that
-notices when to stop asking, not a competing request path.
+as a fallback when that anchor move's near-top trigger stayed silent. There
+is one paging state machine and one way to drive it toward an id outside the
+window; the hunt adds a budget and a caller that notices when to stop asking,
+not a competing request path.
+
+**The fallback's guard is `PagingState::Loading`, not "always" and not
+"never".** Both extremes are real bugs and each is pinned by its own test.
+Always, and the continuation double-dispatches against the empty-page retry
+`apply_history_page`'s directive handling already issued. Never, and the hunt
+stalls silently in the two states where `trigger_paging_if_near_top` emits
+nothing: a window collapsed to a single message (the oldest loaded message is
+also the newest, so `anchor_to_flavoured` re-pins to `Scroll::Bottom`, which
+the trigger bails on) and a `Cooldown` predating the hunt (`start_hunt` fires
+its own fallback straight into that state, which is how a hunt comes to be
+running under one). Either leaves `convo.hunt` set with no request out and no
+toast — "looks stalled, not stopped", the failure the `Err` arm exists to
+prevent. `pages_spent` increments on every non-terminal call regardless, so
+`MAX_HUNT_PAGES` bounds the fallback as tightly as everything else.
 
 **Landing is reported, not performed.** `apply_history_page` returns
 

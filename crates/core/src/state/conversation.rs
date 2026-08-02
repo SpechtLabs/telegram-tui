@@ -463,21 +463,36 @@ pub fn cancel_hunt(convo: &mut ConversationState) {
 /// The landing sets the *anchor* here and reports the id rather than also
 /// moving the selection cursor: see [`HistoryPage`] and architecture §7.5.3.
 ///
-/// Deliberately issues no `GetChatHistory` of its own when continuing:
+/// The continuation normally issues no `GetChatHistory` of its own:
 /// [`anchor_to`]'s own near-top trigger already asks for the next page
 /// (as does [`anchor_to_top`]'s — they share one body for exactly that
-/// reason)
-/// whenever `convo.paging` is `Idle`, which is exactly the state
-/// `on_history_loaded` leaves it in for any non-empty page — the same
-/// condition this function's own "keep going" branch requires. Adding a
-/// second, unconditional request here (mirroring [`start_hunt`]'s fallback)
-/// would double-dispatch: either against that trigger (a non-empty page,
-/// where both fire) or against the empty-page retry `apply_history_page`'s
-/// `directive` handling already issues on its own (where `convo.paging` is
-/// `Loading`, not `Idle`, so the near-top trigger is silent but a request is
-/// already outstanding regardless). `start_hunt`'s fallback exists because
-/// it runs outside `apply_history_page` with no such directive alongside it;
-/// this function always runs with one.
+/// reason) whenever `convo.paging` is `Idle`, which is the state
+/// `on_history_loaded` leaves it in for any non-empty page. An
+/// *unconditional* request here (mirroring [`start_hunt`]'s fallback) would
+/// double-dispatch against that trigger, which is a real bug the "exactly
+/// one more page" regression test pins.
+///
+/// But leaning on the trigger alone lets the hunt stall silently, so the
+/// fallback is kept and guarded on `PagingState::Loading` instead:
+///
+/// - `Loading` is what the empty-page retry leaves behind, and it means
+///   `apply_history_page`'s `directive` handling has already issued the
+///   backward request. Asking again there is the double-dispatch above.
+/// - `Idle` with an empty anchor move means the re-pin swallowed it: a
+///   window collapsed to a single message makes the oldest loaded message
+///   also the newest, [`anchor_to_flavoured`] re-pins to [`Scroll::Bottom`],
+///   and [`trigger_paging_if_near_top`] bails on `Bottom`. Reachable from
+///   the cold-open path (see [`fill_viewport`]) when a page answers with
+///   nothing but the one message already loaded.
+/// - `Cooldown` from before the hunt started silences the trigger the same
+///   way. `start_hunt` fires its own fallback straight into that state,
+///   which is how a hunt comes to be running under one at all.
+///
+/// Both silent cases leave `convo.hunt` set with nothing in flight and no
+/// toast — the "looks stalled, not stopped" failure the `Err` arm above
+/// exists to prevent. `pages_spent` still increments on every non-terminal
+/// call, so `MAX_HUNT_PAGES` bounds the fallback as tightly as everything
+/// else here.
 fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> (Vec<Effect>, Option<MessageId>) {
     let now = app.now;
     let Some(convo) = app.conversations.get_mut(&chat_id) else {
@@ -528,7 +543,26 @@ fn advance_hunt(app: &mut AppState, chat_id: ChatId) -> (Vec<Effect>, Option<Mes
         target: hunt.target,
         pages_spent: hunt.pages_spent + 1,
     });
-    (anchor_to(convo, chat_id, oldest, now), None)
+    let mut effects = anchor_to(convo, chat_id, oldest, now);
+    if effects.is_empty() && !matches!(convo.paging, PagingState::Loading { .. }) {
+        // `start_hunt`'s fallback, with the one guard it does not need. See
+        // the doc comment: `Loading` is the state the empty-page retry
+        // leaves behind and it means a backward request is already out, so
+        // asking again there is the duplicate-dispatch bug. Every other way
+        // of reaching an empty anchor move is a genuine stall — a window
+        // collapsed to one message re-pins to `Scroll::Bottom`, and a
+        // `Cooldown` predating the hunt silences the near-top trigger —
+        // and a hunt with nothing in flight and no toast looks stalled
+        // rather than stopped. `MAX_HUNT_PAGES` still bounds it, so this
+        // cannot turn a cooldown into a flood.
+        effects.push(Effect::Td(TdRequest::GetChatHistory {
+            chat_id,
+            from_message_id: oldest,
+            limit: history::PAGE_SIZE,
+            only_local: false,
+        }));
+    }
+    (effects, None)
 }
 
 /// Tells TDLib which messages the user has actually seen in `chat_id`, so it
@@ -3441,6 +3475,138 @@ mod tests {
         convo.paging = PagingState::Idle;
         start_hunt(app, CHAT, MessageId(1));
         assert!(app.conversations[&CHAT].hunt.is_some());
+    }
+
+    /// Every `GetChatHistory` in `effects`.
+    fn history_request_count(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Td(TdRequest::GetChatHistory { .. })))
+            .count()
+    }
+
+    /// The continuation leans on `anchor_to`'s near-top trigger to ask for
+    /// the next page, which holds for the ordinary case and fails in two
+    /// that are reachable. Here: the window is a single message, so
+    /// `anchor_to_flavoured` finds the oldest loaded message *is* the newest
+    /// one, re-pins to `Scroll::Bottom`, and `trigger_paging_if_near_top`
+    /// bails on `Bottom` outright. The hunt is left `Some(..)` with nothing
+    /// in flight and no toast — the "looks stalled, not stopped" failure the
+    /// `Err` arm exists to prevent.
+    ///
+    /// Reachable through the cold-open path: TDLib's local database holds
+    /// only the chat-list preview message, and a page that answers with
+    /// nothing but that same message is non-empty (so no retry ladder) and
+    /// adds nothing (so the window stays at one).
+    #[test]
+    fn a_continuation_that_cannot_re_pin_still_asks_for_the_next_page() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        convo.messages.push_back(msg(50));
+        convo.paging = PagingState::Idle;
+        start_hunt(&mut app, CHAT, MessageId(1));
+
+        // Non-empty (no retry ladder) and pure overlap (the window stays at
+        // one message, so the re-pin to `Bottom` happens again).
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(vec![msg(50)])).effects;
+
+        assert_eq!(
+            history_request_count(&effects),
+            1,
+            "a hunt with no request in flight and no toast is a hunt that \
+             looks stalled rather than stopped: {effects:?}"
+        );
+        assert_eq!(
+            app.conversations[&CHAT].hunt,
+            Some(JumpHunt {
+                target: MessageId(1),
+                pages_spent: 1,
+            })
+        );
+    }
+
+    /// The other half of the fallback: its `Loading` guard. An empty page
+    /// below `MAX_EMPTY_ATTEMPTS` leaves the machine `Loading` and
+    /// `apply_history_page`'s `directive` handling has already pushed the
+    /// retry, so the anchor move being silent here is correct rather than a
+    /// stall. Firing the fallback anyway is the duplicate-dispatch bug
+    /// `a_hunt_continues_paging_and_asks_for_exactly_one_more_page` guards
+    /// on the non-empty side — and that test cannot see this side, because
+    /// a non-empty page leaves the machine `Idle`.
+    #[test]
+    fn a_continuation_after_an_empty_page_leaves_the_retry_to_the_machine() {
+        let mut app = fixture_state();
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 200..210 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Loading {
+            attempt: 1,
+            only_local: false,
+        };
+        start_hunt(&mut app, CHAT, MessageId(1));
+
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(Vec::new())).effects;
+
+        assert!(
+            matches!(
+                app.conversations[&CHAT].paging,
+                PagingState::Loading { attempt: 2, .. }
+            ),
+            "the machine must still be climbing its retry ladder"
+        );
+        assert_eq!(
+            history_request_count(&effects),
+            1,
+            "the retry ladder already asked; a fallback on top of it is the \
+             duplicate dispatch: {effects:?}"
+        );
+    }
+
+    /// The second gap: any `paging` that is neither `Idle` nor `Loading`.
+    /// `on_scroll_near_top` answers `Cooldown` with nothing while
+    /// `now < until`, so the continuation's anchor move emits nothing and
+    /// the hunt stalls. `start_hunt` fires its own fallback into exactly
+    /// this state, which is how a hunt gets to be running under a cooldown
+    /// in the first place — its page then lands as a stale completion that
+    /// leaves `Cooldown` in place.
+    #[test]
+    fn a_continuation_under_a_cooldown_still_asks_for_the_next_page() {
+        let mut app = fixture_state();
+        app.now = Millis(0);
+        open(&mut app, CHAT);
+        let convo = app.conversations.get_mut(&CHAT).unwrap();
+        for id in 50..60 {
+            convo.messages.push_back(msg(id));
+        }
+        convo.paging = PagingState::Cooldown {
+            until: Millis(10_000),
+        };
+        let opening = start_hunt(&mut app, CHAT, MessageId(1));
+        assert_eq!(
+            history_request_count(&opening),
+            1,
+            "`start_hunt` already has this fallback: {opening:?}"
+        );
+
+        let page: Vec<MessageView> = (40..50).map(msg).collect();
+        let effects = apply_history_page(&mut app, CHAT, false, &Ok(page)).effects;
+
+        assert_eq!(
+            app.conversations[&CHAT].paging,
+            PagingState::Cooldown {
+                until: Millis(10_000)
+            },
+            "a page that never went through the machine leaves it alone"
+        );
+        assert_eq!(
+            history_request_count(&effects),
+            1,
+            "the continuation must not go quiet where `start_hunt` would \
+             not have: {effects:?}"
+        );
     }
 
     /// Every one of the three "the user took over navigation" cancellations
