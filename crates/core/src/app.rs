@@ -370,8 +370,18 @@ impl App {
                 // Without it the highlight stays on the message `j` was
                 // pressed from — below the viewport, invisible — and the
                 // next `↑` walks the view back down instead of moving it.
+                //
+                // `contains`, not `current`: a modal opened over selection
+                // mode (`j` then `d` before the page lands) does not leave
+                // it, and gating on the top of the stack would skip the
+                // move on a path that never self-corrects — `hunt` is
+                // cleared here, so no later page repairs it. Nor is
+                // `convo.selection.is_some()` the same question: eviction
+                // during a long hunt nulls that field while
+                // `Focus::Selection` is still on the stack, which is
+                // exactly the state this call exists to repair.
                 if let Some(target) = page.hunt_landed
-                    && matches!(self.state.focus.current(), Focus::Selection)
+                    && self.state.focus.contains(&Focus::Selection)
                 {
                     effects.extend(selection::select_landing(&mut self.state, chat_id, target));
                 }
@@ -3905,6 +3915,52 @@ mod routing {
             Some(MessageId(45)),
             "and so must the selection cursor — a highlight below the \
              viewport is a highlight the user cannot see"
+        );
+    }
+
+    /// A modal sits *on top of* `Focus::Selection` without leaving it, so
+    /// `focus.current()` answers `Modal(_)` and a gate written against it
+    /// skips the cursor move — reproducing finding 1 exactly, on a path
+    /// that never self-corrects: `hunt` is cleared on landing, so no later
+    /// page repairs the highlight.
+    ///
+    /// Reachable by pressing `j` on a reply whose quote is not loaded and
+    /// then `d` before the page arrives, which is the sequence below.
+    #[test]
+    fn a_landing_under_a_modal_still_moves_the_selection_cursor() {
+        let mut app = hunting_for_an_unloaded_quote(MessageId(45), 50..60);
+        // The delete capability only arrives via `getMessageProperties`, so
+        // the chip row does not offer Delete until it lands.
+        app.update(Action::TdResult(TdResult::MessagePropertiesLoaded {
+            chat_id: CHAT,
+            message_id: MessageId(59),
+            outcome: Ok(MessageCaps {
+                can_be_deleted_for_all_users: true,
+                ..MessageCaps::default()
+            }),
+        }));
+        app.update(Action::Key(Key::Char('d')));
+        assert!(
+            matches!(
+                app.state().focus.current(),
+                Focus::Modal(ModalKind::ConfirmDelete { .. })
+            ),
+            "the confirm modal must be up, over selection mode: {:?}",
+            app.state().focus.current()
+        );
+        assert_eq!(app.state().focus.depth(), 3);
+
+        app.update(Action::TdResult(TdResult::HistoryLoaded {
+            chat_id: CHAT,
+            only_local: false,
+            outcome: Ok((40..50).map(|id| message(1, id)).collect()),
+        }));
+
+        assert_eq!(
+            selected_message(&app),
+            Some(MessageId(45)),
+            "selection mode is still on the stack under the modal, so the \
+             landing owes it a cursor move"
         );
     }
 

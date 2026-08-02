@@ -833,8 +833,35 @@ impl FocusStack {
     }
     pub fn replace_base(&mut self, f: Focus) { self.stack[0] = f; }
     pub fn depth(&self) -> usize { self.stack.len() }
+    /// Whether `f` is anywhere in the stack, not merely on top.
+    pub fn contains(&self, f: &Focus) -> bool { self.stack.contains(f) }
 }
 ```
+
+**`current()` answers "what claims keys", `contains()` answers "what mode is
+the user in".** They differ whenever a level is pushed *over* another without
+leaving it, which is every modal and both overlays. Key routing wants
+`current()` — that is the whole point of a stack. Anything asking whether the
+user is still *in* a mode wants `contains()`, and using `current()` there is a
+silent bug rather than a compile error.
+
+The case that forced the distinction: `Chip::JumpToQuoted` starts a hunt, the
+user presses `d` before the page lands, and `Focus::Modal(ConfirmDelete)` goes
+on top of `Focus::Selection`. The landing (§7.5.3) then has to move the
+selection cursor — selection mode has not been left — but a `current()` gate
+sees `Modal(_)` and skips it, which is the finding-1 defect on a path that
+never self-corrects, since `hunt` is cleared on landing and no later page
+repairs the highlight.
+
+`convo.selection.is_some()` is *not* an equivalent gate, despite reading like
+one. Eviction during a long hunt nulls that field while `Focus::Selection` is
+still on the stack (§7.5.3), so it is `None` in precisely the state the
+landing exists to repair.
+
+`contains` compares by equality, so for the payload-carrying `Modal(_)` it
+matches an exact `ModalKind`. Every present caller asks about a payload-free
+variant; a "some modal is open" query would need its own discriminant-based
+helper rather than this one.
 
 ### 4.6 `AppState` and sub-states — `core/src/app.rs`, `core/src/state/`
 

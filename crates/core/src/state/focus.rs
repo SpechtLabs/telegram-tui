@@ -61,6 +61,24 @@ impl FocusStack {
     pub fn depth(&self) -> usize {
         self.stack.len()
     }
+    /// Whether `f` is anywhere in the stack rather than merely on top of it.
+    ///
+    /// [`Self::current`] answers "what claims keys"; this answers "what mode
+    /// is the user in". The two differ whenever a level is pushed *over*
+    /// another without leaving it, which is every modal and both overlays:
+    /// a confirm dialog over selection mode leaves `current()` reporting
+    /// `Modal(_)` while the user is still, in every sense they would
+    /// recognize, selecting a message. Routing wants `current()` — that is
+    /// what a stack is for. Anything asking whether a mode is still *active*
+    /// wants this, and reaching for `current()` there is a silent bug, not a
+    /// compile error (architecture §4.5).
+    ///
+    /// Equality-based, so `Modal(_)` matches an exact [`ModalKind`]. Every
+    /// caller today asks about a payload-free variant; "is any modal open"
+    /// would need its own discriminant-based helper.
+    pub fn contains(&self, f: &Focus) -> bool {
+        self.stack.contains(f)
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +104,40 @@ mod tests {
         assert!(!stack.pop());
         assert_eq!(stack.depth(), 1);
         assert_eq!(stack.current(), &Focus::ChatList);
+    }
+
+    #[test]
+    fn contains_sees_levels_current_cannot() {
+        let mut stack = FocusStack::new(Focus::Composer);
+        stack.push(Focus::Selection);
+        stack.push(Focus::Modal(ModalKind::ConfirmSendFile {
+            path: PathBuf::from("/tmp/x"),
+        }));
+
+        // The whole point: the user is still in selection mode, and only
+        // one of these two questions can tell.
+        assert!(stack.contains(&Focus::Selection));
+        assert_ne!(stack.current(), &Focus::Selection);
+        // The base counts too, not just the levels above it.
+        assert!(stack.contains(&Focus::Composer));
+        assert!(!stack.contains(&Focus::ChatList));
+
+        // Popping the modal off does not change the answer for Selection;
+        // popping Selection does.
+        stack.pop();
+        assert!(stack.contains(&Focus::Selection));
+        stack.pop();
+        assert!(!stack.contains(&Focus::Selection));
+
+        // Payload-carrying variants compare exactly.
+        stack.push(Focus::Modal(ModalKind::ConfirmSendFile {
+            path: PathBuf::from("/tmp/x"),
+        }));
+        assert!(stack.contains(&Focus::Modal(ModalKind::ConfirmSendFile {
+            path: PathBuf::from("/tmp/x"),
+        })));
+        assert!(!stack.contains(&Focus::Modal(ModalKind::ConfirmSendFile {
+            path: PathBuf::from("/tmp/y"),
+        })));
     }
 }
