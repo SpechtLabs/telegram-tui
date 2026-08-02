@@ -481,6 +481,38 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    /// Tripwire for a failure mode the test above cannot see: `draw` clamps
+    /// the box to `area.width` whenever content is wider than that, and a
+    /// clamped box clips an over-long row silently at the edge — no
+    /// `TRUNCATION_MARK` involved, since that constant only guards row
+    /// *count*, not row *width*. A help-row description once overflowed
+    /// this way (task 7's jump-to-quote row, caught only by eyeballing the
+    /// rendered diff) with `full_table_fits_120x40_without_truncation`
+    /// green the whole time. This mirrors `draw`'s own width computation so
+    /// it can assert what that function's doc comment on `build_content`
+    /// promises — the table actually fits a 120-wide frame, not just that
+    /// nothing got padded with an ellipsis.
+    #[test]
+    fn the_table_actually_fits_within_a_120_wide_frame() {
+        let theme = Theme::default_dark();
+        let content = build_content(&theme);
+        let max_content_width = content
+            .iter()
+            .map(line_width)
+            .max()
+            .unwrap_or(0)
+            .max(TITLE.len())
+            .max(FOOTER.len());
+        // Border column plus two columns of internal padding, both sides —
+        // the same `+ 6` `draw` uses to turn content width into box width.
+        assert!(
+            max_content_width + 6 <= 120,
+            "content is {max_content_width} columns wide; +6 for border/padding \
+             exceeds the 120-wide frame draw() clamps to, so a row would clip \
+             silently at the box edge with no TRUNCATION_MARK"
+        );
+    }
+
     #[test]
     fn small_frame_truncates_with_an_ellipsis_marker() {
         let state = fixture_state(Focus::Help);
