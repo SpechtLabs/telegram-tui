@@ -1652,6 +1652,81 @@ mod tests {
         );
     }
 
+    /// The short fill's forward walk built the anchor with
+    /// `leading_separator = false` — its separator belongs above the
+    /// viewport's first row — and then discovers it has to continue
+    /// backward after all, at which point that separator is back on screen
+    /// and has to be put back. Deleting the restore left the workspace
+    /// green while abutting the anchor's block against the older one with
+    /// no blank between them, violating spec §7.1's one-blank-row rule for
+    /// exactly the frames a near-the-end quote jump produces.
+    #[test]
+    fn the_short_fill_restores_the_anchors_block_separator() {
+        let state = fixture_state(Some(conversation(
+            numbered_history(12),
+            Scroll::AtTop {
+                message_id: MessageId(11),
+            },
+        )));
+        let rendered = render_to_string(80, 12, &state);
+        let rows: Vec<&str> = rendered.lines().collect();
+
+        let body = rows
+            .iter()
+            .position(|r| r.contains("msg 11"))
+            .expect("the anchor must be on screen");
+        // header is directly above the body; the separator above that.
+        assert!(
+            rows[body - 1].contains("Alice"),
+            "expected the anchor's header, got: {:?}",
+            rows[body - 1]
+        );
+        assert!(
+            rows[body - 2].trim().is_empty(),
+            "the anchor's block must keep its boundary blank when the fill \
+             turns around, got {:?}:\n{rendered}",
+            rows[body - 2]
+        );
+    }
+
+    /// Only five snapshots moved on this branch, all chip-letter renders:
+    /// nothing snapshots a `Scroll::AtTop` frame in either of its two
+    /// forms. These two are the baselines for the forward fill and for its
+    /// short-fill turnaround.
+    #[test]
+    fn at_top_forward_fill_80x24() {
+        let state = fixture_state(Some(conversation(
+            numbered_history(40),
+            Scroll::AtTop {
+                message_id: MessageId(10),
+            },
+        )));
+        let rendered = render_to_string(80, 24, &state);
+        assert!(
+            !rendered.contains("msg 9"),
+            "nothing older than the anchor belongs on screen:\n{rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn at_top_short_fill_falls_back_to_the_bottom_80x24() {
+        let state = fixture_state(Some(conversation(
+            numbered_history(12),
+            Scroll::AtTop {
+                message_id: MessageId(11),
+            },
+        )));
+        let rendered = render_to_string(80, 24, &state);
+        let rows: Vec<&str> = rendered.lines().collect();
+        assert!(
+            rows.last().unwrap().contains("msg 12"),
+            "too few messages are newer than the anchor for it to be \
+             top-most, so the frame falls back to bottom-anchored:\n{rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
     /// The oldest and newest `msg N` body actually printed in a frame of
     /// [`numbered_history`]. Read off the rendered cells rather than the hit
     /// map on purpose: comparing the hit map against itself proves nothing,
