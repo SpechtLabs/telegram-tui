@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/SpechtLabs/telegram-tui/compare/v0.2.0...v0.2.1) (2026-08-02)
+
+
+### Features
+
+* **ui:** keyboard navigation that stops fighting the viewport ([#10](https://github.com/SpechtLabs/telegram-tui/issues/10)) ([731667f](https://github.com/SpechtLabs/telegram-tui/commit/731667fe7741aba5bcc13109ae0b5ab78fc2d22a))
+
+
+### Bug Fixes
+
+* **docs:** replace the hand-rolled cast player with the real one ([#77](https://github.com/SpechtLabs/telegram-tui/issues/77)) ([d55eda6](https://github.com/SpechtLabs/telegram-tui/commit/d55eda65ca181888c63480e893fbae16530d1171))
+
 ## [0.2.0](https://github.com/SpechtLabs/telegram-tui/compare/v0.1.7...v0.2.0) (2026-08-01)
 
 
