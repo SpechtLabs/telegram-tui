@@ -30,7 +30,7 @@
   "homepage": "https://github.com/SpechtLabs/telegram-tui#readme",
   "devDependencies": {
     "@vuepress/bundler-vite": "2.0.0-rc.31",
-    "@vuepress/plugin-register-components": "2.0.0-rc.132",
+    "@vuepress/plugin-register-components": "2.0.0-rc.135",
     "http-server": "^14.1.1",
     "markdown-it-container": "^4.0.0",
     "sass-embedded": "^1.100.0",
