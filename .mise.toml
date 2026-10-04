@@ -17,7 +17,7 @@ pinact = "4.1.0"
 # markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
 # and `mise run docs-build` locally are exactly what CI does.
 bun = "1.3.14"
-markdownlint-cli2 = "0.23.2"
+markdownlint-cli2 = "0.23.3"
 
 # Records the `tgt --demo` asciinema cast committed alongside the demo driver
 # script (see `crates/app/src/demo/`'s module docs and `scripts/record-demo.sh`).
