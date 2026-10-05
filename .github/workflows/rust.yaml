@@ -44,13 +44,14 @@ env:
   # and downloads it again.
   # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
   MISE_VERSION: 2026.10.2
-  # Every tool a Linux job runs. mise-action keys its cache on install_args,
-  # so one list means one cache: main's runs save it and every pull request
-  # restores it, rather than each job keeping a copy of its own subset. The
-  # Rust toolchain itself lives outside mise's cache (see "Cache the Rust
-  # toolchain"). macOS has a mise cache of its own anyway and installs only
-  # what its steps run.
-  MISE_TOOLS: rust cargo-insta aqua:taiki-e/cargo-llvm-cov yamllint actionlint shellcheck
+  # The tools every Linux job runs. mise-action keys its cache on
+  # install_args, so a shared list means a shared cache: main's runs save it
+  # and every pull request restores it. Rust is the exception: its toolchain
+  # lives in ~/.rustup, outside mise's cache, so only the jobs that build Rust
+  # add it, and they save the toolchain cache alongside (see "Cache the Rust
+  # toolchain"). A job that installed Rust without saving the toolchain would
+  # save a mise cache that claims a toolchain ~/.rustup doesn't have.
+  MISE_TOOLS: yamllint actionlint shellcheck
 
 jobs:
   lint:
@@ -122,7 +123,9 @@ jobs:
         uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: ${{ runner.os == 'Linux' && env.MISE_TOOLS || 'rust cargo-insta' }}
+          # macOS has a mise cache of its own anyway, and installs only what
+          # its steps run.
+          install_args: ${{ runner.os == 'Linux' && format('{0} rust cargo-insta aqua:taiki-e/cargo-llvm-cov', env.MISE_TOOLS) || 'rust cargo-insta' }}
 
       # The prebuilt TDLib that `download-tdlib` fetches for Linux is linked
       # against LLVM's libc++, which the Ubuntu image does not ship, so every
@@ -132,6 +135,11 @@ jobs:
       - name: Install libc++ (Linux TDLib runtime dependency)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
+
+      # The backstop for the two caches disagreeing (.mise.toml explains the
+      # task). It runs before rust-cache, whose first act is a cargo call.
+      - name: Make sure the toolchain has its components
+        run: mise run toolchain
 
       # rust-cache keys on the toolchain and the lockfile, and drops the
       # workspace's own build output before it saves, so the cache holds the

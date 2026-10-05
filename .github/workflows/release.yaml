@@ -373,6 +373,12 @@ jobs:
           version: ${{ env.MISE_VERSION }}
           install_args: rust
 
+      # See rust.yaml: the backstop for the toolchain cache and mise's
+      # disagreeing. Every tag since v0.1.2 has the task.
+      - name: Make sure the toolchain has its components
+        if: steps.decide.outputs.skip_build != 'true'
+        run: mise run toolchain
+
       # libc++ is TDLib's own C++ runtime (see the note in rust.yaml); the linker
       # needs it present to resolve libtdjson's dependencies, and package.sh
       # copies it into the tarball so users do not. patchelf is what gives the

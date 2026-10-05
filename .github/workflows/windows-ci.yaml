@@ -117,6 +117,11 @@ jobs:
           version: ${{ env.MISE_VERSION }}
           install_args: rust cargo-insta
 
+      # See rust.yaml: the backstop for the two caches disagreeing, before
+      # rust-cache's first cargo call.
+      - name: Make sure the toolchain has its components
+        run: mise run toolchain
+
       # See rust.yaml. Fewer, larger files also keep "Post Cache" short here,
       # where Git's tar.exe is punishingly slow over many small ones.
       - name: Cache cargo registry and dependencies
