@@ -2295,18 +2295,18 @@ toml = "=1.1.6"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
-tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "f059e936623c2eb0ca67f6ae3301487c9443ffd0", default-features = false, features = ["opentelemetry"] }
-opentelemetry = { version = "=0.32.0", default-features = false, features = ["logs"] }
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["logs", "internal-logs"] }
-opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
-opentelemetry-appender-tracing = "=0.32.0"
-reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "c43e7f7557b19e37cd0404c695e69ec1e77a390b", default-features = false, features = ["opentelemetry"] }
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["logs"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["logs", "internal-logs"] }
+opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry-appender-tracing = "=0.33.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
 
 [dev-dependencies]
 insta = { workspace = true }
 tempfile = "=3.27.0"
 axum = "=0.8.9"
-opentelemetry-proto = { version = "=0.32.0", features = ["gen-tonic-messages", "trace", "logs"] }
+opentelemetry-proto = { version = "=0.33.0", features = ["gen-tonic-messages", "trace", "logs"] }
 prost = "=0.14.4"
 ```
 
@@ -2330,7 +2330,8 @@ Notes:
   and the rule is stated once in both modules — a battery that takes the global
   subscriber cannot be used here, a battery that does not can.
 - `tracing-batteries` is not on crates.io; pinned to commit
-  `f059e936623c2eb0ca67f6ae3301487c9443ffd0` (repo HEAD, 2026-07-21), with
+  `c43e7f7557b19e37cd0404c695e69ec1e77a390b` (repo HEAD, 2026-09-29; it moved
+  the stack to sentry 0.49 and OpenTelemetry 0.33), with
   `default-features = false, features = ["sentry"]`. The `opentelemetry`
   feature is off because that battery is unusable (above) and turning it on
   would drag in tonic and gRPC for nothing.
@@ -2338,9 +2339,10 @@ Notes:
   on it with `default-features = false`, which drops `panic`, `backtrace`,
   `contexts`, and `debug-images` — every integration that makes a crash reporter
   one. Cargo unifies features across the graph, so pinning the same version here
-  widens the set without a second copy of the crate. It does pull a second
-  `reqwest` major (0.13 for Sentry's transport alongside 0.12 for the OTLP
-  exporter's), which is a real cost accepted for a working uploader.
+  widens the set without a second copy of the crate. Sentry 0.49 and the OTLP
+  exporter 0.33 both use `reqwest` 0.13; batteries itself still depends on
+  0.12 directly, so a second `reqwest` major is compiled, a real cost accepted
+  for a working uploader.
 - The four `opentelemetry*` crates are the stack `tracing-batteries` wraps,
   driven directly by `app/src/otel.rs` (T49). The battery itself is unusable
   here: `OpenTelemetry::setup` calls `.init()` on a registry it builds
@@ -2349,7 +2351,8 @@ Notes:
   shipped, which is the leak §13.2 exists to prevent. `reqwest` is a direct
   dependency for its feature flags alone (the exporter's blocking HTTP client
   needs a TLS backend); no code in this workspace names it. The pins match the
-  versions `tracing-batteries` resolves, so nothing is compiled twice.
+  versions `tracing-batteries` resolves, so no OpenTelemetry crate is compiled
+  twice.
 - `axum` + `opentelemetry-proto` + `prost` exist only for the CI allowlist test
   (§13.8): an in-process OTLP collector stub that decodes export requests and
   drains attribute keys.
