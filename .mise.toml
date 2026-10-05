@@ -11,7 +11,7 @@
 # project would silently build on stable.
 rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-insta" = "1.48.0" # snapshot review workflow
-pinact = "4.1.0"
+pinact = "4.1.1"
 
 # Documentation website (docs/): VuePress builds under bun, and the same
 # markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
