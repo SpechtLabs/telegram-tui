@@ -342,8 +342,11 @@ impl ImageArea {
         }
 
         let built = match capability {
+            // The last argument is kitty's zlib transmission compression,
+            // which ratatui-image only uses when the terminal was probed for
+            // it; nothing here probes, so it stays off.
             Capability::Kitty => {
-                Kitty::new(image, size, next_kitty_id(), false).map(Protocol::Kitty)
+                Kitty::new(image, size, next_kitty_id(), false, false).map(Protocol::Kitty)
             }
             Capability::Iterm2 => Iterm2::new(image, size, false).map(Protocol::ITerm2),
             Capability::Sixel => Sixel::new(image, size, false).map(Protocol::Sixel),
