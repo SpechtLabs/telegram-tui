@@ -15,7 +15,7 @@ tdlib-rs = { version = "=1.4.0", default-features = false, features = ["download
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "process"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.2"
-clap = { version = "=4.6.4", features = ["derive"] }
+clap = { version = "=4.6.7", features = ["derive"] }
 color-eyre = "=0.6.5"
 etcetera = "=0.11.0"
 # Default features are deliberate and sufficient on all three platforms: the
@@ -25,12 +25,12 @@ etcetera = "=0.11.0"
 # target here would only restate what keyring already does. On non-Apple unix
 # the Secret Service store needs a provider running (gnome-keyring, KWallet,
 # KeePassXC) — see `keychain::db_key`, which has no fallback for its absence.
-keyring = "=4.1.5"
+keyring = "=4.2.0"
 arboard = "=3.6.1"
-rand = "=0.10.2"
+rand = "=0.10.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "=1.1.4"
+toml = "=1.1.6"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
