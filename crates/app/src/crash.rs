@@ -167,6 +167,33 @@ impl CrashReporter {
 pub fn init(enabled: bool) -> Option<CrashReporter> {
     let dsn = dsn(enabled)?;
 
+    // `ClientOptions` is `#[non_exhaustive]`, so it is built from its default
+    // rather than with a struct expression.
+    let mut options = ClientOptions::default();
+    options.release = Some(concat!("telegram-tui@v", env!("CARGO_PKG_VERSION")).into());
+    options.environment = Some(
+        if cfg!(debug_assertions) {
+            "Development"
+        } else {
+            "Customer"
+        }
+        .into(),
+    );
+    options.default_integrations = true;
+    options.attach_stacktrace = true;
+    // No IP address, no username, no request bodies. The pseudonymous
+    // `install.id` the OTLP path uses is deliberately *not* attached here
+    // either: correlating a crash with a usage session is not worth giving the
+    // two egresses a shared key.
+    options.send_default_pii = false;
+    options.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    options.before_send = Some(Arc::new(|mut event| {
+        // Sentry fills this with the machine's hostname, which on a personal
+        // laptop is usually a person's name.
+        event.server_name = None;
+        Some(event)
+    }));
+
     let session = Session::new("telegram-tui", env!("CARGO_PKG_VERSION"))
         // Distinguishes a report from a `cargo run` during development from
         // one off a released binary. `Metadata`'s own default already
@@ -181,36 +208,7 @@ pub fn init(enabled: bool) -> Option<CrashReporter> {
                 "Customer"
             },
         )
-        .with_battery(Sentry::new((
-            dsn,
-            ClientOptions {
-                release: Some(concat!("telegram-tui@v", env!("CARGO_PKG_VERSION")).into()),
-                environment: Some(
-                    if cfg!(debug_assertions) {
-                        "Development"
-                    } else {
-                        "Customer"
-                    }
-                    .into(),
-                ),
-                default_integrations: true,
-                attach_stacktrace: true,
-                // No IP address, no username, no request bodies. The
-                // pseudonymous `install.id` the OTLP path uses is
-                // deliberately *not* attached here either: correlating a
-                // crash with a usage session is not worth giving the two
-                // egresses a shared key.
-                send_default_pii: false,
-                shutdown_timeout: SHUTDOWN_TIMEOUT,
-                before_send: Some(Arc::new(|mut event| {
-                    // Sentry fills this with the machine's hostname, which
-                    // on a personal laptop is usually a person's name.
-                    event.server_name = None;
-                    Some(event)
-                })),
-                ..Default::default()
-            },
-        )));
+        .with_battery(Sentry::new((dsn, options)));
 
     tracing::debug!("crash reporting enabled"); // deliberately without the DSN
     Some(CrashReporter { session })
