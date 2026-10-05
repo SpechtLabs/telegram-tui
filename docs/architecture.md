@@ -2185,13 +2185,13 @@ repository = "https://github.com/SpechtLabs/telegram-tui"
 [workspace.dependencies]
 tgt-core = { path = "crates/core" }
 tgt-ui = { path = "crates/ui" }
-tokio = "=1.53.1"
+tokio = "=1.53.2"
 async-trait = "=0.1.92"
-thiserror = "=2.0.19"
+thiserror = "=2.0.21"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tracing = "=0.1.44"
-insta = { version = "=1.48.0", features = ["json"] }
+insta = { version = "=1.49.0", features = ["json"] }
 
 [profile.release]
 lto = "thin"
@@ -2239,14 +2239,14 @@ ratatui = "=0.30.2"
 crossterm = "=0.29.0"
 unicode-segmentation = "=1.13.3"
 unicode-width = "=0.2.2"
-lru = "=0.18.1"
+lru = "=0.18.5"
 qrcode = "=0.14.1"
-ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "=0.25.10"
-jiff = "=0.2.35"
+jiff = "=0.2.37"
 nucleo = "=0.5.0"
 serde = { workspace = true }
-toml = "=1.1.4"
+toml = "=1.1.6"
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -2283,15 +2283,15 @@ tdlib-rs = { version = "=1.4.0", default-features = false, features = ["download
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "process"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.2"
-clap = { version = "=4.6.4", features = ["derive"] }
+clap = { version = "=4.6.7", features = ["derive"] }
 color-eyre = "=0.6.5"
 etcetera = "=0.11.0"
-keyring = "=4.1.5"
+keyring = "=4.2.0"
 arboard = "=3.6.1"
-rand = "=0.10.2"
+rand = "=0.10.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "=1.1.4"
+toml = "=1.1.6"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
