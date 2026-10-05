@@ -89,13 +89,15 @@ class Tgt < Formula
   # Homebrew strips a single top-level directory when it stages an archive, so
   # by the time this runs the working directory already *is* the contents of
   # the tarball's tgt/ — globbing "tgt/*" matches nothing, and v0.1.4 installed
-  # an empty libexec and a dangling bin symlink because of it. The dotfile glob
-  # is separate because Ruby's Dir["*"] skips dotfiles, which would silently
-  # drop the .tgt-install marker that \`tgt update\` reads to confirm a tree is
-  # ours. Dir returns [] when it matches nothing, so this stays correct for
-  # releases predating the marker.
+  # an empty libexec and a dangling bin symlink because of it. The marker is
+  # named on its own because Ruby's Dir["*"] skips dotfiles, which would
+  # silently drop the .tgt-install marker that \`tgt update\` reads to confirm a
+  # tree is ours. It's a plain path rather than a Dir glob, as brew style
+  # wants: the release workflow renders this formula from the tag it
+  # publishes, and package.sh at every tag with this template writes the
+  # marker.
   def install
-    libexec.install Dir["*"] + Dir[".tgt-install"]
+    libexec.install Dir["*"] + [".tgt-install"]
     bin.install_symlink libexec/"bin/tgt"
   end
 

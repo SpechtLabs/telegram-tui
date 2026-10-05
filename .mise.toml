@@ -2,26 +2,57 @@
 #
 # The tasks below are the single definition of "how this project is built and
 # checked". CI calls exactly these, so a green `mise run check` locally means a
-# green pipeline.
+# green pipeline. Renovate keeps every pin in this file current.
+
+[settings]
+# The pins below are the only source of tool versions. Without this, mise
+# would also read rust-toolchain.toml (and an .nvmrc, should one appear) and
+# could disagree with what CI installs.
+idiomatic_version_file_enable_tools = []
 
 [tools]
 # Rust has to be pinned here as well as in rust-toolchain.toml: a global mise
 # config may set `rust = "stable"`, and whichever mise config wins exports
 # RUSTUP_TOOLCHAIN, which overrides rust-toolchain.toml. Without this entry the
-# project would silently build on stable.
-rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
-"cargo:cargo-insta" = "1.48.0" # snapshot review workflow
-pinact = "4.1.0"
+# project would silently build on stable. rust-toolchain.toml stays so plain
+# `cargo` outside a mise shell picks the same compiler; Renovate moves both in
+# one PR. CI installs the minimal profile, so the components the lint and
+# coverage tasks need are listed. The workflows read this line to key their
+# toolchain cache, so keep it on one line.
+rust = { version = "1.99.0", components = "rustfmt,clippy,llvm-tools" }
+# Rust coverage for Codecov (see the coverage task); it needs the llvm-tools
+# component above.
+"aqua:taiki-e/cargo-llvm-cov" = "0.9.1"
+# Snapshot review workflow (see the snapshots task). A prebuilt binary: the
+# cargo backend compiled it from source on every cold CI cache.
+cargo-insta = "1.49.0"
+
+# Pre-commit for Git hooks
+pre-commit = "4.6.2"
+
+# Linters for what isn't Rust (see the lint task).
+yamllint = "1.38.0"
+actionlint = "1.7.12"
+# actionlint runs shellcheck on every `run:` script when it's on PATH, and
+# silently skips them when it isn't.
+shellcheck = "0.11.0"
+
+# Pins GitHub Actions to commit SHAs (see the update-gha task)
+pinact = "5.0.0"
 
 # Documentation website (docs/): VuePress builds under bun, and the same
 # markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
 # and `mise run docs-build` locally are exactly what CI does.
-bun = "1.3.14"
-markdownlint-cli2 = "0.23.2"
+# markdownlint-cli2 is an npm package, which mise installs with this node.
+bun = "1.4.2"
+node = "24.21.0"
+markdownlint-cli2 = "0.23.3"
 
 # Records the `tgt --demo` asciinema cast committed alongside the demo driver
 # script (see `crates/app/src/demo/`'s module docs and `scripts/record-demo.sh`).
 # Not part of the build; a dev-time tool the same way pinact/cargo-insta are.
+# It has no Windows build, which is one reason CI installs only the tools each
+# job runs (install_args in the workflows) rather than everything here.
 "aqua:asciinema/asciinema" = "3.2.1"
 
 [env]
@@ -47,18 +78,21 @@ TGT_SENTRY_DSN = "{% if env.TGT_SENTRY_DSN %}{{ env.TGT_SENTRY_DSN }}{% else %}h
 # hit mise therefore reports "all tools are installed", skips the install that
 # would add the components above, and the first cargo call makes rustup fetch a
 # bare toolchain instead. `cargo fmt` then fails with "'cargo-fmt' is not
-# installed for the toolchain" on exactly the CI runs that hit the cache. This
-# task closes that gap: it is idempotent, costs nothing when the components are
-# already present, and installs the toolchain if it is missing entirely.
+# installed for the toolchain" on exactly the CI runs that hit the cache. The
+# workflows now cache ~/.rustup by the pinned version and components as well,
+# but the two caches can still disagree (one evicted, the other not), so this
+# task stays as the backstop: it is idempotent, costs nothing when the
+# components are already present, and installs the toolchain if it is missing
+# entirely.
 [tasks.toolchain]
-description = "Ensure the pinned toolchain has rustfmt and clippy (idempotent)"
+description = "Ensure the pinned toolchain has rustfmt, clippy and llvm-tools (idempotent)"
 # `sh` is dash on Ubuntu (no `pipefail`) and cmd on Windows; pin bash so one
 # body works on all three. Windows runners get it from Git for Windows.
 shell = "bash -c"
 run = '''
 set -eu
 channel="${RUSTUP_TOOLCHAIN:-$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)}"
-rustup toolchain install "$channel" --component rustfmt --component clippy --no-self-update
+rustup toolchain install "$channel" --component rustfmt --component clippy --component llvm-tools --no-self-update
 '''
 
 [tasks.fmt]
@@ -81,16 +115,40 @@ run = "cargo fmt --all -- --check"
 # `run` and `package` deliberately do not do this: those produce the artifacts
 # that are meant to report.
 
-[tasks.lint]
+[tasks.clippy]
 description = "Clippy across every target, warnings are errors (gate 2)"
 depends = ["toolchain"]
 env = { TGT_SENTRY_DSN = "" }
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
+# CI runs the four as steps of their own, so a failure names itself; on
+# macOS and Windows only the two Rust ones, since YAML and workflows read the
+# same everywhere.
+[tasks.lint]
+description = "Every lint: rustfmt, clippy, YAML and workflows"
+depends = ["fmt-check", "clippy", "yaml-lint", "actionlint"]
+
+[tasks.yaml-lint]
+description = "Lint every YAML file in the repository"
+run = "yamllint --strict ."
+
+[tasks.actionlint]
+description = "Lint the GitHub Actions workflows"
+run = "actionlint"
+
 [tasks.test]
 description = "Run the whole test suite (gate 3)"
 env = { TGT_SENTRY_DSN = "" }
 run = "cargo test --workspace"
+
+# The tests `test` runs, instrumented by cargo-llvm-cov, into one lcov report
+# that CI uploads to Codecov. The instrumented build has a target directory
+# of its own (target/llvm-cov-target), so it doesn't invalidate `test`'s.
+[tasks.coverage]
+description = "Run the test suite under cargo-llvm-cov and write lcov.info"
+depends = ["toolchain"]
+env = { TGT_SENTRY_DSN = "" }
+run = "cargo llvm-cov --workspace --locked --lcov --output-path lcov.info"
 
 [tasks.boundaries]
 description = "Assert the crate dependency boundaries hold (gate 4)"
@@ -101,8 +159,8 @@ description = "Assert crates/app/src/update.rs and the release workflow agree on
 run = "./scripts/check-release-identity.sh"
 
 [tasks.check]
-description = "The definition of done: every gate that must pass before merging"
-depends = ["fmt-check", "lint", "test", "boundaries", "release-identity"]
+description = "The definition of done: every gate CI runs"
+depends = ["lint", "test", "snapshots", "boundaries", "release-identity"]
 
 [tasks.snapshots]
 description = "Fail on any pending insta snapshot (take them with `cargo insta accept`)"
@@ -230,6 +288,8 @@ description = "Build the documentation website (the docs workflow's second job)"
 depends = ["docs-install-script", "docs-copy-demo-cast"]
 run = "cd docs && bun install --frozen-lockfile && bun run build"
 
+# Pins without moving versions; Renovate moves them afterwards. StaticPages-Upload
+# tracks its main branch, pinned by hand like in the other SpechtLabs repos.
 [tasks.update-gha]
-description = "Update GithubActions to latest version and pin their commit sha"
-run = "pinact run -u -e 'cosign-installer'"
+description = "Pin GitHub Actions to commit SHAs (Renovate keeps them current afterwards)"
+run = "pinact run -e 'SpechtLabs/StaticPages-Upload'"

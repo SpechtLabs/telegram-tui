@@ -425,12 +425,14 @@ mod tests {
 
     /// A fresh path under the OS temp dir. `tgt-ui` carries no `tempfile`
     /// dev-dependency (only `tgt-app` does; see `crates/ui/Cargo.toml`), so
-    /// tests write directly under `std::env::temp_dir()` with a
-    /// counter-suffixed name to avoid collisions between tests running in
-    /// parallel.
+    /// tests write directly under `std::env::temp_dir()` with a name carrying
+    /// the process id and a counter, to avoid collisions between tests running
+    /// in parallel, in this process or in another test run of the same binary
+    /// (`mise run check` runs `test` and `snapshots` side by side).
     fn scratch_path(name: &str) -> PathBuf {
         let n = TEST_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        std::env::temp_dir().join(format!("tgt-ui-image-test-{n}-{name}"))
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("tgt-ui-image-test-{pid}-{n}-{name}"))
     }
 
     /// Writes a synthetic PNG, `width` x `height`, generated in-memory with

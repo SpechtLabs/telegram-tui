@@ -2215,10 +2215,12 @@ mod tests {
     /// Writes a synthetic PNG under the OS temp dir and returns its path.
     /// `tgt-ui` carries no `tempfile` dev-dependency (see
     /// `crates/ui/Cargo.toml`), so this mirrors `render::image`'s own tests:
-    /// a counter-suffixed name, so tests running in parallel cannot collide.
+    /// a name carrying the process id and a counter, so tests running in
+    /// parallel cannot collide, in this process or in another run of it.
     fn scratch_png(width: u32, height: u32) -> PathBuf {
         let n = TEST_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let path = std::env::temp_dir().join(format!("tgt-ui-conversation-image-{n}.png"));
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("tgt-ui-conversation-image-{pid}-{n}.png"));
         let img = image::RgbImage::from_fn(width, height, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 200])
         });

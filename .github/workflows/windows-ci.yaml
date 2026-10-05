@@ -1,0 +1,148 @@
+name: Windows CI
+
+# Split out of the CI matrix (task #75). Windows used to be a third leg of it,
+# kept non-gating with `continue-on-error`. That stopped a red Windows job
+# *failing* a release, but not *delaying* one: release.yaml's `build` job
+# needs the whole called workflow to finish, and a called workflow does not
+# report done until every job inside it does, `continue-on-error` or not.
+# Windows is reliably the slowest leg here — Defender scans every file cargo
+# writes and NTFS charges more per file — so every release and every repair
+# sat waiting on a platform that ships no artifact and gates nothing.
+#
+# This file is not `workflow_call`-able and release.yaml does not reference
+# it, so nothing downstream ever waits on it. Coverage is preserved rather
+# than traded away for that: it runs on pull requests like ci.yaml, and on a
+# direct push to main, since there is no release run to piggyback on, so a
+# Windows regression is still caught at the commit that introduced it. It is
+# advisory: it runs, it reports, and it gates nothing. Nothing forces a red
+# run here to be fixed, so it can rot unnoticed — check it before believing
+# the platform still builds, and if it is red for long, either fix it or drop
+# the job. A permanently red advisory job is worse than no job.
+#
+# macOS and Linux stay in rust.yaml: they ship release artifacts
+# (release.yaml) and release.yaml's build job genuinely needs them to pass
+# first.
+
+on:
+  # The same exclusions as ci.yaml, which explains them.
+  pull_request:
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!assets/**"
+      - "!**.md"
+      - "!LICENSE"
+  push:
+    branches: [main]
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!assets/**"
+      - "!**.md"
+      - "!LICENSE"
+
+permissions:
+  contents: read
+
+# Never called from another workflow (see above), so `github.workflow`
+# always resolves to this workflow's own name here — none of the deadlock
+# risk rust.yaml's header documents for a `workflow_call`'d file. Always
+# cancelling a superseded run (on `push` too, not just `pull_request`) is safe
+# specifically because nothing depends on this job completing: it ships no
+# artifact and blocks no release, unlike release.yaml's own runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Only the tools the steps below run. asciinema in .mise.toml has no
+  # Windows build, and installing everything there is what turned this job
+  # red: "Failed to install aqua:asciinema/asciinema@3.2.1: unsupported env:
+  # windows/amd64".
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+  # mise itself, pinned; rust.yaml explains why.
+  # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
+  MISE_VERSION: 2026.10.2
+
+jobs:
+  check:
+    name: Checks (windows-latest)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Defender scans every file synchronously as it is written, and a debug
+      # build of this workspace writes hundreds of thousands of small ones
+      # (rlibs, object files, fingerprints, dep-info). That tax is the single
+      # largest reason this job takes multiples of the Linux leg for
+      # identical work. Excluding the two directories cargo writes into is
+      # the standard mitigation; it applies only to this ephemeral runner,
+      # which is destroyed after the job, and only to paths we produce
+      # ourselves.
+      - name: Exclude the cargo directories from Defender
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionProcess "rustc.exe"
+          Add-MpPreference -ExclusionProcess "cargo.exe"
+
+      # See rust.yaml: the toolchain lives in ~/.rustup, outside mise's cache.
+      - name: Read the pinned Rust version
+        id: rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          components="$(sed -n 's/^rust = {.*components = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          # A cache key can't hold commas.
+          echo "components=${components//,/-}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache the Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup/toolchains/${{ steps.rust.outputs.version }}-*
+            ~/.rustup/update-hashes/${{ steps.rust.outputs.version }}-*
+          key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ steps.rust.outputs.components }}
+
+      - name: Set up mise
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: rust cargo-insta
+
+      # See rust.yaml: the backstop for the two caches disagreeing, before
+      # rust-cache's first cargo call.
+      - name: Make sure the toolchain has its components
+        run: mise run toolchain
+
+      # See rust.yaml. Fewer, larger files also keep "Post Cache" short here,
+      # where Git's tar.exe is punishingly slow over many small ones.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Same gates as rust.yaml, same reason each is its own step: a failure
+      # names itself in the UI, and the commands live in .mise.toml so
+      # `mise run check` locally runs this set. No "Crate boundaries" step —
+      # rust.yaml already runs it once, on Linux, and the dependency graph it
+      # checks does not vary by platform.
+      - name: Formatting
+        run: mise run fmt-check
+
+      - name: Clippy
+        run: mise run clippy
+
+      - name: Tests
+        run: mise run test
+
+      - name: Pending snapshots
+        run: mise run snapshots

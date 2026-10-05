@@ -8,6 +8,11 @@ on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize]
 
+env:
+  # mise itself, pinned; rust.yaml explains why.
+  # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
+  MISE_VERSION: 2026.10.2
+
 jobs:
   pr-title:
     name: Validate PR title
@@ -23,7 +28,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           # Scopes are optional; when present they should name the crate or
-          # area the change lands in.
+          # area the change lands in. `main` is release-please's own: its
+          # pull requests are titled `chore(main): release x.y.z`, and with
+          # RELEASE_PLEASE_TOKEN they run this check like any other.
           scopes: |
             core
             ui
@@ -31,7 +38,11 @@ jobs:
             docs
             ci
             deps
+            release
+            main
 
+      # When the previous step fails the job would stop; always() lets it post
+      # the error message as a comment.
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         if: always() && (steps.lint_pr_title.outputs.error_message != null)
         with:
@@ -44,17 +55,53 @@ jobs:
             While this project is pre-1.0, a `!`/`BREAKING CHANGE` bumps the minor version and
             everything else bumps the patch.
 
-            ```
+            ```text
             ${{ steps.lint_pr_title.outputs.error_message }}
             ```
 
             Examples: `feat(ui): show delivery receipts`, `fix(core): stop paging past the oldest message`.
 
+      # Delete the previous comment once the title is fixed.
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         if: ${{ steps.lint_pr_title.outputs.error_message == null }}
         with:
           header: pr-title-lint-error
           delete: true
+
+  # The squash commit's body is the PR description, and release-please drops a
+  # commit whose message its parser can't read, without failing the release.
+  # This runs release-please's own parser over the message the merge will
+  # create; .github/commit-lint/check.ts explains the failure it catches.
+  #
+  # pull_request_target checks out the base branch, so the script that runs is
+  # main's; the PR only supplies the title and body, as data in env.
+  commit-message:
+    name: Validate squash commit message
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: bun
+
+      - name: Install release-please
+        working-directory: .github/commit-lint
+        run: bun install --frozen-lockfile
+
+      - name: Parse the squash commit message
+        working-directory: .github/commit-lint
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bun check.ts
 
   labeler:
     name: Label PR

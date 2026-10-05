@@ -8,17 +8,17 @@ The build is a handful of mise tasks, CI runs the same ones, and a green `mise r
 ## The gate
 
 ```shell
-mise run check      # fmt-check, clippy, tests, crate boundaries
+mise run check      # every gate CI runs: lint, tests, snapshots, crate boundaries
 mise run test       # just the tests
 mise run run        # the client, from source
 mise tasks          # everything available
 ```
 
-Four gates sit behind `check`: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `./scripts/check-crate-boundaries.sh`. All four have to pass before anything merges.
+`check` runs every gate CI runs: `mise run lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, yamllint and actionlint), `cargo test --workspace`, the pending-snapshot check, `./scripts/check-crate-boundaries.sh`, and the release signing-identity check. All of them have to pass before anything merges.
 
 The last one is worth explaining. It greps `cargo tree` and fails if `tgt-core` has picked up `ratatui` or `crossterm`, or if `tgt-ui` has picked up `tdlib-rs`. Those bans are what keep the domain testable without a terminal and the renderer testable without a network, and a transitive dependency can break them by accident, so they're checked rather than trusted.
 
-Toolchain comes from mise: Rust 1.97.1 and cargo-insta 1.48.0, both pinned exactly. `rust-toolchain.toml` pins the compiler independently so plain `cargo` picks the right one outside a mise shell. Editing `.mise.toml` needs a `mise trust` before the tasks run again.
+Toolchain comes from mise: Rust 1.99.0 and cargo-insta 1.49.0, pinned exactly like every other tool in `.mise.toml`. `rust-toolchain.toml` pins the compiler independently so plain `cargo` picks the right one outside a mise shell. Editing `.mise.toml` needs a `mise trust` before the tasks run again.
 
 ## Your build sends no crash reports
 

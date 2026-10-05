@@ -22,14 +22,30 @@ documentation:
           - "**/*.md"
           - "docs/**"
 
+# Build, release, and CI plumbing
 ci:
   - changed-files:
       - any-glob-to-any-file:
           - ".github/**"
           - ".mise.toml"
           - "scripts/**"
+          - "rust-toolchain.toml"
           - ".release-please-config.json"
           - ".release-please-manifest.json"
+          - ".pre-commit-config.yaml"
+          - ".markdownlint-cli2.yaml"
+          - ".yamllint.yaml"
+          - ".editorconfig"
+          - "codecov.yml"
+          - "renovate.json"
+
+# The docs site's build: VuePress config, theme and dependencies
+docs-site:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/.vuepress/**"
+          - "docs/package.json"
+          - "docs/bun.lock"
 
 tests:
   - changed-files:
