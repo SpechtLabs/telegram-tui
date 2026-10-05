@@ -19,8 +19,8 @@ Three documents outrank the code, and two of them are load-bearing when making c
 `.mise.toml` holds the task definitions and CI calls those same tasks, so a green `mise run check` locally means a green pipeline. Prefer them over raw cargo invocations:
 
 ```sh
-mise run check       # fmt-check + lint + test + boundaries: the merge gate
-mise run test        # or fmt-check / lint / boundaries individually
+mise run check       # every gate CI runs: lint + test + snapshots + boundaries + release-identity
+mise run test        # or fmt-check / clippy / lint / boundaries individually
 mise run snapshots   # fail on any pending insta snapshot
 mise run build       # release build
 mise run package     # dist/ layout + tarball + relocation proof
@@ -28,9 +28,9 @@ mise run install     # into $TGT_PREFIX (default ~/.local): bin/tgt + lib/libtdj
 mise tasks           # the full list
 ```
 
-The four gates behind `check` are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `./scripts/check-crate-boundaries.sh`. All four must pass before anything merges.
+The gates behind `check` are `mise run lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `yamllint --strict .`, `actionlint`), `cargo test --workspace`, `cargo insta test --workspace --check`, `./scripts/check-crate-boundaries.sh`, and `./scripts/check-release-identity.sh`. All must pass before anything merges. CI runs the same tasks (`.github/workflows/rust.yaml`), with the tests under `mise run coverage` on Linux for Codecov.
 
-Toolchain comes from `mise` (rust 1.97.1, cargo-insta 1.48.0, both pinned exactly). `rust-toolchain.toml` pins the compiler independently, so plain `cargo` picks the right one outside a mise shell. `cargo-insta` may need `PATH="$HOME/.local/share/mise/shims:$PATH"` or `mise exec --`. Editing `.mise.toml` requires `mise trust` before the tasks run again.
+Toolchain comes from `mise` (rust 1.99.0, cargo-insta 1.49.0, both pinned exactly). `rust-toolchain.toml` pins the compiler independently, so plain `cargo` picks the right one outside a mise shell. `cargo-insta` may need `PATH="$HOME/.local/share/mise/shims:$PATH"` or `mise exec --`. Editing `.mise.toml` requires `mise trust` before the tasks run again.
 
 Narrower runs while iterating:
 
@@ -149,7 +149,7 @@ This matters here specifically because the codebase does contain genuinely unwir
 
 The release pipeline had four independent faults, each hidden behind the one before it, and none of them in the build. If a release misbehaves, suspect plumbing before code.
 
-- **A reusable workflow inherits its caller's `github.workflow`.** `release.yaml` calls `ci.yml`, so `ci.yml`'s concurrency expression evaluated to the group its own parent held, and GitHub cancelled every release run as a deadlock. The literal `ci` segment in that group is load-bearing.
+- **A reusable workflow inherits its caller's `github.workflow`.** `release.yaml` used to call `ci.yml`, whose concurrency expression evaluated to the group its own parent held, and GitHub cancelled every release run as a deadlock. The called workflow (`rust.yaml`) therefore has no concurrency group; its callers (`ci.yaml`, and the gate job in `release.yaml`) own it.
 - **`cancel-in-progress: false` does not mean a run cannot be evicted.** GitHub keeps only one *pending* run per concurrency group — a newer run supersedes a waiting one regardless of the cancellation setting. This bit twice. First, a `workflow_dispatch` repair queued behind a push to main was evicted before it ran a single job — fixed by keying the group on `inputs.tag` for dispatch runs, so a repair and a push never share one. Second, and worse: v0.1.5 published as a tag with zero assets, because release-please had already created the tag when a later push evicted the run that would have built it. A push evicting a push, after the tag already exists, is the failure mode to design against — a stuck repair can be re-dispatched by hand; a tag with no build run behind it just sits there looking released.
 - **The `checksums` job never checks the repository out**, so `gh` has no remote to infer from and needs `GH_REPO`. v0.1.4 shipped eight assets and no `SHA256SUMS` before this was found.
 - **Windows is advisory** (`continue-on-error`). It ships no artifact, and being slowest made it the job a superseding push always cancelled. The failure mode to watch for is subtler than "nobody fixes it": an advisory job makes real failures look like environment noise, so "fails only on Windows" reads as "the test is wrong" and the natural fix launders a genuine bug into a `#[cfg]`. That already happened once, with a startup regression.

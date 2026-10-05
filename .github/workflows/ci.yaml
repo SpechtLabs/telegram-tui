@@ -1,0 +1,39 @@
+name: CI
+
+# Everything a pull request runs. The Rust gates are a workflow of their own
+# (rust.yaml), which release.yaml calls to gate every release and which runs
+# on its own from the Actions tab. Windows runs in windows-ci.yaml, which
+# nothing waits on.
+on:
+  # Skip pull requests that only touch documentation; the docs workflow covers
+  # those. The filter excludes rather than lists, so a new source directory or
+  # config file runs CI by default. assets/ holds the docs site's recording.
+  # No check is required by the rulesets, which is what makes a workflow-level
+  # filter safe: a skipped required check would block the merge.
+  pull_request:
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!assets/**"
+      - "!**.md"
+      - "!LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes its run in flight. The matrix is not
+# cheap even when it is free (macOS runners bill at 10x on private repos), and
+# a superseded run proves nothing about the current head. Nothing calls this
+# workflow, so `github.workflow` is always CI here; rust.yaml explains why the
+# called workflow has no group of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    name: Rust
+    uses: ./.github/workflows/rust.yaml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

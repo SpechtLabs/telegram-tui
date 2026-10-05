@@ -62,7 +62,7 @@ permissions:
 # A new push supersedes the run in flight. The build matrix is not cheap even
 # when it is free — macOS runners bill at 10x on private repos — and a
 # superseded run proves nothing about the current head. (Windows is not part
-# of what this run waits on — see windows-ci.yml and task #75.)
+# of what this run waits on — see windows-ci.yaml and task #75.)
 # Releases are exempt: cancelling one half-way could leave a tag published
 # with no binary attached to it.
 # Every run gets a group nothing else can occupy: a repair is keyed by the tag
@@ -86,10 +86,33 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
   cancel-in-progress: false
 
+env:
+  # Each job installs the tools it runs with mise-action's install_args; see
+  # rust.yaml.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+  # mise itself, pinned; rust.yaml explains why.
+  # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
+  MISE_VERSION: 2026.10.2
+
 jobs:
+  # The gate: the same workflow pull requests run (ci.yaml calls it too).
+  #
+  # A push to main that lands while an older push is still in its gate
+  # cancels that gate: the older run then skips release-please, which would
+  # only find that main has moved on (see "Refuse to act" below). The gate is
+  # the only job in this group, so a run that got past its gate builds and
+  # publishes to the end; nothing after it can be cancelled or evicted. The
+  # group carries no `github.workflow` of the called file's own, which is
+  # what deadlocked releases before (rust.yaml's header). Repairs key on the
+  # tag and never cancel.
   ci:
-    name: CI
-    uses: ./.github/workflows/ci.yml
+    name: Rust
+    uses: ./.github/workflows/rust.yaml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    concurrency:
+      group: ${{ github.workflow }}-gate-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'push' }}
 
   release-please:
     name: Release Please
@@ -139,98 +162,35 @@ jobs:
             echo "::notice::main has moved to $tip since this run started at ${{ github.sha }}; leaving release-please to that run."
           fi
 
+      # GitHub doesn't start workflows for what GITHUB_TOKEN does: a release
+      # pull request it opens or updates gets a CI run that waits for
+      # approval. RELEASE_PLEASE_TOKEN, a fine-grained personal access token
+      # with read and write access to this repository's contents, pull
+      # requests and issues, makes the pull request an ordinary one whose CI
+      # runs. Without the secret, release-please falls back to GITHUB_TOKEN.
+      #
+      # release-type "simple" bumps Cargo.toml's `[workspace.package]`
+      # version through the `# x-release-please-version` marker, and the
+      # three workspace crates' entries in Cargo.lock through toml
+      # extra-files (.release-please-config.json), so the lock file in the
+      # release PR is already in sync. That used to be a `cargo update
+      # --workspace` pushed to the release branch after the fact.
+      #
+      # release-please's own "rust" strategy looks like the fix and was
+      # checked against its source rather than assumed: its Cargo.toml
+      # updater requires a `[package]` table and throws ("might be a cargo
+      # workspace") on a virtual manifest like this repo's root Cargo.toml,
+      # which has only `[workspace.package]`. The cargo-workspace plugin
+      # would replace every crate's `version.workspace = true` with a
+      # hardcoded version. Hence "simple".
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release-please
         if: steps.still-current.outputs.current == 'true'
         with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      # release-type "simple" bumps Cargo.toml's `[workspace.package]`
-      # version through `extra-files`' generic marker-comment replace
-      # (`# x-release-please-version`, see Cargo.toml), but has no idea
-      # Cargo.lock exists — it is a generated file and cannot carry that
-      # marker — so nothing keeps the two in sync. Left alone, every release
-      # dirties Cargo.lock for the next clone until someone notices and
-      # regenerates it by hand (1572d33, and it will recur).
-      #
-      # release-please's own "rust" strategy looks like the fix and was
-      # checked against its source rather than assumed: its Cargo.toml
-      # updater requires a `[package]` table and throws
-      # ("might be a cargo workspace") on a virtual manifest like this
-      # repo's root Cargo.toml, which has only `[workspace.package]`. Making
-      # it work would mean reconfiguring every crate as its own
-      # release-please package plus the cargo-workspace plugin — and that
-      # plugin's own updater writes a literal `package.version` string,
-      # which on a crate using `version.workspace = true` (every crate here)
-      # would silently replace the inheritance with a hardcoded version
-      # instead of leaving it alone. Both risks are worse than a dirty lock
-      # file, so this stays release-type "simple" and gets a regeneration
-      # step instead — the honest fix when a generated file cannot carry the
-      # annotation the "correct" mechanism needs.
-      #
-      # `cargo update --workspace` cannot touch anything outside the three
-      # workspace members: every other dependency in this repo is pinned
-      # exactly (`=x.y.z` throughout the three Cargo.toml files), which
-      # forces cargo to that exact resolution regardless of what a plain
-      # `update` would otherwise prefer. So this step's only possible effect
-      # is syncing tgt-core/tgt-ui/tgt-app's own Cargo.lock entries to the
-      # version release-please just wrote above them.
-      #
-      # Pushing straight to the PR branch with the default GITHUB_TOKEN
-      # rather than opening a second PR: release-please already owns this
-      # branch, and a bot-authored push to it does not re-trigger ci.yml's
-      # `pull_request` job (GitHub does not fire `synchronize` for
-      # GITHUB_TOKEN pushes, to prevent workflow loops) — acceptable here
-      # since a lock-file sync following an already-checked version bump
-      # cannot change what fmt/lint/test would report.
-      # The PR JSON goes through the environment, never interpolated into the
-      # shell. `${{ }}` substitution happens before bash parses the line, so
-      # embedding that JSON in a quoted string means the changelog's own text
-      # becomes syntax. This release proved it: the 0.2.0 breaking-change note
-      # contains "a user's own OTLP collector", whose apostrophe closed the
-      # single quote and left the next `(` unquoted —
-      #
-      #   syntax error near unexpected token `('
-      #
-      # The step failed, the Cargo.lock sync below never ran, and PR #8 sat
-      # with a lock still saying 0.1.7. An env var is passed as data, so no
-      # release note can ever be parsed as code again.
-      - name: Extract the release PR's branch
-        id: release-branch
-        if: steps.release-please.outputs.prs_created == 'true'
-        env:
-          RELEASE_PR_JSON: ${{ steps.release-please.outputs.pr }}
-        run: echo "name=$(jq -r '.headBranchName' <<< "$RELEASE_PR_JSON")" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout the release PR branch
-        if: steps.release-please.outputs.prs_created == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.release-branch.outputs.name }}
-
-      - name: Install mise
-        if: steps.release-please.outputs.prs_created == 'true'
-        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
-        with:
-          version: 2026.6.10
-          install: true
-          cache: true
-
-      - name: Sync Cargo.lock with the version bump
-        if: steps.release-please.outputs.prs_created == 'true'
-        run: |
-          set -euo pipefail
-          cargo update --workspace
-          if git diff --quiet -- Cargo.lock; then
-            echo "Cargo.lock already in sync; nothing to push."
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.lock
-          git commit -m 'chore: sync Cargo.lock with the version bump above'
-          git push origin "HEAD:${{ steps.release-branch.outputs.name }}"
     outputs:
       release_created: ${{ steps.release-please.outputs.release_created }}
       tag_name: ${{ steps.release-please.outputs.tag_name }}
@@ -256,7 +216,7 @@ jobs:
     # tdlib-rs's `download-tdlib` publishes a prebuilt TDLib for exactly these
     # four (plus android and windows) — see its build.rs and the v1.4.0 release
     # assets — so each row has a library to download. Windows is built and
-    # tested in its own workflow, windows-ci.yml — not called from here, and
+    # tested in its own workflow, windows-ci.yaml — not called from here, and
     # not in `needs` below, precisely so this job never waits on it (task
     # #75) — but ships no artifact regardless: its loader has no rpath
     # equivalent, so the relocatable layout below has no Windows spelling, and
@@ -297,8 +257,15 @@ jobs:
       # Moved ahead of the build: the "Decide" step below needs it to check
       # whatever this target already has published, before any of the
       # expensive work below runs.
+      #
+      # Held on installer v3, which installs cosign 2.x. Installer v4 installs
+      # cosign 3, whose sign-blob writes the newer protobuf bundle by default,
+      # and the bundles this job publishes are verified by whatever cosign
+      # each user has installed (`tgt update --require-signature`). Moving
+      # needs a deliberate check of which cosign versions read the new
+      # format; Renovate holds it (renovate.json).
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       # Downloads whatever this target currently has on the release, if
       # anything — a fresh `push` release, or a repair of a target that
@@ -375,15 +342,38 @@ jobs:
             rm -f "${tarballs[0]}" "${bundles[0]}"
           fi
 
-      - name: Install mise
+      # See rust.yaml: the toolchain lives in ~/.rustup, outside mise's cache.
+      # Older tags list the components as an array, which the second sed
+      # doesn't read; the key then just lacks them.
+      - name: Read the pinned Rust version
+        id: rust
         if: steps.decide.outputs.skip_build != 'true'
-        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
-        with:
-          version: 2026.6.10
-          install: true
-          cache: true
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' .mise.toml)"
+          components="$(sed -n 's/^rust = {.*components = "\([^"]*\)".*/\1/p' .mise.toml)"
+          test -n "${version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          # A cache key can't hold commas.
+          echo "components=${components//,/-}" >> "${GITHUB_OUTPUT}"
 
-      # libc++ is TDLib's own C++ runtime (see the note in ci.yml); the linker
+      - name: Cache the Rust toolchain
+        if: steps.decide.outputs.skip_build != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.rustup/toolchains/${{ steps.rust.outputs.version }}-*
+            ~/.rustup/update-hashes/${{ steps.rust.outputs.version }}-*
+          key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ steps.rust.outputs.components }}
+
+      - name: Set up mise
+        if: steps.decide.outputs.skip_build != 'true'
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: rust
+
+      # libc++ is TDLib's own C++ runtime (see the note in rust.yaml); the linker
       # needs it present to resolve libtdjson's dependencies, and package.sh
       # copies it into the tarball so users do not. patchelf is what gives the
       # copies a $ORIGIN runpath of their own.
@@ -393,7 +383,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libc++1 libc++abi1 patchelf
 
-      # Deliberately a different key from ci.yml's. Sharing one means restoring
+      # Deliberately not rust.yaml's cache. Sharing one means restoring
       # ~1.3 GB of debug artifacts this job cannot use, and then skipping the
       # save because CI already claimed the key, so target/ would never persist
       # across releases. The target triple is in the key because each row has
@@ -450,7 +440,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          tarball="$(ls tgt-*-${TARGET}.tar.gz)"
+          tarball="$(ls tgt-*-"${TARGET}".tar.gz)"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$tarball" > "${TARGET}.sha256"
           else
@@ -468,7 +458,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          tarball="$(ls tgt-*-${TARGET}.tar.gz)"
+          tarball="$(ls tgt-*-"${TARGET}".tar.gz)"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$tarball" > "${TARGET}.sha256"
           else
@@ -481,7 +471,7 @@ jobs:
       # `checksums` job needs a line from every target regardless of which
       # ones this run rebuilt.
       - name: Upload checksum for the aggregate and the formula
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: checksum-${{ matrix.target }}
           path: dist/${{ matrix.target }}.sha256
@@ -533,7 +523,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Download the per-target checksums
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: checksum-*
           merge-multiple: true
@@ -566,7 +556,7 @@ jobs:
           ref: ${{ env.TAG }}
 
       - name: Download the per-target checksums
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: checksum-*
           merge-multiple: true

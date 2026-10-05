@@ -1,6 +1,6 @@
 # telegram-tui
 
-[![CI](https://github.com/SpechtLabs/telegram-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/SpechtLabs/telegram-tui/actions/workflows/ci.yml)
+[![CI](https://github.com/SpechtLabs/telegram-tui/actions/workflows/release.yaml/badge.svg?branch=main)](https://github.com/SpechtLabs/telegram-tui/actions/workflows/release.yaml)
 [![Release](https://img.shields.io/github/v/release/SpechtLabs/telegram-tui?include_prereleases&sort=semver)](https://github.com/SpechtLabs/telegram-tui/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 

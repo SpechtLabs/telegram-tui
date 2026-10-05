@@ -8,5 +8,5 @@
 # Naming one target here would additionally make every non-macOS machine download
 # a macOS std it can never link against.
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
