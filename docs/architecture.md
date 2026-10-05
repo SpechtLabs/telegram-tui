@@ -2186,7 +2186,7 @@ repository = "https://github.com/SpechtLabs/telegram-tui"
 tgt-core = { path = "crates/core" }
 tgt-ui = { path = "crates/ui" }
 tokio = "=1.53.1"
-async-trait = "=0.1.91"
+async-trait = "=0.1.92"
 thiserror = "=2.0.19"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
@@ -2362,19 +2362,22 @@ Notes:
 ### 6.5 `rust-toolchain.toml`, `.mise.toml`
 
 ```toml
-# rust-toolchain.toml — authoritative for the compiler
+# rust-toolchain.toml — the compiler for plain `cargo` outside mise
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
-targets = ["aarch64-apple-darwin"]
 ```
 
 ```toml
 # .mise.toml — local tooling, exact pins (repo convention)
 [tools]
-rust = "1.97.1"                # mirrors rust-toolchain.toml
-"cargo:cargo-insta" = "1.48.0" # snapshot review workflow
+rust = { version = "1.99.0", components = "rustfmt,clippy,llvm-tools" } # mirrors rust-toolchain.toml
+"aqua:taiki-e/cargo-llvm-cov" = "0.9.1"                                 # coverage for Codecov
+cargo-insta = "1.49.0"                                                  # snapshot review workflow
 ```
+
+`.mise.toml` also pins the linters, the docs toolchain and pinact; see the
+file itself. The two Rust pins move together (Renovate groups them).
 
 TDLib itself arrives through the `download-tdlib` cargo feature — no Homebrew,
 no system package, per constraint 10.
