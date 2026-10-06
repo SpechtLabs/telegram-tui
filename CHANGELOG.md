@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/SpechtLabs/telegram-tui/compare/v0.2.1...v0.2.2) (2026-10-06)
+
+
+### Bug Fixes
+
+* **deps:** bring the crates and the docs site's dependencies current ([#19](https://github.com/SpechtLabs/telegram-tui/issues/19)) ([0820f19](https://github.com/SpechtLabs/telegram-tui/commit/0820f19f3b50a1a807355242814ab23124d5ef41))
+* **deps:** move the telemetry stack to sentry 0.49 and OpenTelemetry 0.33 ([#20](https://github.com/SpechtLabs/telegram-tui/issues/20)) ([2752015](https://github.com/SpechtLabs/telegram-tui/commit/275201535e590bd667e221166b55f83c39805d13))
+
 ## [0.2.1](https://github.com/SpechtLabs/telegram-tui/compare/v0.2.0...v0.2.1) (2026-08-02)
 
 
