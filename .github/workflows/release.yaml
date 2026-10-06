@@ -116,7 +116,7 @@ jobs:
 
   release-please:
     name: Release Please
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [ci]
     if: github.event_name == 'push'
     steps:
@@ -515,7 +515,7 @@ jobs:
 
   checksums:
     name: Checksums
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [release-please, build]
     if: always() && needs.build.result == 'success'
     env:
@@ -548,7 +548,7 @@ jobs:
 
   homebrew:
     name: Update Homebrew Tap
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Waits on checksums so a release never ends up advertised by a formula it
     # has no published SHA256SUMS for.
     needs: [release-please, build, checksums]
