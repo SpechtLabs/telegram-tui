@@ -272,8 +272,8 @@ run = "cp scripts/install.sh docs/.vuepress/public/install.sh"
 description = "Copy assets/demo.cast into the docs site so the \"cast\" container can fetch it"
 # Same reasoning as docs-install-script, one source of truth: assets/demo.cast
 # is canonical, this copies it in, and docs/.vuepress/public/ is gitignored
-# for the copy so nobody edits it in place. AsciinemaCast.vue loads its `src`
-# with a runtime `fetch()`, not a build-time import, so the file has to be
+# for the copy so nobody edits it in place. docs-kit's AsciinemaCast loads its
+# `src` with a runtime `fetch()`, not a build-time import, so the file has to be
 # reachable as a static asset under the site root — `base` is "/", so it
 # lands at https://tgt.specht-labs.de/demo.cast.
 run = "cp assets/demo.cast docs/.vuepress/public/demo.cast"
