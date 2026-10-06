@@ -9,6 +9,11 @@ name: Documentation
 # tasks, and the pins the jobs install, are defined in it.
 on:
   workflow_dispatch:
+  # The home page's releases and contributors are fetched from GitHub when the
+  # site is built, so without a rebuild they go stale. The path filters below
+  # don't apply to a schedule.
+  schedule:
+    - cron: "17 4 * * *"
   push:
     branches:
       - main
@@ -86,9 +91,14 @@ jobs:
 
       - name: Build
         run: mise run docs-build
+        env:
+          # Authenticates the build-time GitHub API calls for the releases and
+          # contributors sections.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Artifacts
-        # Only the deploy job consumes this, and it runs on push/dispatch.
+        # Only the deploy job consumes this, and it runs on push, dispatch and
+        # schedule.
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -102,7 +112,7 @@ jobs:
     needs:
       - build
       - md
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' || github.event_name == 'schedule'
     permissions:
       id-token: write
       pages: write
