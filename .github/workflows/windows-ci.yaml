@@ -63,7 +63,7 @@ env:
   MISE_TASK_RUN_AUTO_INSTALL: "false"
   # mise itself, pinned; rust.yaml explains why.
   # renovate: datasource=github-releases depName=jdx/mise extractVersion=^v(?<version>.+)$
-  MISE_VERSION: 2026.10.2
+  MISE_VERSION: 2026.10.3
 
 jobs:
   check:
