@@ -13,7 +13,7 @@ lru = "=0.18.5"
 qrcode = "=0.14.1"
 ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm", "image-defaults"] }
 image = "=0.25.10"
-jiff = "=0.2.37"
+jiff = "=0.2.38"
 serde = { workspace = true }
 toml = "=1.1.6"
 tracing = { workspace = true }
