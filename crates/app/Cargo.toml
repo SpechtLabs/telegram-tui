@@ -30,7 +30,7 @@ arboard = "=3.6.1"
 rand = "=0.10.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "=1.1.6"
+toml = "=1.1.7"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
