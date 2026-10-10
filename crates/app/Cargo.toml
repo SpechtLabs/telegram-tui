@@ -69,10 +69,10 @@ sentry = { version = "=0.49.3", default-features = false, features = ["panic", "
 # Its `Sentry` battery has no such problem and *is* used. See otel.rs and
 # crash.rs module docs. Versions match the ones batteries resolves, so
 # nothing is duplicated.
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["logs"] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["logs", "internal-logs"] }
-opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
-opentelemetry-appender-tracing = "=0.33.0"
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["logs"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["logs", "internal-logs"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["logs", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry-appender-tracing = "=0.33.1"
 # Not used directly: it pins the TLS backend for the OTLP exporter's blocking
 # HTTP client, which otherwise cannot talk to an https collector.
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
@@ -91,5 +91,5 @@ arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
 insta = { workspace = true }
 tempfile = "=3.27.0"
 axum = "=0.8.9"
-opentelemetry-proto = { version = "=0.33.0", features = ["gen-tonic-messages", "trace", "logs"] }
+opentelemetry-proto = { version = "=0.33.1", features = ["gen-tonic-messages", "trace", "logs"] }
 prost = "=0.14.4"
