@@ -26,7 +26,7 @@ etcetera = "=0.11.0"
 # the Secret Service store needs a provider running (gnome-keyring, KWallet,
 # KeePassXC) — see `keychain::db_key`, which has no fallback for its absence.
 keyring = "=4.2.0"
-arboard = "=3.6.1"
+arboard = "=3.7.0"
 rand = "=0.10.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,7 +34,7 @@ toml = "=1.1.8"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
-tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "72d57e5d3f276592cb75cb3675eeb2cb512f337c", default-features = false, features = ["sentry", "human_errors"] }
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "52683628d869d8e4393900a5c3526d29a1765549", default-features = false, features = ["sentry", "human_errors"] }
 # Named directly only to turn features on. `tracing-batteries` depends on
 # sentry with `default-features = false`, which drops `panic`, `backtrace`,
 # `contexts` and `debug-images` — i.e. everything that makes a *crash*
@@ -85,7 +85,7 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["blocking
 # because the feature pulls `wl-clipboard-rs`, which arboard makes available on
 # non-Apple unix only.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-arboard = { version = "=3.6.1", features = ["wayland-data-control"] }
+arboard = { version = "=3.7.0", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 insta = { workspace = true }
