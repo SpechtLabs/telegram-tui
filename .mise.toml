@@ -19,7 +19,7 @@ idiomatic_version_file_enable_tools = []
 # one PR. CI installs the minimal profile, so the components the lint and
 # coverage tasks need are listed. The workflows read this line to key their
 # toolchain cache, so keep it on one line.
-rust = { version = "1.99.0", components = "rustfmt,clippy,llvm-tools" }
+rust = { version = "1.99.1", components = "rustfmt,clippy,llvm-tools" }
 # Rust coverage for Codecov (see the coverage task); it needs the llvm-tools
 # component above.
 "aqua:taiki-e/cargo-llvm-cov" = "0.9.1"
