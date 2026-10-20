@@ -11,7 +11,7 @@ repository = "https://github.com/SpechtLabs/telegram-tui"
 [workspace.dependencies]
 tgt-core = { path = "crates/core" }
 tgt-ui = { path = "crates/ui" }
-tokio = "=1.53.3"
+tokio = "=1.54.0"
 async-trait = "=0.1.92"
 thiserror = "=2.0.21"
 serde = { version = "=1.0.229", features = ["derive"] }
