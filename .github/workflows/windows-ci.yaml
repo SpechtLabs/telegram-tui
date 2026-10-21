@@ -112,7 +112,7 @@ jobs:
           key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ steps.rust.outputs.components }}
 
       - name: Set up mise
-        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: rust cargo-insta
@@ -125,7 +125,7 @@ jobs:
       # See rust.yaml. Fewer, larger files also keep "Post Cache" short here,
       # where Git's tar.exe is punishingly slow over many small ones.
       - name: Cache cargo registry and dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
