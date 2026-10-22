@@ -44,7 +44,7 @@ pinact = "5.0.0"
 # markdownlint-cli2 version the docs workflow runs, so `mise run docs-lint`
 # and `mise run docs-build` locally are exactly what CI does.
 # markdownlint-cli2 is an npm package, which mise installs with this node.
-bun = "1.4.3"
+bun = "1.4.4"
 node = "24.22.1"
 markdownlint-cli2 = "0.24.0"
 
