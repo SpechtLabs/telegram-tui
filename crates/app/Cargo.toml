@@ -34,7 +34,7 @@ toml = "=1.2.1"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
-tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "4aa19b634594c380bcb5fb7203bea6ae0ae91380", default-features = false, features = ["sentry", "human_errors"] }
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", rev = "95d2aee6d3737ad2235912ee663ded8e1861a72a", default-features = false, features = ["sentry", "human_errors"] }
 # Named directly only to turn features on. `tracing-batteries` depends on
 # sentry with `default-features = false`, which drops `panic`, `backtrace`,
 # `contexts` and `debug-images` — i.e. everything that makes a *crash*
