@@ -92,4 +92,4 @@ insta = { workspace = true }
 tempfile = "=3.27.0"
 axum = "=0.8.9"
 opentelemetry-proto = { version = "=0.33.1", features = ["gen-tonic-messages", "trace", "logs"] }
-prost = "=0.14.4"
+prost = "=0.14.5"
