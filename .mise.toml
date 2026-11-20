@@ -46,7 +46,7 @@ pinact = "5.0.2"
 # markdownlint-cli2 is an npm package, which mise installs with this node.
 bun = "1.4.4"
 node = "24.22.3"
-markdownlint-cli2 = "0.24.1"
+markdownlint-cli2 = "0.24.2"
 
 # Records the `tgt --demo` asciinema cast committed alongside the demo driver
 # script (see `crates/app/src/demo/`'s module docs and `scripts/record-demo.sh`).
