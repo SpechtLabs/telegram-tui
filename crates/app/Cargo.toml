@@ -15,7 +15,7 @@ tdlib-rs = { version = "=1.4.0", default-features = false, features = ["download
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "process"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.2"
-clap = { version = "=4.6.9", features = ["derive"] }
+clap = { version = "=4.6.10", features = ["derive"] }
 color-eyre = "=0.6.5"
 etcetera = "=0.11.0"
 # Default features are deliberate and sufficient on all three platforms: the
@@ -30,7 +30,7 @@ arboard = "=3.7.0"
 rand = "=0.10.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "=1.2.2"
+toml = "=1.2.3"
 tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "registry"] }
 tracing-appender = "=0.2.5"
